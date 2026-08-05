@@ -1,0 +1,59 @@
+# 评级-仓位映射（2026-08-04 回测校准：收紧列下调、宽松列下调、中性列维持）
+rating_position_map:
+  attack:
+    loose: 0.40
+    neutral: 0.60
+    tight: 0.20
+  neutral:
+    loose: 0.30
+    neutral: 0.40
+    tight: 0.10
+  defense:
+    loose: 0.15
+    neutral: 0.20
+    tight: 0.05
+
+# 硬约束
+limits:
+  single_position: 0.15
+  industry_limit: 0.30
+  cash_floor: 0.20
+  core_attention: 10
+  pool: 20
+
+# 定量指标参数（yaml 覆盖代码默认值；键名须与 invest/quant/indicators.py 一致）
+indicators:
+  strength:
+    rs_windows: [5, 10, 20]
+    rs_weights: [0.2, 0.3, 0.5]
+    momentum_windows: [5, 10, 20]
+  rotation:
+    rank_change_threshold: 3   # 排名上升 >= 3 名视为领涨
+  temperature:
+    momentum_window: 5
+    top_n: 5
+  weekly_strength:
+    rs_windows: [4, 12]
+    rs_weights: [0.4, 0.6]
+    momentum_windows: [4, 12]
+  crowding:
+    window: 250
+  linkage:
+    corr_window: 60
+    corr_threshold: 0.7
+
+# 调度表（cron 参考）
+schedule:
+  premarket: "08:30"
+  intradday_interval_minutes: 5
+  after_close: "16:00"
+  weekend: "Sat 09:00"
+  monthly: "1st 09:00"
+
+# 数据口径决策（2026-08-03 确认）
+data:
+  adjustment_primary: qfq
+  daily_primary_source: sina   # 主复权口径：新浪 qfq（沙箱与真实网络均稳定）
+  note: "东财 qfq 与新浪 qfq 数值存在约 2% 差异；交叉校验须同口径或放宽容差"
+  industries_v1:
+    - 半导体   # 占位：行业列表接口可达后校准（支持 BK 代码或名称）

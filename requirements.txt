@@ -1,0 +1,26 @@
+# 核心
+pydantic>=2.5
+pydantic-settings>=2.1
+PyYAML>=6.0
+pandas>=2.0
+numpy>=1.26
+requests>=2.31
+APScheduler>=3.10
+fastapi>=0.110
+uvicorn>=0.27
+openai>=1.30
+
+# 数据源
+akshare>=1.12
+py-mini-racer>=0.6   # 同花顺行业指数（v 值计算，缺依赖会 ImportError）
+tushare>=1.2.89
+
+# 仪表盘
+streamlit>=1.30
+plotly>=5.18
+
+# 回测（可选）
+vectorbt>=0.26
+
+# 测试
+pytest>=8.0
