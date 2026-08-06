@@ -149,11 +149,11 @@ def _nightly(db: str, conn) -> None:
 
 def build_scheduler() -> BackgroundScheduler:
     sched = BackgroundScheduler(timezone="Asia/Shanghai")
-    sched.add_job(_wrap("premarket", _premarket), CronTrigger(day_of_week="mon-fri", hour=8, minute=30), id="premarket")
-    sched.add_job(_wrap("after_close", _after_close), CronTrigger(day_of_week="mon-fri", hour=16, minute=0), id="after_close")
-    sched.add_job(_wrap("weekend", _weekend), CronTrigger(day_of_week="sat", hour=9, minute=0), id="weekend")
-    sched.add_job(_wrap("monthly", _monthly), CronTrigger(day="1", hour=9, minute=30), id="monthly")
-    sched.add_job(_wrap("yearly", _yearly), CronTrigger(month="1", day="1", hour=9, minute=30), id="yearly")
+    sched.add_job(_wrap("premarket", _premarket), CronTrigger(day_of_week="mon-fri", hour=8, minute=30), id="premarket", misfire_grace_time=3600)
+    sched.add_job(_wrap("after_close", _after_close), CronTrigger(day_of_week="mon-fri", hour=16, minute=0), id="after_close", misfire_grace_time=7200)
+    sched.add_job(_wrap("weekend", _weekend), CronTrigger(day_of_week="sat", hour=9, minute=0), id="weekend", misfire_grace_time=7200)
+    sched.add_job(_wrap("monthly", _monthly), CronTrigger(day="1", hour=9, minute=30), id="monthly", misfire_grace_time=43200)
+    sched.add_job(_wrap("yearly", _yearly), CronTrigger(month="1", day="1", hour=9, minute=30), id="yearly", misfire_grace_time=43200)
     sched.add_job(_wrap("intraday", _intraday), CronTrigger(day_of_week="mon-fri", hour="9-11,13-14", minute="*/5"), id="intraday")
-    sched.add_job(_wrap("nightly", _nightly), CronTrigger(hour=22, minute=0), id="nightly")
+    sched.add_job(_wrap("nightly", _nightly), CronTrigger(hour=22, minute=0), id="nightly", misfire_grace_time=7200)
     return sched

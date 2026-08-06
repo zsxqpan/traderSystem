@@ -87,6 +87,14 @@ RISK_MAX_DRAWDOWN=0.15               # 风控默认参数
 
 ---
 
+### 4.3 休眠也能准点推送（唤醒定时器）
+- 系统已注册计划任务 `InvestSystemWake`：每天 21:58 唤醒电脑（WakeToRun）并守护调度服务（`scripts/wake_guard.ps1`，服务不在则自动拉起），保证 22:00 复盘推送不因睡眠/休眠错过。
+- 电源"允许使用唤醒定时器"已设为启用（交流+直流）。若不想电池模式下唤醒，可改回禁用：
+  `powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 0 && powercfg /setactive SCHEME_CURRENT`
+- 例行任务已设错失宽限（misfire_grace_time）：盘前 1h / 盘后 2h / 夜间 2h / 周末 2h / 月度和年度 12h。机器在触发后短时间内醒来会补跑；关机或断电仍无法发送（需云端方案）。
+
+---
+
 ## 5. 企业微信推送
 
 - 未配置 `WECOM_WEBHOOK` 时推送自动禁用，不影响其他功能。
