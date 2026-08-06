@@ -15,11 +15,11 @@ def _read(db_path: str, sql: str, params: tuple = ()) -> pd.DataFrame:
 
 
 def load_strength(db: str) -> pd.DataFrame:
-    return _read(db, "SELECT obj, rs, momentum, trend_stage FROM quant_strength WHERE period='short' AND obj_type='industry' ORDER BY rs DESC")
+    return _read(db, "SELECT obj, rs, momentum, trend_stage FROM quant_strength WHERE period='short' AND obj_type='industry' AND run_date = (SELECT MAX(run_date) FROM quant_strength WHERE period='short' AND obj_type='industry') ORDER BY rs DESC")
 
 
 def load_weekly(db: str) -> pd.DataFrame:
-    return _read(db, "SELECT obj, rs, momentum, trend_stage FROM quant_strength WHERE period='mid' AND obj_type='industry' ORDER BY rs DESC")
+    return _read(db, "SELECT obj, rs, momentum, trend_stage FROM quant_strength WHERE period='mid' AND obj_type='industry' AND run_date = (SELECT MAX(run_date) FROM quant_strength WHERE period='mid' AND obj_type='industry') ORDER BY rs DESC")
 
 
 def load_temperature(db: str) -> pd.DataFrame:
@@ -27,19 +27,19 @@ def load_temperature(db: str) -> pd.DataFrame:
 
 
 def load_rotation(db: str) -> pd.DataFrame:
-    return _read(db, "SELECT industry, rank, lead_lag, turnover_share FROM quant_rotation ORDER BY rank")
+    return _read(db, "SELECT industry, rank, lead_lag, turnover_share FROM quant_rotation WHERE run_date = (SELECT MAX(run_date) FROM quant_rotation) ORDER BY rank")
 
 
 def load_linkage(db: str) -> pd.DataFrame:
-    return _read(db, "SELECT a, b, corr, lead FROM quant_linkage ORDER BY corr DESC")
+    return _read(db, "SELECT a, b, corr, lead FROM quant_linkage WHERE run_date = (SELECT MAX(run_date) FROM quant_linkage) ORDER BY corr DESC")
 
 
 def load_capital(db: str) -> pd.DataFrame:
-    return _read(db, "SELECT obj, fund_type, style, confidence FROM quant_capital ORDER BY confidence DESC")
+    return _read(db, "SELECT obj, fund_type, style, confidence FROM quant_capital q WHERE run_date = (SELECT MAX(run_date) FROM quant_capital q2 WHERE q2.obj_type = q.obj_type) ORDER BY confidence DESC")
 
 
 def load_crowding(db: str) -> pd.DataFrame:
-    return _read(db, "SELECT obj, crowding FROM quant_valuation ORDER BY crowding DESC")
+    return _read(db, "SELECT obj, crowding FROM quant_valuation WHERE run_date = (SELECT MAX(run_date) FROM quant_valuation) ORDER BY crowding DESC")
 
 
 def load_macro(db: str) -> pd.DataFrame:

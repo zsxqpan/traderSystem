@@ -16,13 +16,16 @@ def query_strength(conn, period: str = "short", top: int = 10, obj_type: str = "
     return _query(
         conn,
         """SELECT obj, rs, momentum, trend_stage FROM quant_strength
-           WHERE period=? AND obj_type=? ORDER BY rs DESC LIMIT ?""",
-        (period, obj_type, top),
+           WHERE period=? AND obj_type=?
+             AND run_date = (SELECT MAX(run_date) FROM quant_strength
+                             WHERE period=? AND obj_type=?)
+           ORDER BY rs DESC LIMIT ?""",
+        (period, obj_type, period, obj_type, top),
     )
 
 
 def query_rotation(conn, top: int = 10) -> list[dict]:
-    return _query(conn, "SELECT industry, rank, lead_lag, turnover_share FROM quant_rotation ORDER BY rank LIMIT ?", (top,))
+    return _query(conn, "SELECT industry, rank, lead_lag, turnover_share FROM quant_rotation WHERE run_date = (SELECT MAX(run_date) FROM quant_rotation) ORDER BY rank LIMIT ?", (top,))
 
 
 def query_temperature(conn) -> list[dict]:
@@ -30,11 +33,11 @@ def query_temperature(conn) -> list[dict]:
 
 
 def query_capital(conn) -> list[dict]:
-    return _query(conn, "SELECT obj, fund_type, style, confidence FROM quant_capital ORDER BY confidence DESC")
+    return _query(conn, "SELECT obj, fund_type, style, confidence FROM quant_capital q WHERE run_date = (SELECT MAX(run_date) FROM quant_capital q2 WHERE q2.obj_type = q.obj_type) ORDER BY confidence DESC")
 
 
 def query_linkage(conn, threshold: float = 0.8, top: int = 10) -> list[dict]:
-    return _query(conn, "SELECT a, b, corr, lead FROM quant_linkage WHERE corr>=? ORDER BY corr DESC LIMIT ?", (threshold, top))
+    return _query(conn, "SELECT a, b, corr, lead FROM quant_linkage WHERE run_date = (SELECT MAX(run_date) FROM quant_linkage) AND corr>=? ORDER BY corr DESC LIMIT ?", (threshold, top))
 
 
 def query_macro(conn) -> list[dict]:

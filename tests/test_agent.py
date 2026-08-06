@@ -180,6 +180,28 @@ def test_query_strength_obj_type():
     conn.close()
     print("test_query_strength_obj_type OK")
 
+
+
+def test_query_strength_latest_snapshot():
+    """回归：强度榜只返回最新 run_date 快照，不混入历史数据。"""
+    p = _tmp_db()
+    conn = connect(p)
+    from invest.data.storage import upsert_df
+    upsert_df(conn, "quant_strength", pd.DataFrame([
+        {"run_date": "2026-08-03", "obj_type": "industry", "obj": "白酒", "period": "short",
+         "rs": 0.99, "momentum": 0.5, "trend_stage": "加速", "calc_version": "v1"},
+        {"run_date": "2026-08-04", "obj_type": "industry", "obj": "白酒", "period": "short",
+         "rs": 0.12, "momentum": 0.1, "trend_stage": "启动", "calc_version": "v1"},
+        {"run_date": "2026-08-04", "obj_type": "industry", "obj": "教育", "period": "short",
+         "rs": 0.20, "momentum": 0.15, "trend_stage": "启动", "calc_version": "v1"},
+    ]))
+    d = build_dispatch(conn)
+    top = d["query_strength"](top=5)
+    assert [r["obj"] for r in top] == ["教育", "白酒"]
+    assert abs(top[0]["rs"] - 0.20) < 1e-9 and abs(top[1]["rs"] - 0.12) < 1e-9
+    conn.close()
+    print("test_query_strength_latest_snapshot OK")
+
 if __name__ == "__main__":
     test_tickets_flow()
     test_tools_query()
@@ -187,4 +209,5 @@ if __name__ == "__main__":
     test_llm_tool_loop()
     test_viewpoint_source_enforced()
     test_query_strength_obj_type()
+    test_query_strength_latest_snapshot()
     print("\nALL AGENT TESTS PASSED")

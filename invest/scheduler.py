@@ -125,12 +125,26 @@ def _intraday(db: str, conn) -> None:
 
 
 def _nightly(db: str, conn) -> None:
+    """22:00 每日复盘：到期观点/工单入队 + 固定推送一份当日状态（无事也发）。"""
     from invest.agent.tickets import expire_overdue
     from invest.viewpoints.store import expire_due
+    from invest import pipeline as pl
     expired = expire_due(conn)
-    tickets = expire_overdue(conn)
-    if expired or tickets:
-        Notifier().send_text(f"夜间检查: {expired} 条观点到期进复盘, {tickets} 张工单超时", key="nightly")
+    overdue = expire_overdue(conn)
+    new_vp = conn.execute(
+        "SELECT COUNT(*) FROM viewpoints WHERE date(created_at)=date('now','localtime')"
+    ).fetchone()[0]
+    msg = (
+        f"【A股投资系统 · 每日复盘】\n"
+        f"数据截至: {pl._latest_data_date(conn)}\n"
+        f"市场温度: {pl._temperature(conn)}\n"
+        f"短线强度前5: {pl._top_strength(conn, 'short')}\n"
+        f"中线强度前3: {pl._top_strength(conn, 'mid', 3)}\n"
+        f"今日新增观点: {new_vp} 条 | 到期进复盘: {expired} 条 | 工单超时: {overdue} 张"
+    )
+    ok = Notifier().send_text(msg, key="nightly")
+    if not ok:
+        logger.warning("22:00 复盘推送失败或未配置 webhook")
 
 
 def build_scheduler() -> BackgroundScheduler:

@@ -190,8 +190,11 @@ def arbitrate_all(db_path: str) -> int:
 def _top_strength(conn, period: str = "short", n: int = 5) -> str:
     rows = conn.execute(
         """SELECT obj, rs, trend_stage FROM quant_strength
-           WHERE period=? AND obj_type='industry' ORDER BY rs DESC LIMIT ?""",
-        (period, n),
+           WHERE period=? AND obj_type='industry'
+             AND run_date = (SELECT MAX(run_date) FROM quant_strength
+                             WHERE period=? AND obj_type='industry')
+           ORDER BY rs DESC LIMIT ?""",
+        (period, period, n),
     ).fetchall()
     return "；".join(f"{r['obj']}({r['rs']:+.1%},{r['trend_stage']})" for r in rows) or "-"
 
