@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -31,8 +32,9 @@ def _wrap(job_name: str, fn) -> callable:
             init_db(db)
             conn = connect(db)
             _log_run(conn, job_name, "running")  # 开始即记录，卡死也可见
-            fn(db, conn)
-            _log_run(conn, job_name, "ok")
+            result = fn(db, conn)
+            detail = str(result) if result else ""
+            _log_run(conn, job_name, "ok", detail)
         except Exception as exc:  # noqa: BLE001
             logger.exception("%s 失败", job_name)
             if conn is not None:
@@ -48,13 +50,24 @@ def _wrap(job_name: str, fn) -> callable:
 
 
 def log_service_started() -> None:
-    """服务启动时写一条 job_runs，便于确认调度器确实活着。"""
+    """服务启动时写一条 job_runs，便于确认调度器确实活着，并自检 webhook 可达性。"""
     db = str(ROOT / "data" / "invest.db")
+    detail = "service started"
+    try:
+        import requests
+        webhook = Notifier().webhook
+        if webhook:
+            r = requests.get(webhook, timeout=8)
+            detail += f" | webhook=http{r.status_code}"  # GET 只探测，不发送消息
+        else:
+            detail += " | webhook=not_configured"
+    except Exception as exc:  # noqa: BLE001
+        detail += f" | webhook=unreachable({type(exc).__name__})"
     try:
         init_db(db)
         conn = connect(db)
         try:
-            _log_run(conn, "scheduler", "running", "service started")
+            _log_run(conn, "scheduler", "running", detail)
         finally:
             conn.close()
     except Exception:  # noqa: BLE001
@@ -144,7 +157,12 @@ def _nightly(db: str, conn) -> None:
     )
     ok = Notifier().send_text(msg, key="nightly")
     if not ok:
+        time.sleep(5)  # 网络抖动时重试一次
+        ok = Notifier().send_text(msg, key="nightly")
+    if not ok:
         logger.warning("22:00 复盘推送失败或未配置 webhook")
+        return "push_failed(webhook unreachable)"
+    return "push_ok"
 
 
 def build_scheduler() -> BackgroundScheduler:
