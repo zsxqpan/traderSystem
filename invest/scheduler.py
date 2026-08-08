@@ -160,12 +160,15 @@ def _nightly(db: str, conn) -> None:
     ).fetchone()[0]
     msg = (
         f"【A股投资系统 · 每日复盘】\n"
-        f"数据截至: {pl._latest_data_date(conn)}\n"
+        f"数据截至: {pl._freshness(conn)}\n"
         f"市场温度: {pl._temperature(conn)}\n"
-        f"当日涨幅前5:\n{pl._top_daily_gainers(conn)}\n"
+        f"板块宽度: {pl._breadth(conn)}\n"
+        f"评级: {pl._ratings_block(conn)}\n"
+        f"{pl._daily_movers_block(conn)}\n"
         f"短线强度前5（RS 5/10/20日超额）:\n{pl._top_strength(conn, 'short')}\n"
         f"中线强度前3: {pl._top_strength(conn, 'mid', 3)}\n"
-        f"今日新增观点: {new_vp} 条 | 到期进复盘: {expired} 条 | 工单超时: {overdue} 张"
+        f"今日新增观点: {new_vp} 条 | 到期进复盘: {expired} 条 | 工单超时: {overdue} 张\n"
+        f"Agent 观点:\n{pl._agent_viewpoints(conn) or '-'}"
     )
     ok = Notifier().send_text(msg, key="nightly")
     if not ok:

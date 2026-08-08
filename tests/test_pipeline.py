@@ -157,15 +157,17 @@ def test_pipeline_stock_quant():
 
 
 
-def test_daily_gainers_and_strength_text():
-    """回归：当日涨幅榜 + RS 5/10/20 文本；只取最新 run_date。"""
+def test_daily_movers_and_strength_text():
+    """回归：当日涨/跌幅榜（趋势标签/新晋）+ 宽度 + RS 5/10/20；只取最新 run_date。"""
     from invest import pipeline as pl
     p = _tmp_db()
     conn = connect(p)
     from invest.data.storage import upsert_df
     upsert_df(conn, "industry_bars", pd.DataFrame([
+        {"date": "2026-08-02", "industry": "A", "close": 9.0, "src": "akshare"},
         {"date": "2026-08-03", "industry": "A", "close": 10.0, "src": "akshare"},
         {"date": "2026-08-04", "industry": "A", "close": 11.0, "src": "akshare"},
+        {"date": "2026-08-02", "industry": "B", "close": 19.0, "src": "akshare"},
         {"date": "2026-08-03", "industry": "B", "close": 20.0, "src": "akshare"},
         {"date": "2026-08-04", "industry": "B", "close": 20.5, "src": "akshare"},
     ]))
@@ -175,14 +177,23 @@ def test_daily_gainers_and_strength_text():
         {"run_date": "2026-08-03", "obj_type": "industry", "obj": "B", "period": "short",
          "rs": 0.9, "rs5": 0.9, "rs10": 0.9, "rs20": 0.9, "trend_stage": "加速", "calc_version": "v1"},
     ]))
-    gains = pl._top_daily_gainers(conn)
-    assert "A +10.00%" in gains and "B +2.50%" in gains
+    block = pl._daily_movers_block(conn)
+    assert "A +10.00% [趋势强/新启动]" in block
+    assert "B +2.50%" in block
+    assert "当日跌幅前5:" in block
+    assert pl._breadth(conn) == "上涨2/下跌0"
     strength = pl._top_strength(conn, "short")
     assert "A" in strength
     assert "5日+5.0%" in strength and "10日+8.0%" in strength and "20日+12.0%" in strength
     assert "B" not in strength  # 只取最新 run_date
+    # Agent 观点结构化（结论/周期/失效条件）
+    from invest.viewpoints.store import create_viewpoint
+    create_viewpoint(conn, source="research", obj="A", conclusion="测试观点", period_tag="short",
+                     confidence=0.6, evidence=[{"x": 1}], invalid_condition="RS转负")
+    vp = pl._agent_viewpoints(conn)
+    assert "测试观点 [短线]（失效:RS转负）" in vp
     conn.close()
-    print("test_daily_gainers_and_strength_text OK")
+    print("test_daily_movers_and_strength_text OK")
 
 if __name__ == "__main__":
     test_notifier_disabled_and_mock()
@@ -191,5 +202,5 @@ if __name__ == "__main__":
     test_notify_messages_no_crash()
     test_build_collect_tasks_from_pool()
     test_pipeline_stock_quant()
-    test_daily_gainers_and_strength_text()
+    test_daily_movers_and_strength_text()
     print("\nALL PIPELINE TESTS PASSED")
