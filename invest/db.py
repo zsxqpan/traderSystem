@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 -- ============ 行情 ============
@@ -327,6 +327,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols2 = [r["name"] for r in conn.execute("PRAGMA table_info(candidate_pool)")]
     if "industry" not in cols2:
         conn.execute("ALTER TABLE candidate_pool ADD COLUMN industry TEXT")
+    cols3 = [r["name"] for r in conn.execute("PRAGMA table_info(quant_strength)")]
+    for col in ("rs5", "rs10", "rs20"):
+        if col not in cols3:
+            conn.execute(f"ALTER TABLE quant_strength ADD COLUMN {col} REAL")
     # dragon_tiger 历史 bug：榜单行不写 seat_type（NULL），SQLite 主键中
     # NULL!=NULL，导致每次采集重复插入。清理每个 (date,symbol) 仅保留一行；
     # 新数据由采集层统一写入非空 seat_type='list'（见 akshare_source.py）。
@@ -346,6 +350,36 @@ def init_db(db_path: str | Path) -> None:
         conn.executescript(SCHEMA_SQL)
         _migrate(conn)
         current = conn.execute("PRAGMA user_version").fetchone()[0]
+        if current < 4:
+            # v4 数据修复：板块/龙虎榜日期统一为 YYYY-MM-DD 并去重
+            # （历史曾混写 20260804 与 2026-08-04 两种格式，同日两行数值相同）
+            # 1) 先删掉已有 dashed 对应行的 compact 重复（否则 UPDATE 会撞主键）
+            conn.execute(
+                """DELETE FROM industry_bars WHERE date NOT LIKE '%-%' AND EXISTS (
+                     SELECT 1 FROM industry_bars d2
+                     WHERE d2.date LIKE '%-%'
+                       AND d2.industry = industry_bars.industry
+                       AND d2.src = industry_bars.src
+                       AND REPLACE(d2.date,'-','') = industry_bars.date
+                   )"""
+            )
+            # 2) 剩余 compact 转 dashed
+            conn.execute(
+                """UPDATE industry_bars SET date =
+                     substr(date,1,4)||'-'||substr(date,5,2)||'-'||substr(date,7,2)
+                   WHERE date NOT LIKE '%-%'"""
+            )
+            # 3) 兜底去重（幂等）
+            conn.execute(
+                """DELETE FROM industry_bars WHERE rowid NOT IN (
+                     SELECT MIN(rowid) FROM industry_bars GROUP BY industry, date, src
+                   )"""
+            )
+            conn.execute(
+                """UPDATE dragon_tiger SET date =
+                     substr(date,1,4)||'-'||substr(date,5,2)||'-'||substr(date,7,2)
+                   WHERE date NOT LIKE '%-%'"""
+            )
         if current < SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()

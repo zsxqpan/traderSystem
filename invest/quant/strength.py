@@ -83,12 +83,17 @@ def compute_strength(
         mom = calc_momentum(close, params["momentum_windows"])
         stage = calc_trend_stage(close)
         last_date = close.dropna().index[-1]
+        # 单窗口相对强度（日报展示 5/10/20 日超额）
+        win_rs = {f"rs{w}": calc_rs(close, benchmark, [w], [1.0]) for w in windows}
         rows.append({
             "run_date": _fmt_date(last_date),
             "obj_type": obj_type,
             "obj": name,
             "period": "short",
             "rs": rs,
+            "rs5": win_rs["rs5"],
+            "rs10": win_rs["rs10"],
+            "rs20": win_rs["rs20"],
             "momentum": mom,
             "trend_stage": stage,
             "calc_version": "v1",

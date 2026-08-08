@@ -57,12 +57,23 @@ def log_service_started() -> None:
         import requests
         webhook = Notifier().webhook
         if webhook:
-            r = requests.get(webhook, timeout=8)
-            detail += f" | webhook=http{r.status_code}"  # GET 只探测，不发送消息
+            last_err = ""
+            for _attempt in range(3):  # 瞬时 TLS/网络抖动重试，避免误报不可达
+                try:
+                    r = requests.get(webhook, timeout=8)  # GET 只探测，不发送消息
+                    if r.status_code == 200:
+                        detail += " | webhook=http200"
+                        break
+                    last_err = f"http{r.status_code}"
+                except Exception as exc:  # noqa: BLE001
+                    last_err = f"{type(exc).__name__}"
+                    time.sleep(3)
+            else:
+                detail += f" | webhook=unreachable({last_err})"
         else:
             detail += " | webhook=not_configured"
     except Exception as exc:  # noqa: BLE001
-        detail += f" | webhook=unreachable({type(exc).__name__})"
+        detail += f" | webhook=check_failed({type(exc).__name__})"
     try:
         init_db(db)
         conn = connect(db)
@@ -151,7 +162,8 @@ def _nightly(db: str, conn) -> None:
         f"【A股投资系统 · 每日复盘】\n"
         f"数据截至: {pl._latest_data_date(conn)}\n"
         f"市场温度: {pl._temperature(conn)}\n"
-        f"短线强度前5: {pl._top_strength(conn, 'short')}\n"
+        f"当日涨幅前5:\n{pl._top_daily_gainers(conn)}\n"
+        f"短线强度前5（RS 5/10/20日超额）:\n{pl._top_strength(conn, 'short')}\n"
         f"中线强度前3: {pl._top_strength(conn, 'mid', 3)}\n"
         f"今日新增观点: {new_vp} 条 | 到期进复盘: {expired} 条 | 工单超时: {overdue} 张"
     )

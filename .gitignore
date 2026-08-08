@@ -1,5 +1,5 @@
-# 数据与日志
-data/
+# 数据与日志（仅根目录 data/；invest/data 是代码，必须提交）
+/data/
 logs/
 *.db
 *.db-wal
@@ -18,5 +18,6 @@ venv/
 # 系统
 Thumbs.db
 .DS_Store
+
 # 虚拟环境
 myenv/

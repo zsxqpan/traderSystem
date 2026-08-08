@@ -39,6 +39,8 @@ def test_strength_ranking():
     assert rs["A"] > rs["C"] > rs["B"], rs
     assert df["obj_type"].iloc[0] == "industry"
     assert df["period"].iloc[0] == "short"
+    assert {"rs5", "rs10", "rs20"} <= set(df.columns)
+    assert df["rs5"].notna().all() and df["rs10"].notna().all() and df["rs20"].notna().all()
     print("test_strength_ranking OK")
 
 

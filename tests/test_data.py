@@ -567,6 +567,51 @@ def test_ths_concat_dedupe_sort():
     assert _concat_industry_years([]).empty
     print("test_ths_concat_dedupe_sort OK")
 
+
+
+def test_date_normalization_kline():
+    """回归：K 线类日期统一为 YYYY-MM-DD（历史曾混写两种格式）。"""
+    src = AkShareSource()
+    df = pd.DataFrame({
+        "日期": ["20260804"], "开盘价": [1.0], "最高价": [1.2],
+        "最低价": [0.9], "收盘价": [1.1], "成交量": [100], "成交额": [110.0],
+    })
+    out = src.normalize(df, {"kind": "industry_all"})
+    assert out["date"].iloc[0] == "2026-08-04"
+    print("test_date_normalization_kline OK")
+
+
+def test_migration_v4_dedupe():
+    """回归：v4 迁移把 compact/dashed 同日重复清理为单行 dashed。"""
+    tmp = os.path.join(tempfile.gettempdir(), "invest_v4_migrate_test.db")
+    for s in ("", "-wal", "-shm"):
+        try:
+            os.remove(tmp + s)
+        except OSError:
+            pass
+    init_db(tmp)
+    conn = connect(tmp)
+    conn.execute("PRAGMA user_version = 3")  # 模拟旧版本库
+    conn.commit()
+    from invest.data.storage import upsert_df
+    upsert_df(conn, "industry_bars", pd.DataFrame([
+        {"date": "2026-08-04", "industry": "semicon", "close": 100.0, "src": "akshare"},
+        {"date": "20260804", "industry": "semicon", "close": 100.0, "src": "akshare"},
+    ]))
+    assert conn.execute("SELECT COUNT(*) FROM industry_bars").fetchone()[0] == 2
+    conn.close()
+    init_db(tmp)  # 触发 v4 清理
+    conn = connect(tmp)
+    rows = conn.execute("SELECT date, close FROM industry_bars").fetchall()
+    assert len(rows) == 1 and rows[0]["date"] == "2026-08-04"
+    conn.close()
+    for s in ("", "-wal", "-shm"):
+        try:
+            os.remove(tmp + s)
+        except OSError:
+            pass
+    print("test_migration_v4_dedupe OK")
+
 if __name__ == "__main__":
     test_margin_normalize()
     test_macro_pmi_normalize()
@@ -594,4 +639,6 @@ if __name__ == "__main__":
     test_tushare_ts_code_and_normalize()
     test_emotion_holiday_skipped()
     test_ths_concat_dedupe_sort()
+    test_date_normalization_kline()
+    test_migration_v4_dedupe()
     print("\nALL TESTS PASSED")

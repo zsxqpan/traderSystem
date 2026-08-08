@@ -92,12 +92,14 @@ def quant(db_path: str) -> dict:
     amounts = ind.pivot_table(index="date", columns="industry", values="amount")
     benchmark = idx.set_index("date")["close"]
     returns = closes.pct_change().replace([float("inf"), float("-inf")], float("nan"))
+    returns = returns.mask(returns.abs() > 0.15)  # 单日>15% 视为数据异常（板块指数不可能），排除防污染
 
     stock["date"] = pd.to_datetime(stock["date"], format="mixed", errors="coerce")
     stock_closes = stock.pivot_table(index="date", columns="symbol", values="close")
     stock_results = {}
     if len(stock_closes.columns) >= 1:
         stock_returns = stock_closes.pct_change().replace([float("inf"), float("-inf")], float("nan"))
+        stock_returns = stock_returns.mask(stock_returns.abs() > 0.15)
         conn2 = connect(db_path)
         try:
             seat_rows = pd.read_sql_query(
@@ -187,7 +189,28 @@ def arbitrate_all(db_path: str) -> int:
 
 
 # ---------- 消息模板 ----------
+def _pct(v) -> str:
+    return f"{v:+.1%}" if v is not None and pd.notna(v) else "-"
+
+
 def _top_strength(conn, period: str = "short", n: int = 5) -> str:
+    """行业强度榜文本；短线轨附 5/10/20 日相对强度（RS）。"""
+    if period == "short":
+        rows = conn.execute(
+            """SELECT obj, rs, rs5, rs10, rs20, trend_stage FROM quant_strength
+               WHERE period=? AND obj_type='industry'
+                 AND run_date = (SELECT MAX(run_date) FROM quant_strength
+                                 WHERE period=? AND obj_type='industry')
+               ORDER BY rs DESC LIMIT ?""",
+            (period, period, n),
+        ).fetchall()
+        parts = []
+        for r in rows:
+            windows = " ".join(
+                f"{h}{_pct(r[k])}" for h, k in (("5日", "rs5"), ("10日", "rs10"), ("20日", "rs20"))
+            )
+            parts.append(f"{r['obj']} rs{_pct(r['rs'])} [{windows}] {r['trend_stage']}")
+        return "\n".join(parts) or "-"
     rows = conn.execute(
         """SELECT obj, rs, trend_stage FROM quant_strength
            WHERE period=? AND obj_type='industry'
@@ -197,6 +220,23 @@ def _top_strength(conn, period: str = "short", n: int = 5) -> str:
         (period, period, n),
     ).fetchall()
     return "；".join(f"{r['obj']}({r['rs']:+.1%},{r['trend_stage']})" for r in rows) or "-"
+
+
+def _top_daily_gainers(conn, n: int = 5) -> str:
+    """最新一个行业数据日，板块指数真实涨幅前 n。"""
+    rows = conn.execute(
+        """WITH ranked AS (
+             SELECT industry, close,
+                    ROW_NUMBER() OVER (PARTITION BY industry ORDER BY REPLACE(date,'-','') DESC) rn
+             FROM industry_bars
+           )
+           SELECT a.industry, (a.close/b.close - 1) AS pct
+           FROM ranked a JOIN ranked b
+             ON a.industry=b.industry AND a.rn=1 AND b.rn=2
+           ORDER BY pct DESC LIMIT ?""",
+        (n,),
+    ).fetchall()
+    return "\n".join(f"{r['industry']} {r['pct']:+.2%}" for r in rows) or "-"
 
 
 def _temperature(conn) -> str:
@@ -247,7 +287,8 @@ def notify_after_close(db_path: str, agent_text: str = "") -> bool:
             f"【A股投资系统 · 盘后日报】\n"
             f"数据截至: {_latest_data_date(conn)}\n"
             f"温度: {_temperature(conn)}\n"
-            f"短线强度前5: {_top_strength(conn, 'short')}\n"
+            f"当日涨幅前5:\n{_top_daily_gainers(conn)}\n"
+            f"短线强度前5（RS 5/10/20日超额）:\n{_top_strength(conn, 'short')}\n"
             f"今日新增观点: {new_vp} 条 | 触发止损: {stop_hits} 笔\n"
             f"Agent 复盘:\n{agent_text or '[Agent 未运行]'}"
         )
