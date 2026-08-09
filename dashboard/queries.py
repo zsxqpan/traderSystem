@@ -26,6 +26,70 @@ def load_temperature(db: str) -> pd.DataFrame:
     return _read(db, "SELECT run_date, profit_effect, score FROM quant_temperature ORDER BY run_date DESC LIMIT 1")
 
 
+def load_temperature_history(db: str, limit: int = 60) -> pd.DataFrame:
+    """市场温度历史序列（用于趋势图）。"""
+    return _read(
+        db,
+        "SELECT run_date, score, profit_effect, limit_up_count FROM quant_temperature ORDER BY run_date DESC LIMIT ?",
+        (limit,),
+    ).iloc[::-1].reset_index(drop=True)
+
+
+def load_latest_movers(db: str) -> pd.DataFrame:
+    """最新行业交易日板块涨跌幅与成交额（用于热力图/树图）。"""
+    return _read(
+        db,
+        """WITH ranked AS (
+             SELECT industry, close, amount,
+                    ROW_NUMBER() OVER (PARTITION BY industry ORDER BY REPLACE(date,'-','') DESC) rn
+             FROM industry_bars
+           )
+           SELECT a.industry,
+                  (a.close/b.close - 1) AS pct,
+                  a.amount
+           FROM ranked a JOIN ranked b ON a.industry=b.industry AND b.rn=2
+           WHERE a.rn=1
+           ORDER BY pct DESC"""
+    )
+
+
+def load_crowding_vs_strength(db: str) -> pd.DataFrame:
+    """拥挤度 × 相对强度散点数据（最新快照）。"""
+    return _read(
+        db,
+        """SELECT s.obj, s.rs, s.trend_stage, v.crowding
+           FROM quant_strength s
+           JOIN quant_valuation v ON v.obj = s.obj
+           WHERE s.period='short' AND s.obj_type='industry'
+             AND s.run_date = (SELECT MAX(run_date) FROM quant_strength WHERE period='short' AND obj_type='industry')
+             AND v.run_date = (SELECT MAX(run_date) FROM quant_valuation)
+           ORDER BY s.rs DESC"""
+    )
+
+
+def load_data_health(db: str) -> pd.DataFrame:
+    """各行情表最新日期与滞后天数（数据健康横幅）。"""
+    sql = """
+        SELECT 'industry_bars' AS tbl, MAX(date) AS max_date FROM industry_bars
+        UNION ALL SELECT 'index_bars', MAX(date) FROM index_bars
+        UNION ALL SELECT 'daily_bars', MAX(date) FROM daily_bars
+        UNION ALL SELECT 'market_emotion', MAX(date) FROM market_emotion
+        UNION ALL SELECT 'industry_valuation', MAX(date) FROM industry_valuation
+        UNION ALL SELECT 'dragon_tiger', MAX(date) FROM dragon_tiger
+        UNION ALL SELECT 'macro_series', MAX(date) FROM macro_series
+    """
+    df = _read(db, sql)
+    if df.empty:
+        return df
+    today = pd.Timestamp.today().normalize()
+    df["max_date"] = pd.to_datetime(df["max_date"], format="mixed", errors="coerce")
+    df["lag_days"] = (today - df["max_date"]).dt.days
+    df["status"] = df["lag_days"].apply(
+        lambda d: "正常" if d <= 1 else ("偏旧" if d <= 5 else "过期")
+    )
+    return df
+
+
 def load_rotation(db: str) -> pd.DataFrame:
     return _read(db, "SELECT industry, rank, lead_lag, turnover_share FROM quant_rotation WHERE run_date = (SELECT MAX(run_date) FROM quant_rotation) ORDER BY rank")
 

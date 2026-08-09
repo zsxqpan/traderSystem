@@ -51,8 +51,25 @@ def test_viewpoints_status_parameterized():
     assert len(jobs) <= 5
     print("test_viewpoints_status_parameterized OK")
 
+
+
+def test_overview_queries():
+    """总览页查询：温度历史/涨跌榜/拥挤度×强度/数据健康。"""
+    th = q.load_temperature_history(DB)
+    assert not th.empty and {"run_date", "score"} <= set(th.columns)
+    mv = q.load_latest_movers(DB)
+    assert not mv.empty and {"industry", "pct", "amount"} <= set(mv.columns)
+    assert mv["pct"].max() > 0
+    cs = q.load_crowding_vs_strength(DB)
+    assert not cs.empty and {"obj", "rs", "crowding", "trend_stage"} <= set(cs.columns)
+    h = q.load_data_health(DB)
+    assert not h.empty and {"tbl", "max_date", "lag_days", "status"} <= set(h.columns)
+    assert set(h["tbl"]) >= {"industry_bars", "index_bars", "daily_bars"}
+    print("test_overview_queries OK")
+
 if __name__ == "__main__":
     test_queries()
     test_strength_industry_only()
     test_viewpoints_status_parameterized()
+    test_overview_queries()
     print("\nALL DASHBOARD TESTS PASSED")
