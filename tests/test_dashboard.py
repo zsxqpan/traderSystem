@@ -67,9 +67,33 @@ def test_overview_queries():
     assert set(h["tbl"]) >= {"industry_bars", "index_bars", "daily_bars"}
     print("test_overview_queries OK")
 
+
+
+def test_rotation_linkage_style_queries():
+    """轮动轨迹/联动网络/风格时间线查询。"""
+    rh = q.load_rotation_history(DB)
+    assert not rh.empty and {"run_date", "industry", "rank"} <= set(rh.columns)
+    edges = q.load_linkage_edges(DB, threshold=0.85, max_edges=150)
+    assert not edges.empty and {"a", "b", "corr", "lead"} <= set(edges.columns)
+    assert len(edges) <= 150
+    assert (edges["corr"] >= 0.85).all()
+    sh = q.load_style_history(DB)
+    assert not sh.empty and {"run_date", "style", "n"} <= set(sh.columns)
+    print("test_rotation_linkage_style_queries OK")
+
+
+def test_position_limit():
+    """评级→建议仓位（未评级时保守默认 0.5，不报错）。"""
+    pl = q.load_position_limit(DB)
+    assert set(pl) == {"macro", "market", "position_limit"}
+    assert 0 <= pl["position_limit"] <= 1
+    print("test_position_limit OK")
+
 if __name__ == "__main__":
     test_queries()
     test_strength_industry_only()
     test_viewpoints_status_parameterized()
     test_overview_queries()
+    test_rotation_linkage_style_queries()
+    test_position_limit()
     print("\nALL DASHBOARD TESTS PASSED")

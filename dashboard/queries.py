@@ -67,6 +67,50 @@ def load_crowding_vs_strength(db: str) -> pd.DataFrame:
     )
 
 
+def load_rotation_history(db: str) -> pd.DataFrame:
+    """板块轮动排名历史（排名轨迹图）。"""
+    return _read(
+        db,
+        "SELECT run_date, industry, rank, lead_lag, turnover_share FROM quant_rotation ORDER BY run_date, rank"
+    )
+
+
+def load_linkage_edges(db: str, threshold: float = 0.8, max_edges: int = 150) -> pd.DataFrame:
+    """最新联动网络高相关边（按 corr 降序截断，避免图太密）。"""
+    return _read(
+        db,
+        """SELECT a, b, corr, lead FROM quant_linkage
+           WHERE run_date = (SELECT MAX(run_date) FROM quant_linkage) AND corr >= ?
+           ORDER BY corr DESC LIMIT ?""",
+        (threshold, max_edges),
+    )
+
+
+def load_style_history(db: str) -> pd.DataFrame:
+    """行业资金风格占比历史（风格轮动时间线）。"""
+    return _read(
+        db,
+        """SELECT run_date, style, COUNT(*) AS n FROM quant_capital
+           WHERE obj_type='industry' GROUP BY run_date, style ORDER BY run_date"""
+    )
+
+
+def load_position_limit(db: str) -> dict:
+    """当前评级与建议总仓位上限（复用纪律层映射逻辑）。"""
+    from invest.discipline.rating import get_position_limit, get_rating
+    conn = connect(db)
+    try:
+        macro = get_rating(conn, "macro")
+        market = get_rating(conn, "market")
+        return {
+            "macro": (macro or {}).get("value"),
+            "market": (market or {}).get("value"),
+            "position_limit": float(get_position_limit(conn)),
+        }
+    finally:
+        conn.close()
+
+
 def load_data_health(db: str) -> pd.DataFrame:
     """各行情表最新日期与滞后天数（数据健康横幅）。"""
     sql = """
