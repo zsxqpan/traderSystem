@@ -43,6 +43,13 @@ def build_collect_tasks(db_path: str) -> list[dict]:
     return tasks
 
 
+def collect_industry(db_path: str) -> list[dict]:
+    """只采集行业指数全量（同花顺当天数据晚间才发布，供 21:30 刷新）。"""
+    from invest.data.collector import TASKS, run_collection
+    tasks = [t for t in TASKS if t["name"] == "industry_all"]
+    return run_collection(db_path, tasks=tasks)
+
+
 def collect(db_path: str, tasks=None) -> list[dict]:
     """采集数据（默认含候选池个股任务），返回任务摘要。"""
     from invest.data.collector import run_collection

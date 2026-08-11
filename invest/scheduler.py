@@ -148,6 +148,14 @@ def _intraday(db: str, conn) -> None:
         _log_run(conn, "intraday", "ok", "无异动")
 
 
+def _industry_refresh(db: str, conn) -> None:
+    """21:30 行业数据刷新：同花顺当天板块数据晚间才发布，
+    刷新后 22:00 每日复盘即为当天板块涨幅/强度。"""
+    import invest.pipeline as pl
+    pl.collect_industry(db)
+    pl.quant(db)
+
+
 def _nightly(db: str, conn) -> None:
     """22:00 每日复盘：到期观点/工单入队 + 固定推送一份当日状态（无事也发）。"""
     from invest.agent.tickets import expire_overdue
@@ -188,5 +196,6 @@ def build_scheduler() -> BackgroundScheduler:
     sched.add_job(_wrap("monthly", _monthly), CronTrigger(day="1", hour=9, minute=30), id="monthly", misfire_grace_time=43200)
     sched.add_job(_wrap("yearly", _yearly), CronTrigger(month="1", day="1", hour=9, minute=30), id="yearly", misfire_grace_time=43200)
     sched.add_job(_wrap("intraday", _intraday), CronTrigger(day_of_week="mon-fri", hour="9-11,13-14", minute="*/5"), id="intraday")
+    sched.add_job(_wrap("industry_refresh", _industry_refresh), CronTrigger(day_of_week="mon-fri", hour=21, minute=30), id="industry_refresh", misfire_grace_time=3600)
     sched.add_job(_wrap("nightly", _nightly), CronTrigger(hour=22, minute=0), id="nightly", misfire_grace_time=7200)
     return sched
