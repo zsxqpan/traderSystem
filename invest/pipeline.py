@@ -76,9 +76,12 @@ def quant(db_path: str) -> dict:
         ind = pd.read_sql_query(
             "SELECT date, industry, close, amount FROM industry_bars ORDER BY date", conn,
         )
-        idx = pd.read_sql_query(
-            "SELECT date, close FROM index_bars WHERE index_code='000300' ORDER BY date", conn,
+        # 多指数读取（2026-08-16）：沪深300 作基准，其余指数用于风格/结构性行情判断
+        idx_all = pd.read_sql_query(
+            "SELECT date, index_code, close FROM index_bars ORDER BY date", conn,
         )
+        idx300 = idx_all[idx_all["index_code"] == "000300"][["date", "close"]]
+        idx = idx300  # 兼容下游（benchmark 用沪深300）
         macro = pd.read_sql_query(
             "SELECT date, indicator, value FROM macro_series ORDER BY date", conn,
         )
@@ -89,7 +92,7 @@ def quant(db_path: str) -> dict:
             "SELECT date, symbol, close FROM daily_bars ORDER BY date", conn,
         )
         valuation_hist = pd.read_sql_query(
-            "SELECT date, industry, pe FROM industry_valuation ORDER BY date", conn,
+            "SELECT date, industry, pe, pb FROM industry_valuation ORDER BY date", conn,
         )
     finally:
         conn.close()
@@ -110,7 +113,8 @@ def quant(db_path: str) -> dict:
         conn2 = connect(db_path)
         try:
             seat_rows = pd.read_sql_query(
-                "SELECT symbol, seat_type, buy, sell, net FROM dragon_tiger WHERE seat_type IS NOT NULL", conn2,
+                "SELECT symbol, seat_type, buy, sell, net FROM dragon_tiger "
+                "WHERE seat_type IS NOT NULL AND seat_type != 'list'", conn2,
             )
         finally:
             conn2.close()
@@ -119,8 +123,48 @@ def quant(db_path: str) -> dict:
         stock_results["stock_strength"] = compute_strength(stock_closes, benchmark, obj_type="stock")
         stock_results["stock_weekly"] = compute_weekly(stock_closes, benchmark, obj_type="stock")
         stock_results["stock_capital"] = compute_stock_capital(stock_closes, stock_returns, fund_types)
+        # Alpha158 核心量价因子（2026-08-16）：date×symbol 截面，供 factor_eval 检验
+        try:
+            from invest.quant.alpha158 import compute_alpha158
+            stock_hist = stock.copy()
+            stock_hist = stock_hist.sort_values(["symbol", "date"])
+            fdf, fnames = compute_alpha158(stock_hist, idx)
+            stock_results["alpha158"] = {"n_factors": len(fnames), "shape": list(fdf.shape)}
+        except Exception:  # noqa: BLE001
+            stock_results["alpha158"] = {"n_factors": 0, "error": "alpha158 计算失败"}
     if len(stock_closes.columns) >= 3:
         stock_results["stock_linkage"] = compute_linkage(stock_returns, **get_params("linkage"))
+
+    # 指数相对强度（多指数 vs 沪深300，obj_type='index'）与风格判断（2026-08-16）
+    index_results: dict = {}
+    try:
+        from invest.quant.style import compute_style, style_to_text
+        idx_closes = idx_all.pivot_table(index="date", columns="index_code", values="close")
+        idx_closes.index = pd.to_datetime(idx_closes.index, format="mixed", errors="coerce")
+        idx_closes = idx_closes.dropna(how="all").sort_index()
+        bench = benchmark  # 沪深300
+        style_result = compute_style(idx_closes, bench)
+        index_results["style"] = style_result
+        index_results["style_text"] = style_to_text(style_result)
+        # 各指数强度快照（写入 quant_strength, obj_type='index'）
+        rows = []
+        for code, v in (style_result.get("index_strength") or {}).items():
+            if not v.get("rs") or v["rs"] != v["rs"]:  # NaN 跳过
+                continue
+            rows.append({
+                "run_date": style_result.get("run_date"),
+                "obj_type": "index",
+                "obj": code,
+                "period": "short",
+                "rs": v["rs"],
+                "momentum": v["momentum"],
+                "trend_stage": v["trend_stage"],
+                "calc_version": "v1",
+            })
+        if rows:
+            index_results["index_strength_df"] = pd.DataFrame(rows)
+    except Exception:  # noqa: BLE001
+        logger.warning("指数风格计算失败", exc_info=True)
 
     results = {
         "strength": compute_strength(closes, benchmark),
@@ -132,10 +176,27 @@ def quant(db_path: str) -> dict:
         "crowding": compute_crowding(amounts),
         "macro": compute_macro_liquidity(macro),
     }
-    from invest.quant.valuation import compute_pe_percentile, merge_valuation
+    from invest.quant.valuation import (
+        compute_pe_percentile,
+        compute_pb_percentile,
+        merge_valuation,
+    )
     if not results["crowding"].empty and not valuation_hist.empty:
         pct = compute_pe_percentile(valuation_hist)
-        results["crowding"] = merge_valuation(results["crowding"], pct)
+        results["crowding"] = merge_valuation(results["crowding"], pct, col_pct="pe_pct")
+        # PB 分位（[A]1）：pb 数据存在时自动合并（数据源未接入时静默跳过）
+        if valuation_hist["pb"].notna().any():
+            pct_pb = compute_pb_percentile(valuation_hist)
+            results["crowding"] = merge_valuation(results["crowding"], pct_pb, col_pct="pb_pct")
+    # 拥挤度状态机（TODO 2.2）：crowding 分位 + 成交占比趋势 → 状态列
+    try:
+        from invest.quant.crowding_state import state_matrix
+        if not results["crowding"].empty and not amounts.empty:
+            states = state_matrix(results["crowding"], amounts)
+            state_map = dict(zip(states["obj"], states["state"]))
+            results["crowding"]["crowding_state"] = results["crowding"]["obj"].map(state_map)
+    except Exception:  # noqa: BLE001
+        logger.warning("拥挤度状态机计算失败", exc_info=True)
 
     conn = connect(db_path)
     try:
@@ -150,6 +211,8 @@ def quant(db_path: str) -> dict:
             upsert_df(conn, "quant_linkage", stock_results["stock_linkage"])
         if "stock_capital" in stock_results:
             upsert_df(conn, "quant_capital", stock_results["stock_capital"])
+        if "index_strength_df" in index_results:
+            upsert_df(conn, "quant_strength", index_results["index_strength_df"])
         upsert_df(conn, "quant_rotation", results["rotation"])
         upsert_df(conn, "quant_temperature", results["temperature"])
         upsert_df(conn, "quant_capital", results["capital"])
@@ -159,6 +222,8 @@ def quant(db_path: str) -> dict:
     finally:
         conn.close()
     results.update(stock_results)
+    results["style_text"] = index_results.get("style_text", "")
+    results["style"] = index_results.get("style", {})
     return {k: len(v) for k, v in results.items()}
 
 
@@ -387,45 +452,15 @@ def _agent_viewpoints(conn, n: int = 5) -> str:
 
 
 def notify_premarket(db_path: str, agent_text: str = "") -> bool:
-    conn = connect(db_path)
-    try:
-        msg = (
-            f"【A股投资系统 · 盘前】\n"
-            f"数据截至: {_freshness(conn)}\n"
-            f"评级: {_ratings_block(conn)}\n"
-            f"市场温度: {_temperature(conn)}\n"
-            f"板块宽度: {_breadth(conn)}\n"
-            f"关注方向(Agent):\n{agent_text or '[Agent 未运行]'}"
-        )
-    finally:
-        conn.close()
+    from invest.report import premarket_report
+    msg = premarket_report(db_path, agent_text)
     from invest.notifier import Notifier
     return Notifier().send_text(msg, key="premarket", min_interval=600)
 
 
 def notify_after_close(db_path: str, agent_text: str = "") -> bool:
-    conn = connect(db_path)
-    try:
-        new_vp = conn.execute(
-            "SELECT COUNT(*) AS n FROM viewpoints WHERE date(created_at)=date('now','localtime')"
-        ).fetchone()["n"]
-        stop_hits = conn.execute(
-            """SELECT COUNT(*) AS n FROM trade_records
-               WHERE date(created_at)=date('now','localtime') AND deviation_note LIKE '%止损%'"""
-        ).fetchone()["n"]
-        msg = (
-            f"【A股投资系统 · 盘后日报】\n"
-            f"数据截至: {_freshness(conn)}\n"
-            f"市场温度: {_temperature(conn)}\n"
-            f"板块宽度: {_breadth(conn)}\n"
-            f"评级: {_ratings_block(conn)}\n"
-            f"{_daily_movers_block(conn)}\n"
-            f"短线强度前5（RS 5/10/20日超额）:\n{_top_strength(conn, 'short')}\n"
-            f"今日新增观点: {new_vp} 条 | 触发止损: {stop_hits} 笔\n"
-            f"Agent 复盘:\n{_agent_viewpoints(conn) or agent_text or '[Agent 未运行]'}"
-        )
-    finally:
-        conn.close()
+    from invest.report import daily_report
+    msg = daily_report(db_path, agent_text)
     from invest.notifier import Notifier
     return Notifier().send_text(msg, key="after_close", min_interval=600)
 
@@ -453,3 +488,26 @@ def _macro_text(conn) -> str:
         "SELECT indicator, value FROM quant_macro ORDER BY date DESC, indicator"
     ).fetchall()
     return "；".join(f"{r['indicator']}={r['value']}" for r in rows) or "-"
+
+
+def notify_p2_brief(db_path: str, agent_text: str = "") -> bool:
+    """P2 例行简报（[A]8）：每日榜单摘要 + 宏观仪表盘，rest 级关注推送。
+
+    内容：数据新鲜度 / 评级 / 当日涨跌幅榜 / 短线强度前5 / 宏观流动性；
+    与盘后日报区别：更轻量，面向 rest 级关注与日常巡检。
+    """
+    conn = connect(db_path)
+    try:
+        msg = (
+            f"【A股投资系统 · P2 例行简报】\n"
+            f"数据截至: {_freshness(conn)}\n"
+            f"评级: {_ratings_block(conn)}\n"
+            f"{_daily_movers_block(conn, n=3)}\n"
+            f"短线强度前5（RS 5/10/20日超额）:\n{_top_strength(conn, 'short')}\n"
+            f"宏观流动性:\n{_macro_text(conn)}\n"
+            f"Agent 简报:\n{agent_text or '[Agent 未运行]'}"
+        )
+    finally:
+        conn.close()
+    from invest.notifier import Notifier
+    return Notifier().send_text(msg, key="p2_brief", min_interval=600)

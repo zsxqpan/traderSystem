@@ -29,8 +29,19 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-chat"
     llm_api_key: str = ""
 
-    # 推送
+    # 推送：企业微信
     wecom_webhook: str = ""
+
+    # 推送：飞书群（开放平台 API，需走代理）
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_chat_id: str = ""
+    feishu_proxy: str = "http://127.0.0.1:7892"
+
+    # 推送：个人微信（iLink Bot API，token 来自 Hermes weixin 登录）
+    weixin_token: str = ""
+    weixin_to_user_id: str = ""
+    weixin_ctx_path: str = ""
 
     # 数据源
     tushare_token: str = ""

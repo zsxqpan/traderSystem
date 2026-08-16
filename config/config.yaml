@@ -57,3 +57,23 @@ data:
   note: "东财 qfq 与新浪 qfq 数值存在约 2% 差异；交叉校验须同口径或放宽容差"
   industries_v1:
     - 半导体   # 占位：行业列表接口可达后校准（支持 BK 代码或名称）
+
+# 交易成本模型（2026-08-15，invest/discipline/costs.py）
+costs:
+  commission_rate: 0.00025   # 佣金万2.5
+  commission_min: 5.0        # 最低佣金 5 元
+  stamp_tax_rate: 0.0005     # 印花税 0.05%（卖出）
+  transfer_fee_rate: 0.00001 # 过户费 0.001%（双向）
+  slippage_rate: 0.001       # 滑点 0.1%
+  impact_rate: 0.0           # 冲击成本（默认 0）
+  adv_participation_limit: 0.05  # 单笔/20日均额 上限
+
+# 组合风险簇与预算上限（2026-08-15，invest/discipline/clusters.py）
+budgets:
+  style_total: 0.60   # 风格簇合计上限
+  cluster: 0.40       # 单风险簇上限
+  l2_soft: 0.25       # 单 L2 软上限
+  l2_hard: 0.35       # 单 L2 硬上限
+  event: 0.20         # 事件博弈簇合计上限
+clusters:             # 可追加/覆盖风险簇规则（行业关键词 -> 簇）
+  # 示例: "红利资产": ["电力", "煤炭"]

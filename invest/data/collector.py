@@ -36,6 +36,55 @@ TASKS: list[dict] = [
         "cross_check": False,
         "params": {"symbol": "000300", "start_date": "20240101", "end_date": "20991231"},
     },
+    # 多指数监控（2026-08-16 新增）：覆盖大盘/中小盘/成长/北交所，供风格与结构性行情判断
+    {
+        "name": "index_bars_000016",
+        "kind": "index_bars",
+        "table": "index_bars",
+        "sources": ["akshare"],
+        "cross_check": False,
+        "params": {"symbol": "000016", "start_date": "20240101", "end_date": "20991231"},
+    },
+    {
+        "name": "index_bars_000905",
+        "kind": "index_bars",
+        "table": "index_bars",
+        "sources": ["akshare"],
+        "cross_check": False,
+        "params": {"symbol": "000905", "start_date": "20240101", "end_date": "20991231"},
+    },
+    {
+        "name": "index_bars_000852",
+        "kind": "index_bars",
+        "table": "index_bars",
+        "sources": ["akshare"],
+        "cross_check": False,
+        "params": {"symbol": "000852", "start_date": "20240101", "end_date": "20991231"},
+    },
+    {
+        "name": "index_bars_000688",
+        "kind": "index_bars",
+        "table": "index_bars",
+        "sources": ["akshare"],
+        "cross_check": False,
+        "params": {"symbol": "000688", "start_date": "20240101", "end_date": "20991231"},
+    },
+    {
+        "name": "index_bars_399006",
+        "kind": "index_bars",
+        "table": "index_bars",
+        "sources": ["akshare"],
+        "cross_check": False,
+        "params": {"symbol": "399006", "start_date": "20240101", "end_date": "20991231"},
+    },
+    {
+        "name": "index_bars_899050",
+        "kind": "index_bars",
+        "table": "index_bars",
+        "sources": ["akshare"],
+        "cross_check": False,
+        "params": {"symbol": "899050", "start_date": "20240101", "end_date": "20991231"},
+    },
 
     {
         "name": "industry_all",
@@ -62,7 +111,7 @@ TASKS: list[dict] = [
         "table": "margin",
         "sources": ["akshare"],
         "cross_check": False,
-        "params": {"start_date": "20240101", "end_date": "20240801"},
+        "params": {"start_date": "20240101", "end_date": "20991231"},
     },
     {
         "name": "macro_pmi",
@@ -79,6 +128,30 @@ TASKS: list[dict] = [
         "sources": ["akshare"],
         "cross_check": False,
         "params": {"macro": "new_financial_credit"},
+    },
+    {
+        "name": "macro_shrzgm",
+        "kind": "macro_series",
+        "table": "macro_series",
+        "sources": ["akshare"],
+        "cross_check": False,
+        "params": {"macro": "shrzgm"},
+    },
+    {
+        "name": "macro_bond_yield",
+        "kind": "macro_series",
+        "table": "macro_series",
+        "sources": ["akshare"],
+        "cross_check": False,
+        "params": {"macro": "bond_yield"},
+    },
+    {
+        "name": "macro_all_a_pe",
+        "kind": "macro_series",
+        "table": "macro_series",
+        "sources": ["akshare"],
+        "cross_check": False,
+        "params": {"macro": "all_a_pe"},
     },
     {
         "name": "industry_valuation",
@@ -160,12 +233,15 @@ def _run_one(
                 params = dict(task.get("params", {}))
                 params["kind"] = task["kind"]
                 if task["kind"] in ("market_emotion", "industry_valuation") and "date" not in params:
-                    import datetime as _dt
-                    params["date"] = _dt.date.today().strftime("%Y%m%d")
+                    # 交易日参数：非交易日（周末/节假日）回退到最近交易日，
+                    # 否则接口按 date 查当日数据返回空（2026-08-15 周六实测）。
+                    from invest.data.calendar import latest_trading_day
+                    params["date"] = latest_trading_day().strftime("%Y%m%d")
                 df = src.fetch(params)
                 df = src.normalize(df, params)
-                if (df is None or df.empty) and task["kind"] == "market_emotion":
-                    # 节假日/停市：无涨停池数据，跳过落库（不记 0 涨停、不判失败）
+                if (df is None or df.empty) and task["kind"] in ("market_emotion", "seat_detail"):
+                    # 空数据属正常：节假日无涨停池 / 候选池近期无龙虎榜上榜，
+                    # 跳过落库（不记 0 行、不判失败）
                     update_credibility(conn, src_name, True)
                     source_results.append({"source": src_name, "rows": 0, "written": 0})
                     break

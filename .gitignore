@@ -7,6 +7,12 @@ logs/
 
 # 环境与密钥
 .env
+.env.backup*
+
+# 本地临时/测试产物
+.tmp/
+_pytest_out.txt
+probe_verify_tmp.py
 
 # Python
 __pycache__/

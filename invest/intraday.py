@@ -1,4 +1,16 @@
-"""盘中异动监测：核心关注个股实时涨跌幅监控（东财盘口优先，新浪分钟线兜底）。"""
+﻿"""盘中异动监测：核心关注个股实时涨跌幅监控（三源直连轮询）。
+
+实时行情通道（2026-08-15 决策）：新浪 hq.sinajs.cn / 腾讯 qt.gtimg.cn /
+东财 push2 三源直连 Level-1 快照轮询，批量取核心池，3-5 秒间隔；
+任一源失败自动切换下一源；行情时间戳与接收时刻差值超阈值视为
+不新鲜（stale），不支撑决策（数据失效即防守）。
+
+推送时效分级（v3 14.3，2026-08-15）：
+- P0（core 核心关注异动）：交易时段内立即推送，300s 限频；
+- P1（track 跟踪异动）：600s 降频（避免噪音）；
+- P2（rest/其他）：不实时推送（仅晚间复盘汇总）；
+- 非交易时段：盘中异动类一律静默（防御，正常调度已由 _in_trading_window 守护）。
+"""
 from __future__ import annotations
 
 import datetime as dt
@@ -17,33 +29,56 @@ def _in_trading_window(now: dt.datetime | None = None) -> bool:
     return (dt.time(9, 35) <= t <= dt.time(11, 30)) or (dt.time(13, 5) <= t <= dt.time(14, 55))
 
 
+def _bare_symbol(sym: str) -> str:
+    """sz000001 -> 000001；600519 -> 600519（裸代码，与 candidate_pool 一致）。"""
+    s = sym.lower()
+    for prefix in ("sh", "sz", "bj"):
+        if s.startswith(prefix):
+            return s[2:]
+    return s
+
+
 def fetch_current_price(symbol: str) -> float | None:
-    """取最新价：优先东财实时盘口（"最新"），失败回退新浪 60 分钟线最后一根收盘。"""
+    """取单只最新价：三源直连轮询，失败返回 None（保持旧接口签名）。"""
+    from invest.data.realtime import RealtimeQuoter, _to_market_symbol
     try:
-        import akshare as ak
-        from invest.data.sources.akshare_source import call_with_timeout
-        df = call_with_timeout(ak.stock_bid_ask_em, symbol=symbol, timeout=20)
-        if df is not None and not df.empty and {"item", "value"} <= set(df.columns):
-            row = df[df["item"] == "最新"]
-            if not row.empty:
-                v = pd.to_numeric(row["value"].iloc[0], errors="coerce")
-                if pd.notna(v) and float(v) > 0:
-                    return float(v)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        import akshare as ak
-        from invest.data.sources.akshare_source import _sina_stock_symbol
-        from invest.data.sources.akshare_source import call_with_timeout
-        df = call_with_timeout(ak.stock_zh_a_minute, symbol=_sina_stock_symbol(symbol), period="60", timeout=20)
-        if df is None or df.empty:
+        with RealtimeQuoter() as q:
+            quotes = q.fetch([symbol])
+        if not quotes:
             return None
-        close_col = "close" if "close" in df.columns else ("收盘" if "收盘" in df.columns else None)
-        if close_col is None:
-            return None
-        return float(df[close_col].dropna().iloc[-1])
+        msym = _to_market_symbol(symbol)
+        qq = quotes.get(msym) or next(iter(quotes.values()))
+        return qq.price if qq else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def fetch_batch_prices(
+    symbols: list[str],
+    max_lag: float = 10.0,
+    db_path: str | None = None,
+) -> dict[str, float]:
+    """批量取最新价（核心池一次轮询）：返回 {裸代码: price}，只收新鲜数据。
+
+    db_path 提供时，将源/延迟/stale 计数写入 job_runs(job='realtime') 留痕。
+    """
+    from invest.data.realtime import RealtimeQuoter, is_fresh, log_realtime_health
+    symbols = list(dict.fromkeys(symbols))
+    if not symbols:
+        return {}
+    try:
+        with RealtimeQuoter() as q:
+            quotes = q.fetch(symbols)
+    except Exception:  # noqa: BLE001
+        return {}
+    if db_path:
+        log_realtime_health(db_path, quotes, q.source_failures)
+    out: dict[str, float] = {}
+    for sym, qq in quotes.items():
+        if qq.price is None or not is_fresh(qq, max_lag=max_lag):
+            continue
+        out[_bare_symbol(sym)] = qq.price
+    return out
 
 
 def _baselines(db_path: str) -> dict[str, float]:
@@ -60,7 +95,11 @@ def _baselines(db_path: str) -> dict[str, float]:
 
 
 def check_core_moves(db_path: str, threshold: float = 0.03) -> list[dict]:
-    """核心关注个股盘中异动检测。"""
+    """核心关注个股盘中异动检测：批量取价一次轮询，缺失标的跳过。
+
+    数据失效即防守：三源全挂或行情不新鲜时返回空列表（不推送、不抛错）；
+    轮询延迟/源切换写入 job_runs(job='realtime') 留痕。
+    """
     conn = connect(db_path)
     try:
         core = [r["symbol"] for r in conn.execute(
@@ -68,10 +107,13 @@ def check_core_moves(db_path: str, threshold: float = 0.03) -> list[dict]:
         )]
     finally:
         conn.close()
+    if not core:
+        return []
     baselines = _baselines(db_path)
+    prices = fetch_batch_prices(core, db_path=db_path)
     alerts = []
     for sym in core:
-        price = fetch_current_price(sym)
+        price = prices.get(sym)
         base = baselines.get(sym)
         if price is None or base is None or base <= 0:
             continue
@@ -99,14 +141,45 @@ def _attribute(db_path: str, alert: dict) -> str:
         return ""
 
 
+# 推送时效分级：候选池 level -> (优先级, 限频秒)
+_PUSH_POLICY = {
+    "core": ("P0", 300),    # 核心关注：交易时段立即推
+    "track": ("P1", 600),   # 跟踪：降频，避免噪音
+    "rest": ("P2", 0),      # 其余：不实时推（仅晚间汇总）
+}
+
+
 def send_alerts(db_path: str, alerts: list[dict], attribute: bool = True) -> int:
-    """推送异动（同标的 5 分钟限频）；attribute 时为首条异动附 LLM 归因。"""
+    """推送异动，按候选池等级时效分级（v3 14.3）。
+
+    - 非交易时段：一律静默返回 0（防御：正常调度已由 _in_trading_window 守护）；
+    - P0（core）：立即推送，300s 限频；P1（track）：600s 限频；
+    - P2（rest）：不实时推送，仅晚间复盘汇总（这里跳过）；
+    - attribute 时为首条 P0 异动附 LLM 归因。
+    """
+    if not _in_trading_window():
+        return 0
     from invest.notifier import Notifier
+    conn = connect(db_path)
+    try:
+        levels = {
+            r["symbol"]: r["level"]
+            for r in conn.execute("SELECT symbol, level FROM candidate_pool WHERE out_date IS NULL")
+        }
+    finally:
+        conn.close()
     notifier = Notifier()
     sent = 0
-    for i, a in enumerate(alerts):
-        msg = f"【盘中异动】{a['symbol']} 现价 {a['price']:.2f}，较昨收 {a['pct']:+.2%}"
-        if attribute and i == 0:
+    # 只对 P0/P1 推送；P2 静默（晚间复盘统一汇总）
+    pushable = [a for a in alerts if levels.get(a["symbol"], "rest") in ("core", "track")]
+    if not pushable:
+        return 0
+    for i, a in enumerate(pushable):
+        level = levels.get(a["symbol"], "rest")
+        priority, interval = _PUSH_POLICY.get(level, ("P2", 0))
+        tag = f"[{priority}]"
+        msg = f"{tag}【盘中异动】{a['symbol']} 现价 {a['price']:.2f}，较昨收 {a['pct']:+.2%}"
+        if attribute and i == 0 and priority == "P0":
             try:
                 note = _attribute(db_path, a)
             except Exception:  # noqa: BLE001
@@ -116,7 +189,7 @@ def send_alerts(db_path: str, alerts: list[dict], attribute: bool = True) -> int
         ok = notifier.send_text(
             msg,
             key=f"intraday_{a['symbol']}",
-            min_interval=300,
+            min_interval=interval,
         )
         sent += int(ok)
     return sent

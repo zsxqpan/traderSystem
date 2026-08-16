@@ -48,9 +48,17 @@ def compute_capital(closes: pd.DataFrame, returns: pd.DataFrame) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
-def classify_seat(seat_name: str) -> str:
-    """营业部名称 → 资金类型：机构 / 北向 / 量化 / 游资。"""
-    name = seat_name or ""
+def classify_seat(seat_name: str) -> str | None:
+    """营业部名称 → 资金类型：机构 / 北向 / 量化 / 游资。
+
+    榜单占位行（seat_type='list'，龙虎榜名单无席位概念）、空值与 NaN 返回 None，
+    不得误分类为游资（2026-08-15 修复：曾把 'list' 落入默认分支变假数据）。
+    """
+    if not isinstance(seat_name, str):
+        return None
+    name = seat_name.strip()
+    if not name or name == "list":
+        return None
     if "机构专用" in name:
         return "机构"
     if "股通" in name:
@@ -61,12 +69,18 @@ def classify_seat(seat_name: str) -> str:
 
 
 def aggregate_fund_types(seat_rows: pd.DataFrame) -> dict[str, dict]:
-    """席位明细 → {symbol: {fund_type, confidence}}（按净额主导类型）。"""
+    """席位明细 → {symbol: {fund_type, confidence}}（按净额主导类型）。
+
+    只统计真实席位行（seat_type 非 list/空）；榜单占位行剔除，防假数据。
+    """
     out: dict = {}
     if seat_rows is None or seat_rows.empty or "symbol" not in seat_rows.columns:
         return out
     g = seat_rows.copy()
-    g["fund_type"] = g["seat_type"].map(classify_seat)
+    g["fund_type"] = g["seat_type"].apply(classify_seat)
+    g = g[g["fund_type"].notna()]  # 剔除占位行（list/空）——只能由真实席位得出类型
+    if g.empty:
+        return out
     for sym, grp in g.groupby("symbol"):
         by_type = grp.groupby("fund_type")["net"].sum()
         total = float(by_type.sum())

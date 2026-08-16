@@ -75,7 +75,12 @@ def test_yearly_review():
     conn.commit()
     r = yearly_review(conn)
     assert len(r["backtest_summary"]) == 1
-    assert r["suggestions"]
+    assert r["backtest_summary"][0]["rule_type"] == "trend_stage_excess"
+    # 新结构：等级单调/凯利校准/权重区分度/错误分类
+    assert "level_monotonicity" in r
+    assert "kelly_calibration" in r
+    assert "weight_discrimination" in r
+    assert "error_classification" in r
     conn.close()
     print("test_yearly_review OK")
 

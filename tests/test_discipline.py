@@ -138,11 +138,41 @@ def test_pool_industry():
     conn.close()
     print("test_pool_industry OK")
 
+
+
+def test_risk_data_guard_degrade():
+    import datetime as _dt
+    p = _tmp_db()
+    conn = connect(p)
+    rating.set_rating(conn, "macro", "宽松")
+    rating.set_rating(conn, "market", "进攻")
+    # 无实时留痕 + 无日线 -> data_guard 应报实时行情失效
+    v = risk.data_guard(conn, db_path=p)
+    assert any("实时行情失效" in x for x in v)
+    # data_ok=False -> check_position 强制禁止新开仓
+    violations = risk.check_position(conn, proposed=0.05, data_ok=False)
+    assert any("数据失效" in x for x in violations)
+    # data_ok=True + 仓位合规 -> 无违规
+    ok_v = risk.check_position(conn, proposed=0.05, data_ok=True)
+    assert not any("数据失效" in x for x in ok_v)
+    # 日线陈旧 -> 报日线数据陈旧
+    conn.execute(
+        "INSERT INTO daily_bars(symbol, date, close, src) VALUES('X1', ?, 10.0, 'akshare')",
+        ((_dt.date.today() - _dt.timedelta(days=30)).isoformat(),),
+    )
+    conn.commit()
+    v2 = risk.data_guard(conn, db_path=p)
+    assert any("日线数据陈旧" in x for x in v2)
+    conn.close()
+    print("test_risk_data_guard_degrade OK")
+
+
 if __name__ == "__main__":
     test_pool_capacity()
     test_rating_position()
     test_plan_validations()
     test_risk_checks()
+    test_risk_data_guard_degrade()
     test_records_deviation()
     test_pool_industry()
     print("\nALL DISCIPLINE TESTS PASSED")

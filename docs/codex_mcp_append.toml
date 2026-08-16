@@ -1,0 +1,18 @@
+# ============================================================
+# 追加到 C:\Users\狐狸怂\.codex\config.toml 末尾
+# （在 [projects....] 段之后，直接粘贴即可）
+# 用记事本打开 config.toml，复制下面全部内容粘贴到文件末尾保存
+# ============================================================
+
+[mcp_servers.sqlite-invest]
+command = 'C:\Users\狐狸怂\AppData\Roaming\uv\tools\mcp-notify\Scripts\python.exe'
+args = ["-m", "tools.mcp.local_sqlite_mcp"]
+
+[mcp_servers.sqlite-invest.env]
+PYTHONPATH = 'C:\Users\狐狸怂\Documents\Codex\2026-08-01\la\traderSystem'
+
+[mcp_servers.mcp-notify]
+command = 'C:\Users\狐狸怂\AppData\Roaming\uv\tools\mcp-notify\Scripts\mcp-notify.exe'
+
+[mcp_servers.akshare-tools]
+command = 'C:\Users\狐狸怂\AppData\Roaming\uv\tools\akshare-tools\Scripts\akshare-tools.exe'

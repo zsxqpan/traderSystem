@@ -45,7 +45,7 @@ def test_notifier_disabled_and_mock():
 def test_scheduler_jobs():
     sched = build_scheduler()
     ids = {j.id for j in sched.get_jobs()}
-    assert {"premarket", "after_close", "weekend", "intraday", "monthly", "yearly", "nightly", "industry_refresh"} <= ids
+    assert {"premarket", "after_close", "weekend", "intraday_tick", "monthly", "yearly", "nightly", "industry_refresh", "p2_brief"} <= ids
     print("test_scheduler_jobs OK")
 
 

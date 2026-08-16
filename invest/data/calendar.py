@@ -50,3 +50,11 @@ def upcoming_events(conn: sqlite3.Connection, days: int = 7) -> list[dict]:
         (today, limit),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def latest_trading_day(d: dt.date | None = None) -> dt.date:
+    """最近一个交易日（含今天；今天非交易日则回退到上一个工作日）。"""
+    d = d or dt.date.today()
+    while not is_trading_day(d):
+        d -= dt.timedelta(days=1)
+    return d

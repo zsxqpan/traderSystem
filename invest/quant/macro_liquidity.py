@@ -1,4 +1,4 @@
-"""宏观流动性加工（中线轨）：M1-M2 剪刀差、PMI、新增信贷同比。"""
+"""宏观流动性加工（中线轨）：M1-M2 剪刀差、PMI、社融增量、新增信贷。"""
 from __future__ import annotations
 
 import pandas as pd
@@ -26,5 +26,7 @@ def compute_macro_liquidity(macro_df: pd.DataFrame) -> pd.DataFrame:
     if "货币(M1)-同比增长" in idx and "货币和准货币(M2)-同比增长" in idx:
         add("M1-M2剪刀差", idx["货币(M1)-同比增长"] - idx["货币和准货币(M2)-同比增长"])
     add("PMI制造业指数", idx.get("制造业-指数"))
+    # 真实社融增量（商务部源 macro_shrzgm，2026-08-15 接入）；无则回落新增信贷同比
+    add("社融增量", idx.get("社会融资规模增量"))
     add("新增信贷同比", idx.get("当月-同比增长"))
     return pd.DataFrame(rows)

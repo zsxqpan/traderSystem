@@ -176,10 +176,16 @@ def test_macro_liquidity():
         "indicator": ["制造业-指数"],
         "value": [49.5],
     })
-    out = compute_macro_liquidity(pd.concat([m, m2, m3], ignore_index=True))
+    m4 = pd.DataFrame({
+        "date": ["2026年03月份"],
+        "indicator": ["社会融资规模增量"],
+        "value": [52240.0],
+    })
+    out = compute_macro_liquidity(pd.concat([m, m2, m3, m4], ignore_index=True))
     d = dict(zip(out["indicator"], out["value"]))
     assert abs(d["M1-M2剪刀差"] - (1.5 - 7.0)) < 1e-6, d
     assert d["PMI制造业指数"] == 49.5
+    assert d["社融增量"] == 52240.0  # 真实社融增量已接入（2026-08-15）
     print("test_macro_liquidity OK")
 
 
@@ -218,16 +224,21 @@ def test_seat_classification_and_stock_capital():
     assert classify_seat("深股通专用") == "北向"
     assert classify_seat("某某量化营业部") == "量化"
     assert classify_seat("中信证券上海分公司") == "游资"
+    # 榜单占位行不得误分类（2026-08-15 修复：'list'/空 曾落入默认"游资"分支）
+    assert classify_seat("list") is None
+    assert classify_seat(None) is None
 
     seats = pd.DataFrame({
-        "symbol": ["000001", "000001", "000001", "600000", "600000"],
-        "seat_type": ["机构专用", "机构专用", "游资X", "深股通专用", "深股通专用"],
-        "net": [1000.0, 900.0, -500.0, 300.0, 200.0],
+        "symbol": ["000001", "000001", "000001", "600000", "600000", "000002", "000002"],
+        "seat_type": ["机构专用", "机构专用", "游资X", "深股通专用", "深股通专用", "list", None],
+        "net": [1000.0, 900.0, -500.0, 300.0, 200.0, 9999.0, 9999.0],
     })
     ft = aggregate_fund_types(seats)
     assert ft["000001"]["fund_type"] == "机构"
     assert ft["000001"]["confidence"] > 0.5
     assert ft["600000"]["fund_type"] == "北向"
+    # 只有占位行的标的不得产出 fund_type（防假数据）
+    assert "000002" not in ft or ft["000002"]["fund_type"] is None
 
     dates = pd.bdate_range("2024-01-02", periods=120)
     closes = pd.DataFrame({

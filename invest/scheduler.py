@@ -1,4 +1,10 @@
-"""调度器：盘前/盘后/周末/夜间例行任务（APScheduler）。"""
+"""调度器：盘前/盘后/周末/夜间例行任务（APScheduler）。
+
+盘中实时行情通道（2026-08-15 决策）：独立 ticker 每 4 秒轮询核心池，
+非交易时段由 _in_trading_window 守护（空转无副作用）；
+异动推送与失败留痕照常，正常轮询不写 job_runs（留痕由
+log_realtime_health 节流承担，正常 60s 一条基线、异常立即记）。
+"""
 from __future__ import annotations
 
 import logging
@@ -7,6 +13,7 @@ from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from invest.db import connect, init_db
 from invest.notifier import Notifier
@@ -89,6 +96,18 @@ def _premarket(db: str, conn) -> None:
     import invest.pipeline as pl
     pl.collect(db)
     pl.quant(db)
+    # 环境重评触发检查（[B]8）：ERP 跨分位/社融拐点/10Y>20bp，触发即推送提示
+    try:
+        from invest.discipline.macro_gate import check_env_retrigger, env_retrigger_text
+        result = check_env_retrigger(conn)
+        text = env_retrigger_text(result)
+        if text:
+            _log_run(conn, "env_retrigger", "ok", f"触发 {result['n']} 条")
+            Notifier().send_text(text, key="env_retrigger", min_interval=43200)
+        else:
+            _log_run(conn, "env_retrigger", "ok", "无触发")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("环境重评检查失败: %s", exc)
     text = pl.agent_premarket(db)
     pl.notify_premarket(db, text)
 
@@ -100,6 +119,22 @@ def _after_close(db: str, conn) -> None:
     text = pl.agent_after_close(db)
     n_conflict = pl.arbitrate_all(db)
     pl.notify_after_close(db, text if n_conflict == 0 else f"{text}\n[自动仲裁 {n_conflict} 对冲突]")
+    # 收盘扫描：因子快照 + 变化检测 + P1 推送（新入池/等级/评级变化）
+    try:
+        from invest.scan import run_scan_and_notify
+        changes = run_scan_and_notify(db)
+        if changes:
+            _log_run(conn, "scan", "ok", f"P1 变化 {len(changes)} 条")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("收盘扫描失败: %s", exc)
+    # 历史行业归属/ST 状态快照（[A]10）：每日收盘落库，供历史时点回溯
+    try:
+        from invest.data.universe import record_universe_snapshot
+        n_uni = record_universe_snapshot(conn)
+        if n_uni:
+            _log_run(conn, "universe", "ok", f"快照 {n_uni} 个标的")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("历史快照失败: %s", exc)
 
 
 def _weekend(db: str, conn) -> None:
@@ -110,7 +145,18 @@ def _weekend(db: str, conn) -> None:
     pl.quant(db)
     review = weekly_review(conn)
     save_report(conn, review["period"], "weekly", review)
-    pl.notify_weekend(db, f"纪律得分: {review['score']}；计划外交易 {review['rogue_trades']} 笔")
+    # 周度纪律 + 周期漂移 + 持仓卡片复评（[A]6/[A]7）一并推送
+    card_warns = [c for c in review["cards_review"] if c.get("hit_stop") or c.get("near_stop")]
+    extra = ""
+    if card_warns:
+        extra = "\n持仓卡片警戒: " + "；".join(
+            f"{c['symbol']}{'破止损' if c['hit_stop'] else '近止损'}" for c in card_warns
+        )
+    pl.notify_weekend(
+        db,
+        f"纪律得分: {review['score']}；计划外交易 {review['rogue_trades']} 笔；"
+        f"周期漂移 {review['cycle_drift']} 个计划" + extra,
+    )
 
 
 def _monthly(db: str, conn) -> None:
@@ -118,8 +164,13 @@ def _monthly(db: str, conn) -> None:
     from invest.review.report import save_report
     content = monthly_review(conn)
     save_report(conn, "monthly", "monthly", content)
+    env = content.get("environment_quality", {})
+    env_note = ""
+    if env.get("verdict") == "warn":
+        env_note = "；环境质量告警: " + "；".join(env.get("warnings", []))
     Notifier().send_text(
-        f"月度复盘: 观点命中率 {content['overall_accuracy'] if content['overall_accuracy'] is not None else '暂无'} | 待复盘 {content['pending_review']} 条",
+        f"月度复盘: 观点命中率 {content['overall_accuracy'] if content['overall_accuracy'] is not None else '暂无'} | "
+        f"待复盘 {content['pending_review']} 条 | 环境质量 {env.get('verdict', 'ok')}{env_note}",
         key="monthly",
     )
 
@@ -132,20 +183,44 @@ def _yearly(db: str, conn) -> None:
     Notifier().send_text(f"年度复盘已生成: {len(content['backtest_summary'])} 组回测结论待检视", key="yearly")
 
 
-def _intraday(db: str, conn) -> None:
+def _intraday_tick_job() -> None:
+    """盘中 4 秒轮询 job 入口（无参，适配 APScheduler）。
+
+    - 非交易时段直接返回（守护，空转开销极小；行情旧属正常，不跑 P0 监控）；
+    - 正常轮询不写 job_runs（避免每 4 秒一条噪音；实时健康留痕由
+      log_realtime_health 节流承担，异常/stale 立即落库）；
+    - 仅异动推送与失败留痕。
+    """
     import invest.intraday as intr
+    db = str(ROOT / "data" / "invest.db")
     if not intr._in_trading_window():
         return
+    # P0 监控（仅交易时段：休市行情旧属正常，非交易时段不检查数据冲突）
+    try:
+        from invest.monitor import run_p0_monitor
+        run_p0_monitor(db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("P0 监控失败: %s", exc)
+    conn = connect(db)
     try:
         alerts = intr.check_core_moves(db)
     except Exception as exc:  # noqa: BLE001
-        _log_run(conn, "intraday", "failed", str(exc))
+        try:
+            _log_run(conn, "intraday", "failed", str(exc))
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning("盘中轮询失败: %s", exc)
         return
+    finally:
+        conn.close()
     if alerts:
         sent = intr.send_alerts(db, alerts)
-        _log_run(conn, "intraday", "ok", f"异动 {len(alerts)} 条，推送 {sent} 条")
-    else:
-        _log_run(conn, "intraday", "ok", "无异动")
+        conn2 = connect(db)
+        try:
+            _log_run(conn2, "intraday", "ok", f"异动 {len(alerts)} 条，推送 {sent} 条")
+        finally:
+            conn2.close()
+
 
 
 def _industry_refresh(db: str, conn) -> None:
@@ -178,6 +253,16 @@ def _nightly(db: str, conn) -> None:
         f"今日新增观点: {new_vp} 条 | 到期进复盘: {expired} 条 | 工单超时: {overdue} 张\n"
         f"Agent 观点:\n{pl._agent_viewpoints(conn) or '-'}"
     )
+    # 数据质量报告（PIT 四状态）追加到复盘消息
+    try:
+        from invest.data.pit import quality_report
+        report = quality_report(conn)
+        bad = {t: st for t, (st, _info) in report.items() if st != "valid"}
+        if bad:
+            parts = [f"{t}={st}" for t, st in list(bad.items())[:8]]
+            msg += f"\n数据质量: {', '.join(parts)}"
+    except Exception:  # noqa: BLE001
+        pass
     ok = Notifier().send_text(msg, key="nightly")
     if not ok:
         time.sleep(5)  # 网络抖动时重试一次
@@ -188,6 +273,12 @@ def _nightly(db: str, conn) -> None:
     return "push_ok"
 
 
+def _p2_brief(db: str, conn) -> None:
+    """P2 例行简报（[A]8）：每日榜单摘要 + 宏观仪表盘，rest 级关注巡检。"""
+    import invest.pipeline as pl
+    pl.notify_p2_brief(db)
+
+
 def build_scheduler() -> BackgroundScheduler:
     sched = BackgroundScheduler(timezone="Asia/Shanghai")
     sched.add_job(_wrap("premarket", _premarket), CronTrigger(day_of_week="mon-fri", hour=8, minute=30), id="premarket", misfire_grace_time=21600)
@@ -195,7 +286,17 @@ def build_scheduler() -> BackgroundScheduler:
     sched.add_job(_wrap("weekend", _weekend), CronTrigger(day_of_week="sat", hour=9, minute=0), id="weekend", misfire_grace_time=7200)
     sched.add_job(_wrap("monthly", _monthly), CronTrigger(day="1", hour=9, minute=30), id="monthly", misfire_grace_time=43200)
     sched.add_job(_wrap("yearly", _yearly), CronTrigger(month="1", day="1", hour=9, minute=30), id="yearly", misfire_grace_time=43200)
-    sched.add_job(_wrap("intraday", _intraday), CronTrigger(day_of_week="mon-fri", hour="9-11,13-14", minute="*/5"), id="intraday")
+    # 盘中实时行情：4 秒高频轮询（三源直连，替代原 5 分钟 cron）
+    sched.add_job(
+        _intraday_tick_job,
+        IntervalTrigger(seconds=4),
+        id="intraday_tick",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
     sched.add_job(_wrap("industry_refresh", _industry_refresh), CronTrigger(day_of_week="mon-fri", hour=21, minute=30), id="industry_refresh", misfire_grace_time=3600)
     sched.add_job(_wrap("nightly", _nightly), CronTrigger(hour=22, minute=0), id="nightly", misfire_grace_time=7200)
+    # P2 例行简报（[A]8）：21:35 每日榜单 + 宏观仪表盘（行业刷新之后、复盘之前）
+    sched.add_job(_wrap("p2_brief", _p2_brief), CronTrigger(hour=21, minute=35), id="p2_brief", misfire_grace_time=7200)
     return sched

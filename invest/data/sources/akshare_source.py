@@ -61,6 +61,8 @@ _MACRO_UNITS = {
     "shrzgm": "亿元",
     "money_supply": "亿元/同比%",
     "new_financial_credit": "亿元/同比%",
+    "bond_yield": "%",
+    "all_a_pe": "倍/分位",
 }
 
 
@@ -76,11 +78,21 @@ def _sina_stock_symbol(symbol: str) -> str:
     return "sz" + symbol
 
 
+def _fmt_month(raw: str) -> str:
+    """YYYYMM → YYYY年MM月份（宏观月度口径统一）。无法解析原样返回。"""
+    s = str(raw).strip()
+    if len(s) == 6 and s.isdigit():
+        return f"{s[:4]}年{s[4:6]}月份"
+    return s
+
+
 def _sina_index_symbol(symbol: str) -> str:
-    """000300 -> sh000300；399xxx -> sz399xxx；已带前缀则原样。"""
+    """指数代码 → 新浪前缀：000xxx -> sh；399xxx -> sz；899xxx -> bj（北证50）；已带前缀则原样。"""
     s = symbol.lower()
     if s.startswith(("sh", "sz", "bj")):
         return s
+    if symbol.startswith("899"):
+        return "bj" + symbol
     return ("sz" if symbol.startswith("399") else "sh") + symbol
 
 
@@ -166,10 +178,24 @@ class AkShareSource(BaseSource):
             if kind == "industry_all":
                 return self._fetch_all_industries(ak, task)
             if kind == "industry_valuation":
-                return ak.stock_industry_pe_ratio_cninfo(
-                    symbol="国证行业分类",
-                    date=task["date"],
-                )
+                # 非交易日传 date 会返回空导致 JSON 解析失败：
+                # 失败自动回退最近交易日（collector 层已回退，这里双保险）。
+                from invest.data.calendar import latest_trading_day
+                import datetime as _dt
+                d = task.get("date") or latest_trading_day().strftime("%Y%m%d")
+                try:
+                    return ak.stock_industry_pe_ratio_cninfo(
+                        symbol="国证行业分类",
+                        date=d,
+                    )
+                except Exception:
+                    fallback = latest_trading_day(_dt.date.today()).strftime("%Y%m%d")
+                    if fallback == d:
+                        raise
+                    return ak.stock_industry_pe_ratio_cninfo(
+                        symbol="国证行业分类",
+                        date=fallback,
+                    )
             if kind == "seat_detail":
                 return self._fetch_seat_detail(ak, task)
             if kind == "stock_daily_all":
@@ -245,7 +271,7 @@ class AkShareSource(BaseSource):
         errors = []
         for sym in symbols:
             try:
-                dates = call_with_timeout(ak.stock_lhb_stock_detail_date_em, symbol=sym, timeout=25)
+                dates = call_with_timeout(ak.stock_lhb_stock_detail_date_em, sym, timeout=25)
                 if dates is None or dates.empty:
                     continue
                 dates["交易日"] = pd.to_datetime(dates["交易日"]).dt.date
@@ -256,7 +282,7 @@ class AkShareSource(BaseSource):
                     for flag in ("买入", "卖出"):
                         try:
                             df = call_with_timeout(
-                                ak.stock_lhb_stock_detail_em, symbol=sym, date=dstr, flag=flag, timeout=25,
+                                ak.stock_lhb_stock_detail_em, sym, dstr, flag, timeout=25,
                             )
                             if df is None or df.empty:
                                 continue
@@ -275,7 +301,8 @@ class AkShareSource(BaseSource):
                 errors.append(f"{sym}: {exc}")
             time.sleep(0.2)
         if not frames:
-            raise SourceError("seat_detail 全部失败: " + "; ".join(errors))
+            # 近期无上榜（空数据）不算失败：返回空表由编排层按空数据处理
+            return pd.DataFrame()
         return pd.concat(frames, ignore_index=True)
 
     def _fetch_stock_daily_all(self, ak, task: dict) -> pd.DataFrame:
@@ -314,8 +341,34 @@ class AkShareSource(BaseSource):
             # 东财新增信贷（v1 社融口径替代）
             return ak.macro_china_new_financial_credit()
         if macro == "shrzgm":
-            # 商务部源，部分网络 TLS 握手失败；保留供可用网络使用
-            return ak.macro_china_shrzgm()
+            # 真实社融增量（商务部源，2026-08-15 用户本机实测可达）
+            df = ak.macro_china_shrzgm()
+            if df is not None and not df.empty and "月份" in df.columns:
+                # 月份 202602 → 2026年02月份（与 PMI/货币口径一致，供排序与 PIT 解析）
+                df = df.copy()
+                df["月份"] = df["月份"].astype(str).map(_fmt_month)
+            return df
+        if macro == "bond_yield":
+            # 中美国债收益率（10Y/2Y 及利差，%），用于 ERP 与 10Y 周变动检测（[B]8）
+            df = ak.bond_zh_us_rate(start_date=task.get("start_date", "20200101"))
+            if df is not None and not df.empty and "日期" in df.columns:
+                df = df.rename(columns={"日期": "date"})
+                keep = ["date", "中国国债收益率10年", "中国国债收益率2年", "中国国债收益率10年-2年"]
+                df = df[[c for c in keep if c in df.columns]]
+            return df
+        if macro == "all_a_pe":
+            # 乐咕乐股全 A 平均 PE（TTM 中位数 + 历史分位），ERP 分位用（[B]8）
+            df = ak.stock_a_ttm_lyr()
+            if df is not None and not df.empty and "date" in df.columns:
+                df = df.rename(columns={
+                    "date": "date",
+                    "middlePETTM": "全A中位PE_TTM",
+                    "quantileInRecent10YearsMiddlePeTtm": "全A中位PE近10年分位",
+                    "quantileInAllHistoryMiddlePeTtm": "全A中位PE全历史分位",
+                })
+                keep = ["date", "全A中位PE_TTM", "全A中位PE近10年分位", "全A中位PE全历史分位"]
+                df = df[[c for c in keep if c in df.columns]]
+            return df
         raise NotImplementedError(f"未知宏观指标 macro={macro}")
 
     def _fetch_daily(self, ak, task: dict) -> pd.DataFrame:
@@ -340,21 +393,28 @@ class AkShareSource(BaseSource):
                 ) from sina_exc
 
     def _fetch_index(self, ak, task: dict) -> pd.DataFrame:
-        """指数日线：优先东财，失败回退新浪。"""
+        """指数日线：优先新浪（直连稳定，2026-08-16 实测东财被反爬），失败回退东财。
+
+        新浪接口 stock_zh_index_daily 返回全历史，end_date 忽略；
+        东财接口 index_zh_a_hist 支持 start/end 区间，作为回退。
+        """
         try:
-            return ak.index_zh_a_hist(
-                symbol=task["symbol"],
-                period="daily",
-                start_date=task.get("start_date", "19900101"),
-                end_date=task.get("end_date", "20991231"),
-            )
-        except Exception as em_exc:
+            df = ak.stock_zh_index_daily(symbol=_sina_index_symbol(task["symbol"]))
+            if df is not None and not df.empty:
+                return df
+            raise SourceError("新浪指数返回空数据")
+        except Exception as sina_exc:
             try:
-                return ak.stock_zh_index_daily(symbol=_sina_index_symbol(task["symbol"]))
-            except Exception as sina_exc:
+                return ak.index_zh_a_hist(
+                    symbol=task["symbol"],
+                    period="daily",
+                    start_date=task.get("start_date", "19900101"),
+                    end_date=task.get("end_date", "20991231"),
+                )
+            except Exception as em_exc:
                 raise SourceError(
-                    f"index_bars 获取失败（东财: {em_exc}；新浪: {sina_exc}）"
-                ) from sina_exc
+                    f"index_bars 获取失败（新浪: {sina_exc}；东财: {em_exc}）"
+                ) from em_exc
 
     def normalize(self, df: pd.DataFrame, task: dict) -> pd.DataFrame:
         kind = task["kind"]
@@ -397,6 +457,9 @@ class AkShareSource(BaseSource):
             df["src"] = self.name
         elif kind == "macro_series":
             df = _macro_to_long(df, task)
+            # 社融月份 YYYYMM → YYYY年MM月份（统一月度口径；fetch 层已格式化，此处兜底）
+            if "date" in df.columns and task.get("macro") == "shrzgm":
+                df["date"] = df["date"].astype(str).map(_fmt_month)
         elif kind == "stock_daily_all":
             df["src"] = self.name
         elif kind == "industry_valuation":
@@ -404,6 +467,9 @@ class AkShareSource(BaseSource):
                 "变动日期": "date", "行业名称": "industry",
                 "静态市盈率-加权平均": "pe", "行业层级": "level",
             })
+            # PB 列（乐咕乐股/东财行业估值接入后自然带 pb 列，见 TODO [A]1）
+            if "pb" in df.columns:
+                df["pb"] = pd.to_numeric(df["pb"], errors="coerce")
             df["date"] = df["date"].astype(str)
             df["src"] = self.name
         elif kind == "seat_detail":

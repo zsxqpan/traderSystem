@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 -- ============ 行情 ============
@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS quant_valuation (
     pe_pct   REAL,
     pb_pct   REAL,
     crowding REAL,
+    crowding_state TEXT DEFAULT '',
     PRIMARY KEY (run_date, obj)
 );
 
@@ -167,6 +168,7 @@ CREATE TABLE IF NOT EXISTS industry_valuation (
     date     TEXT NOT NULL,
     industry TEXT NOT NULL,
     pe       REAL,
+    pb       REAL,
     level    INTEGER,
     src      TEXT DEFAULT 'akshare',
     PRIMARY KEY (date, industry, level, src)
@@ -305,6 +307,82 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     cost   REAL DEFAULT 0,
     PRIMARY KEY (date, job)
 );
+
+-- ============ PIT 化（2026-08-15，TODO 2.1） ============
+-- 数据溯源：最小可追溯主键（as_of_time/object_id/reference_id/cycle/data_version/rule_version）
+CREATE TABLE IF NOT EXISTS data_provenance (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of_time    TEXT NOT NULL,          -- 数据时点（YYYY-MM-DD HH:MM:SS）
+    object_id     TEXT NOT NULL,          -- 对象（symbol/industry/index）
+    object_type   TEXT DEFAULT '',        -- stock/industry/index/macro
+    reference_id  TEXT DEFAULT '',        -- 关联（plan_id/viewpoint_id/task 名）
+    cycle         TEXT DEFAULT '',        -- 周期（short/mid/long/波段/配置）
+    data_version  TEXT DEFAULT '',        -- 数据版本（源/口径）
+    rule_version  TEXT DEFAULT '',        -- 规则版本（因子/评级版本）
+    note          TEXT DEFAULT '',
+    created_at    TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_provenance_obj_time ON data_provenance(object_id, as_of_time);
+
+-- 机会卡片（2026-08-15，TODO 1.3）
+CREATE TABLE IF NOT EXISTS cards (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol         TEXT NOT NULL,
+    level          TEXT DEFAULT 'B',        -- S/A/B/C
+    cycle          TEXT DEFAULT 'short',    -- short/mid/long
+    spread_type    TEXT DEFAULT '',         -- 主价差类型
+    spread_value   TEXT DEFAULT '',         -- 主价差当前值（文本，含单位）
+    thesis         TEXT DEFAULT '',         -- 三句话验证
+    falsify        TEXT DEFAULT '',         -- 证伪条件
+    entry_range    TEXT DEFAULT '',         -- 入场区间（如 "10.0,10.5"）
+    stop_loss      REAL,
+    target         REAL,
+    status         TEXT DEFAULT 'candidate',-- candidate/locked/review/downgraded/void
+    review_note    TEXT DEFAULT '',
+    created_at     TEXT DEFAULT (datetime('now','localtime')),
+    updated_at     TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_cards_symbol ON cards(symbol);
+CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status);
+
+-- 规则版本管理（2026-08-15，TODO 2.6 / v3 3.3）
+CREATE TABLE IF NOT EXISTS rule_versions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_name         TEXT NOT NULL,          -- rating_position_map / indicators.strength / ...
+    version           TEXT NOT NULL,          -- 版本号（如 v3.1）
+    params_json       TEXT NOT NULL,          -- 该规则完整参数快照
+    effective_date    TEXT,                   -- 生效日
+    change_reason     TEXT DEFAULT '',
+    validation_sample TEXT DEFAULT '',        -- 验证样本（回测区间/样本外区间）
+    rollback_condition TEXT DEFAULT '',       -- 回滚条件
+    status            TEXT DEFAULT 'active',  -- active / frozen / rolled_back
+    created_at        TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_rule_versions_name ON rule_versions(rule_name, status);
+
+-- 候选/否决/未执行机会全量留存（防选择偏差，v3 15.1）
+CREATE TABLE IF NOT EXISTS candidate_decisions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision   TEXT NOT NULL,             -- add / reject / skip / remove
+    symbol     TEXT NOT NULL,
+    level      TEXT DEFAULT '',
+    industry   TEXT DEFAULT '',
+    reason     TEXT DEFAULT '',
+    decided_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_symbol ON candidate_decisions(symbol);
+
+-- 历史行业归属/成分/ST 状态快照（[A]10，2026-08-15）
+-- 每个交易日收盘后把「标的→行业（手工映射+候选池）/ST 状态」落库，
+-- 供任意历史时点回溯成分与 ST 状态（数据源成本评估后确定回填范围）。
+CREATE TABLE IF NOT EXISTS stock_universe_history (
+    date      TEXT NOT NULL,
+    symbol    TEXT NOT NULL,
+    industry  TEXT DEFAULT '',
+    is_st     INTEGER DEFAULT 0,
+    src       TEXT DEFAULT 'manual',
+    PRIMARY KEY (date, symbol)
+);
 """
 
 
@@ -331,6 +409,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for col in ("rs5", "rs10", "rs20"):
         if col not in cols3:
             conn.execute(f"ALTER TABLE quant_strength ADD COLUMN {col} REAL")
+    cols_val = [r["name"] for r in conn.execute("PRAGMA table_info(quant_valuation)")]
+    if "crowding_state" not in cols_val:
+        conn.execute("ALTER TABLE quant_valuation ADD COLUMN crowding_state TEXT DEFAULT ''")
+    # 行业估值支持 PB（[A]1）：industry_valuation 增加 pb 列（乐咕乐股/东财行业估值）
+    cols_ind = [r["name"] for r in conn.execute("PRAGMA table_info(industry_valuation)")]
+    if "pb" not in cols_ind:
+        conn.execute("ALTER TABLE industry_valuation ADD COLUMN pb REAL")
     # dragon_tiger 历史 bug：榜单行不写 seat_type（NULL），SQLite 主键中
     # NULL!=NULL，导致每次采集重复插入。清理每个 (date,symbol) 仅保留一行；
     # 新数据由采集层统一写入非空 seat_type='list'（见 akshare_source.py）。

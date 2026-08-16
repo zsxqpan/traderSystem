@@ -202,6 +202,64 @@ def test_query_strength_latest_snapshot():
     conn.close()
     print("test_query_strength_latest_snapshot OK")
 
+
+def test_cross_validate():
+    """多源交叉验证（A-Stock-Skills 多源校验思想）：四维度汇总。"""
+    p = _tmp_db()
+    conn = connect(p)
+    from invest.data.storage import upsert_df
+    upsert_df(conn, "quant_strength", pd.DataFrame([
+        {"run_date": "2026-08-03", "obj_type": "industry", "obj": "半导体", "period": "short",
+         "rs": 0.15, "rs5": 0.05, "rs10": 0.1, "rs20": 0.2, "momentum": 0.1,
+         "trend_stage": "加速", "calc_version": "v1"},
+    ]))
+    upsert_df(conn, "quant_capital", pd.DataFrame([
+        {"run_date": "2026-08-03", "obj_type": "industry", "obj": "半导体",
+         "fund_type": "游资", "style": "主题炒作", "confidence": 0.8},
+    ]))
+    upsert_df(conn, "quant_linkage", pd.DataFrame([
+        {"run_date": "2026-08-03", "a": "半导体", "b": "元件", "corr": 0.85, "lead": "半导体"},
+    ]))
+    upsert_df(conn, "quant_valuation", pd.DataFrame([
+        {"run_date": "2026-08-03", "obj": "半导体", "pe_pct": 0.35, "crowding": 0.7,
+         "crowding_state": "拥挤"},
+    ]))
+    d = build_dispatch(conn)
+    r = d["cross_validate"]("半导体", obj_type="industry")
+    assert r["obj"] == "半导体"
+    assert r["dimensions"]["strength"]["trend_stage"] == "加速"
+    assert r["dimensions"]["capital"]["style"] == "主题炒作"
+    assert r["dimensions"]["linkage"][0]["corr"] >= 0.7
+    assert r["dimensions"]["valuation"]["pe_pct"] == 0.35
+    # 个股交叉验证（无行业映射时至少返回 strength/capital）
+    upsert_df(conn, "quant_strength", pd.DataFrame([
+        {"run_date": "2026-08-03", "obj_type": "stock", "obj": "600519", "period": "short",
+         "rs": 0.1, "momentum": 0.05, "trend_stage": "启动", "calc_version": "v1"},
+    ]))
+    upsert_df(conn, "quant_capital", pd.DataFrame([
+        {"run_date": "2026-08-03", "obj_type": "stock", "obj": "600519",
+         "fund_type": None, "style": "震荡", "confidence": 0.3},
+    ]))
+    r2 = d["cross_validate"]("600519", obj_type="stock")
+    assert r2["dimensions"]["strength"]["obj"] == "600519"
+    # 行业维度在 industry 子键（不覆盖个股维度）
+    assert r2["dimensions"]["industry"]["name"] == "白酒"
+    conn.close()
+    print("test_cross_validate OK")
+
+
+def test_agent_prompts_include_process():
+    """回归：A-Stock-Skills 分析流程已融入 system prompt。"""
+    from invest.agent.agents import RESEARCH_SYSTEM, TRADE_SYSTEM
+    for sys_prompt in (RESEARCH_SYSTEM, TRADE_SYSTEM):
+        assert "分析流程" in sys_prompt
+        assert "交叉验证" in sys_prompt
+        assert "失效条件" in sys_prompt
+        assert "数据失效即防守" in sys_prompt
+        assert "trade-journal" in sys_prompt or "问责" in sys_prompt
+    print("test_agent_prompts_include_process OK")
+
+
 if __name__ == "__main__":
     test_tickets_flow()
     test_tools_query()
@@ -210,4 +268,6 @@ if __name__ == "__main__":
     test_viewpoint_source_enforced()
     test_query_strength_obj_type()
     test_query_strength_latest_snapshot()
+    test_cross_validate()
+    test_agent_prompts_include_process()
     print("\nALL AGENT TESTS PASSED")

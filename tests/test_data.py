@@ -95,6 +95,27 @@ def test_macro_new_financial_credit_normalize():
     print("test_macro_new_financial_credit_normalize OK")
 
 
+def test_macro_shrzgm_normalize():
+    """真实社融增量（macro_china_shrzgm）：月份 YYYYMM 应统一为 YYYY年MM月份。"""
+    from invest.data.sources.akshare_source import _fmt_month
+    src = AkShareSource()
+    df = pd.DataFrame({
+        "月份": ["202602", "202603"],
+        "社会融资规模增量": [23837.0, 52240.0],
+        "其中-人民币贷款": [8458.0, 31522.0],
+    })
+    out = src.normalize(df, {"kind": "macro_series", "macro": "shrzgm"})
+    assert out["date"].iloc[0] == "2026年02月份"
+    assert out["date"].iloc[-1] == "2026年03月份"
+    assert out["unit"].iloc[0] == "亿元"
+    v = out[out["indicator"] == "社会融资规模增量"].iloc[0]["value"]
+    assert v == 23837.0
+    # 月份格式化单测
+    assert _fmt_month("202602") == "2026年02月份"
+    assert _fmt_month("2026-02") == "2026-02"  # 非 YYYYMM 原样返回
+    print("test_macro_shrzgm_normalize OK")
+
+
 def test_macro_no_date_col_error():
     src = AkShareSource()
     df = pd.DataFrame({"foo": [1.0]})
@@ -618,6 +639,7 @@ if __name__ == "__main__":
     test_macro_normalize_idempotent()
     test_macro_money_supply_normalize()
     test_macro_new_financial_credit_normalize()
+    test_macro_shrzgm_normalize()
     test_macro_no_date_col_error()
     test_collector_macro_flow()
     test_industry_normalize()
