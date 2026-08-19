@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,6 +65,79 @@ def test_tools_query():
     assert temp[0]["score"] == 75.0
     conn.close()
     print("test_tools_query OK")
+
+
+def test_query_stock_daily_db_and_akshare():
+    """2026-08-18：个股日线工具——本地优先，本地缺失按需联网（东财→新浪回退）。"""
+    from invest.agent.tools import query_stock_daily, _stock_daily_cache
+
+    p = _tmp_db()
+    conn = connect(p)
+    _stock_daily_cache.clear()
+    try:
+        # 本地路径：候选池个股直接出数据
+        from invest.data.storage import upsert_df
+        upsert_df(conn, "daily_bars", pd.DataFrame([
+            {"date": "2026-08-18", "symbol": "300438", "close": 65.55},
+            {"date": "2026-08-17", "symbol": "300438", "close": 65.0},
+            {"date": "2026-08-14", "symbol": "300438", "close": 64.0},
+            {"date": "2026-08-13", "symbol": "300438", "close": 63.5},
+            {"date": "2026-08-12", "symbol": "300438", "close": 63.0},
+        ]))
+        r = query_stock_daily(conn, "600519.SH")  # 代码归一化（本地无 → 可能实时联网成功）
+        assert r["symbol"] == "600519"
+        r2 = query_stock_daily(conn, "300438")
+        assert r2["source"] == "db"
+        assert r2["latest_close"] == 65.55
+        # pct_1d 输出四舍五入到 4 位小数
+        assert abs(r2["pct_1d"] - round(65.55 / 65.0 - 1, 4)) < 1e-9
+
+        # akshare 路径：东财失败 → 新浪回退（用未缓存的新代码 000858）
+        import pandas as _pd
+        sina_df = _pd.DataFrame({
+            "date": _pd.to_datetime(["2026-08-19", "2026-08-18", "2026-08-17", "2026-08-14", "2026-08-13"]),
+            "close": [1307.88, 1297.99, 1293.09, 1341.99, 1355.29],
+        })
+        _stock_daily_cache.clear()
+        with mock.patch("akshare.stock_zh_a_hist", side_effect=ConnectionError("em down")):
+            with mock.patch("akshare.stock_zh_a_daily", return_value=sina_df):
+                r3 = query_stock_daily(conn, "000858")
+        assert r3["source"] == "akshare"
+        assert r3["latest_close"] == 1307.88
+        assert r3["latest_date"] == "2026-08-19"
+    finally:
+        conn.close()
+    print("test_query_stock_daily_db_and_akshare OK")
+
+
+def test_chat_system_has_skill_mechanism():
+    """2026-08-18：Skill 由大模型语义自选——CHAT_SYSTEM 内置三个 skill 方法论与自标注要求。"""
+    from invest.agent.agents import CHAT_SYSTEM
+
+    assert "Skill" in CHAT_SYSTEM
+    assert "serenity" in CHAT_SYSTEM and "youzi" in CHAT_SYSTEM and "stock_analysis" in CHAT_SYSTEM
+    assert "已使用 Skill" in CHAT_SYSTEM
+    print("test_chat_system_has_skill_mechanism OK")
+
+
+def test_realtime_health_trading_window_aware():
+    """2026-08-18：非交易时段休市，实时行情旧属正常——query_realtime_health 返回 ok=True
+    并提示用日线数据，不再误报"数据失效"（避免盘后艾特 Agent 分析个股被拒）。"""
+    from invest.agent.tools import query_realtime_health
+
+    # 非交易时段 → ok=True + 休市提示（函数内局部导入，patch 源模块）
+    with mock.patch("invest.intraday._in_trading_window", return_value=False):
+        out = query_realtime_health(None)
+    assert out["ok"] is True
+    assert "非交易时段" in out["note"]
+
+    # 交易时段 → 走真实 realtime_health（mock 其返回）
+    with mock.patch("invest.intraday._in_trading_window", return_value=True):
+        with mock.patch("invest.data.realtime.realtime_health",
+                        return_value={"ok": False, "stale": 2, "last_detail": "stale=2"}):
+            out2 = query_realtime_health(None)
+    assert out2["ok"] is False and out2["stale"] == 2
+    print("test_realtime_health_trading_window_aware OK")
 
 
 def test_conflict_detection():
@@ -263,6 +337,9 @@ def test_agent_prompts_include_process():
 if __name__ == "__main__":
     test_tickets_flow()
     test_tools_query()
+    test_query_stock_daily_db_and_akshare()
+    test_chat_system_has_skill_mechanism()
+    test_realtime_health_trading_window_aware()
     test_conflict_detection()
     test_llm_tool_loop()
     test_viewpoint_source_enforced()

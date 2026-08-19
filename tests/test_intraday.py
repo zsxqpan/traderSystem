@@ -85,6 +85,43 @@ def test_check_core_moves():
     print("test_check_core_moves OK")
 
 
+def test_check_core_moves_default_threshold():
+    """2026-08-18 按板块阈值：主板 ±3% 触发；创业板/科创板 ±6% 触发（原统一 5%）。"""
+    from invest.data.storage import upsert_df
+    p = _tmp_db()
+    conn = connect(p)
+    upsert_df(conn, "candidate_pool", pd.DataFrame([
+        {"symbol": "000001", "level": "core", "in_date": "2026-08-01", "out_date": None},   # 主板
+        {"symbol": "300001", "level": "core", "in_date": "2026-08-01", "out_date": None},   # 创业板
+        {"symbol": "688001", "level": "core", "in_date": "2026-08-01", "out_date": None},   # 科创板
+    ]))
+    upsert_df(conn, "daily_bars", pd.DataFrame([
+        {"symbol": "000001", "date": "2026-08-03", "close": 10.0, "src": "akshare"},
+        {"symbol": "300001", "date": "2026-08-03", "close": 10.0, "src": "akshare"},
+        {"symbol": "688001", "date": "2026-08-03", "close": 10.0, "src": "akshare"},
+    ]))
+    conn.close()
+    # 主板 +3% 触发（10.3/10.0）
+    with mock.patch("invest.data.realtime.RealtimeQuoter", _fake_quoter({"000001": 10.3})):
+        alerts = check_core_moves(p)
+    assert len(alerts) == 1 and alerts[0]["symbol"] == "000001" and alerts[0]["threshold"] == 0.03
+    # 主板 +2.5% 不触发
+    with mock.patch("invest.data.realtime.RealtimeQuoter", _fake_quoter({"000001": 10.25})):
+        assert check_core_moves(p) == []
+    # 创业板 +3% 不触发（阈值 6%）
+    with mock.patch("invest.data.realtime.RealtimeQuoter", _fake_quoter({"300001": 10.3})):
+        assert check_core_moves(p) == []
+    # 创业板 +6% 触发
+    with mock.patch("invest.data.realtime.RealtimeQuoter", _fake_quoter({"300001": 10.6})):
+        alerts = check_core_moves(p)
+    assert len(alerts) == 1 and alerts[0]["threshold"] == 0.06
+    # 科创板 +6% 触发
+    with mock.patch("invest.data.realtime.RealtimeQuoter", _fake_quoter({"688001": 10.6})):
+        alerts = check_core_moves(p)
+    assert len(alerts) == 1 and alerts[0]["symbol"] == "688001"
+    print("test_check_core_moves_default_threshold OK")
+
+
 def test_send_alerts_mocked():
     p = _tmp_db()
     # 交易时段内：000001 为 core -> P0 立即推，附归因
@@ -136,6 +173,7 @@ def test_send_alerts_priority_filter():
 if __name__ == "__main__":
     test_trading_window()
     test_check_core_moves()
+    test_check_core_moves_default_threshold()
     test_send_alerts_mocked()
     test_send_alerts_off_hours_silent()
     test_send_alerts_priority_filter()

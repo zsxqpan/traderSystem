@@ -151,10 +151,30 @@ def test_intraday_report_no_live():
     print("test_intraday_report_no_live OK")
 
 
+def test_intraday_report_public_hides_positions():
+    """public=True（非管理员版）：隐藏持仓警戒等私有持仓信息（完整版下验证）。"""
+    from invest.report import intraday_report
+    p = _tmp_db()
+    conn = connect(p)
+    _seed(conn)
+    conn.close()
+    with mock.patch("invest.report._live_quotes", return_value=({"600519": 105.0}, {"600519": 0.05})):
+        with mock.patch("invest.report._card_alerts", return_value=["持仓600519 破止损"]):
+            msg_private = intraday_report(p, public=False, brief=False)   # 完整版
+            msg_public = intraday_report(p, public=True, brief=False)     # 完整版但公开
+            msg_brief = intraday_report(p)                                # 简洁版（默认）
+    assert "持仓600519 破止损" in msg_private
+    assert "持仓600519 破止损" not in msg_public
+    assert "持仓600519 破止损" not in msg_brief  # 简洁版也不含持仓警戒
+    assert "今日操作" in msg_brief  # 简洁版含操作建议
+    print("test_intraday_report_public_hides_positions OK")
+
+
 if __name__ == "__main__":
     test_daily_report()
     test_daily_report_card_alert()
     test_premarket_report()
     test_intraday_report()
     test_intraday_report_no_live()
+    test_intraday_report_public_hides_positions()
     print("\nALL REPORT TESTS PASSED")

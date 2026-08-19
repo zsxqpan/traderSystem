@@ -77,7 +77,7 @@
 - 周六盘中 ticker、真实推送、真实交易时段行为均未实测
 - 阶段 3 凯利/压力测试/BCS 为代码就绪，无真实交易样本支撑（trade_records=0）
 - .env 凭据存在但未读取验证（[REDACTED]）
-- 飞书群 @ 机器人盘中报告：逻辑与生成已验证（mock + 真实库），真实群消息触发链路依赖 Hermes 桌面端 gateway.log，需实机群内验证
+- 飞书群 @ 机器人盘中报告：逻辑与生成已验证（mock + 真实库），链路已改项目本体直连（lark-oapi WebSocket，零 Hermes 依赖）；真实群消息触发待 Hermes 侧停用同应用连接后实机验证（见 docs/GATEWAY_STABILITY_ANALYSIS.md）
 
 # traderSystem 代办清单（v2/v3 合并路线）
 > 更新：2026-08-15 | 原则：完成一项勾一项。
@@ -191,14 +191,25 @@
 - 宏观只做减法：宽松/中性系数 1.00、收紧 0.70，不给方向加分（v3 6.2）
 - 仓位无合格样本时用固定风险，不填假设胜率进凯利（v3 11.6）
 - 同一底层标的/同 L2/同风险簇的跨周期仓位必须合并计算（v3 11.2）
-- 实时数据硬约束（2026-08-15）：盘中行情必须用 Level-1 快照接口直接轮询（新浪/腾讯/东财三源，3-5 秒间隔），端到端延迟 ≤ 10 秒；分钟线只做历史回填，不得作为实时兜底；任何延迟或失效数据不得支撑 P0 决策，必须先告警；调度器已实现（2026-08-15）：intraday_tick 每 4 秒轮询，非交易时段守护，正常轮询不写 job_runs（留痕由 log_realtime_health 节流承担，正常 60s 一条基线、异常立即记）
+- 实时数据硬约束（2026-08-15，轮询频率 2026-08-18 降为 10s）：盘中行情必须用 Level-1 快照接口直接轮询（新浪/腾讯/东财三源，**10 秒间隔**），端到端延迟 ≤ 10 秒；分钟线只做历史回填，不得作为实时兜底；任何延迟或失效数据不得支撑 P0 决策，必须先告警；调度器已实现（2026-08-15）：intraday_tick 每 10 秒轮询（2026-08-18 由 4s 降频），非交易时段守护，正常轮询不写 job_runs（留痕由 log_realtime_health 节流承担，正常 60s 一条基线、异常立即记）
 
 ## 已完成（历史）
 - [x] 数据层：涨停池/炸板池（2026-08-04）、同花顺行业全量扩展（2026-08-04）、回填脚本（2026-08-04）、个股多标的采集与盘中异动监测（2026-08-04）
 - [x] 定量层：行业 RS/多周期动量/趋势阶段、板块轮动、市场温度 v1、资金属性 v1、行业联动 v1、中轨线（周线趋势/拥挤度/宏观流动性）、趋势阶段/风格/风格×温度校准（2026-08-03）、回测框架 + 评级-仓位映射（2026-08-04）
 - [x] 推理：LLM 接入（DeepSeek，2026-08-03）、双 Agent + 工单 + 仲裁 v1、观点库 CRUD + 五要素校验 + 准确率 v1（2026-08-03）
 - [x] Agent 升级（2026-08-16）：融入 A-Stock-Skills 分析流程——6 步分析流程（数据核实→多维度交叉验证→技术面辅助→筛选条件→四段式报告→问责机制）+ 硬约束强化；新增 cross_validate 工具（行业/个股四维度：强度/资金/联动/估值一次性汇总），prompt 含 trade-journal 问责理念，tests/test_agent.py 增 2 用例
+- [x] 报告改版：短线/中期分工（2026-08-16）：日报+盘中实时报告聚焦短线操作辅助——异常波动检测（量比/振幅/长上影下影→做T信号）、做T提示（实时价日内位置低吸/高抛）、建仓时机提示（情绪周期+温度+低估值启动）；周报聚焦中期（中线强度前8/低估值趋势候选/宏观流动性）；invest/report.py + tests/test_report_short.py (6)
+- [x] 盘前信息早报（2026-08-16）：交易日 8:40 发送 morning_brief_report（invest/report.py）——隔夜市场一句话（温度/情绪周期/市场风格）、龙虎榜净买入 TOP5 资金焦点、板块主线（强度+涨幅）、今日关注（候选池/异常波动）、评级仓位、宏观速览，简明扼要（<30 行）；调度器新增 morning_brief 任务；**仅发送飞书群**（notify_morning_brief 直连 feishu_push，不走 Notifier 多通道）；tests/test_morning_brief.py (4)
 - [x] 高星量化项目落地 4 项（2026-08-16）：① Alpha158 核心因子（invest/quant/alpha158.py 73 因子，纯 pandas 不依赖 qlib，接 pipeline + scripts/eval_alpha158.py + test_alpha158.py）；② kill-gate 击杀门禁（invest/discipline/kill_gate.py：最大回撤/连亏/盈利因子/胜率/最小样本硬门槛，挂入 BCS full_assessment，test_kill_gate.py）；③ youzi-trading-skill（23位游资心法 SKILL.md 已构建 tools/hermes_skills/youzi-trading/，待复制到 Hermes skills/finance/）；④ quantdash-ai-stock 对照（docs/QUANTDASH_COMPARISON.md）+ 情绪周期状态机落地（invest/quant/emotion_cycle.py 冰点/启动/主升/退潮，接入日报，test_emotion_cycle.py）
+- [x] 盘后报告合并 + 数据新鲜度门禁（2026-08-18）：盘后日报(16:00)/P2简报(21:35)/每日复盘(22:00) 三份合并为一份 **22:00 晚间盘后报告**（evening_report：daily_report + 复盘统计 + 数据质量）；发送前用 _data_lag_reason 校验日线/指数是否到最近交易日，**滞后则不发送、推送原因**（12h 限频 + job_runs 留痕）；16:00 after_close 保留采集/Agent/仲裁/收盘扫描/历史快照（不再推送日报）；21:30 行业刷新 + 21:40 日线补采保留为数据准备；tests/test_pipeline.py 新增门禁用例 2 个
+- [x] 默认 ticker-only + Skill 大模型自选 + 报告 A/B/C/E（2026-08-19）：① run_service **默认 ticker-only**（--full 才完整 APScheduler），重启指令默认带 --ticker-only；② Skill 改**大模型语义自选**——CHAT_SYSTEM 内置 serenity/youzi/stock_analysis 方法论，模型回复末尾自标注「↘ 已使用 Skill：xxx」，删除关键词路由（route_skill）；③ 报告A：盘中报告加**今日操作建议**（温度+情绪周期）；④ 报告B：短线失效条件去 RS 化（价格/量能/情绪类，RS 仅中长线）；⑤ 报告C：日报详细化——宏观流动性→温度/情绪→板块→**重点关注行业**（FOCUS_INDUSTRIES 名单+四维数据+LLM 意见）→强度→异动→候选池→**消息面（大模型提炼）**→持仓警戒→Agent复盘；⑥ 报告E：盘中报告**默认简洁版**（brief），含「详细/完整」才发完整版（私聊/群聊一致）；tests 更新（skill 机制/简洁版/重点行业缺省跳过）
+- [x] 板块异动阈值 + 周期化日线 + Skill 路由 + 爱心表情（2026-08-18）：① 异动阈值按板块——主板 ±3%、创业板(300/301)/科创板(688/689) ±6%（intraday._move_threshold，推送带阈值标注，test_intraday 更新）；② query_stock_daily 按周期拉取——短线/游资=60 日、中线=250、长线=500（days 上限放宽到 750，tool 描述与 CHAT_SYSTEM 指导周期）；③ **Skill 路由**——产业链/基本面→Serenity、短线/异动/游资→youzi、五步法→stock_analysis（agents.route_skill 本地关键词零 token，SKILL_LIBRARY 摘要注入 prompt），回复末尾斜体行标注「↘ 已使用 Skill：xxx」（飞书消息不支持小字号，用斜体弱化近似；feishu_push.send_post 富文本）；④ **收到消息先回 ❤️ 表情**（feishu_push.add_reaction，im:message.reaction 权限，需后台开启）；实测路由正确；tests 新增 route_skill/skill 标注用例
+- [x] 个股日线按需查询工具（2026-08-18）：Agent 新增 query_stock_daily——本地 daily_bars 优先（候选池个股），本地缺失（池外个股如 600519）按需 akshare 联网拉取（东财→新浪双源回退，30 分钟缓存），返回 最新收盘/1/5/20日涨跌幅/60日高低/最近5条K线；修复：_daily_stats 解包顺序、新浪 datetime 日期过滤、run_chat max_turns 2→3（防连续两轮工具调用后返回工具 JSON 而非结论）；CHAT_SYSTEM 明确"分析个股先查日线，不要再回没数据"；tests/test_agent.py 新增用例；实测 600519 收盘 1307.88
+- [x] 非交易时段误报"数据失效"修复（2026-08-18）：query_realtime_health 改为**交易时段感知**——休市时实时行情旧属正常，返回 ok=True 并提示用日线/收盘数据，不再拒绝盘后/盘前个股分析；Agent 提示词（_ANALYSIS_PROCESS/_COMMON_RULES/CHAT_SYSTEM）同步加"数据失效仅交易时段适用"限定；实测非交易时段分析 600519 正常出结论；tests/test_agent.py 新增用例
+- [x] 飞书私聊 + 群内全量 Agent 回应（2026-08-18）：① **私聊（p2p）任意消息回应**（修复私聊不回应）；② **群内 @ 任意消息由 Agent 回应**（不再只回报告）：语义报告→盘中报告（非管理员公开版）、问候→帮助提示（本地判定零 token）、其他→会话 Agent（invest.agent.run_chat，带系统数据工具，max_turns=2）；③ 非管理员（私聊/群内@）统一 100 万/日限额（llm_usage job='group'，llm._budget_ok 对 group 放行由限额把关）；限频 报告30s/会话10s；tests/test_feishu_ws.py 新增私聊/会话用例
+- [x] 群成员开放 + 限额 + 省 token + OS 计划任务（2026-08-18）：① 非管理员艾特可获取**公开版**盘中报告（intraday_report public=True，无持仓警戒），每日 token 限额 100 万（FEISHU_NONADMIN_DAILY_TOKEN_LIMIT，llm_usage job='group' 记账，超限回额度提示）；② 周报消息面改**大模型提炼**（财联社电报为素材 + LLM 挑讨论度/重要性最高的 5 条并给理由，失败回退直列）；③ 盘中报告**去指数/风格**，新增 板块异动+情绪人气+龙虎榜龙头（纯 DB 零 token）；Agent prompt 加省 token 规则（近60日/关键字段/工具≤3次/单观点≤80字）+ max_turns 5→4；④ **OS 计划任务**：scripts/run_job.py 单任务入口 + scripts/install_os_tasks.ps1 注册 9 个 Windows 任务（schtasks /XML，StartWhenAvailable 错过补跑）+ run_service.py --ticker-only（10s 轮询仍需常驻）；tests 新增 public/限额/ticker_only 用例
+- [x] 盘中降频 + 边沿告警 + 语义触发（2026-08-18）：① 周末周报改**周日 20:00**（原周六 09:00），weekly_report 新增**消息面**（财联社电报 stock_info_global_cls 近 7 日 TOP6）；② 盘中轮询 4s→**10s**，异动推送限频 P0: 600→**180s**、P1: 1800s 不变（intraday.py _PUSH_POLICY）；③ P0 数据失效告警改**边沿触发**（失效通知一次、恢复再通知一次，状态存 data/monitor_state.json，monitor.py）；④ 飞书盘中报告**去关键词触发，纯 LLM 语义识别**（feishu_ws._is_report_request 纯语义，LLM 失败→False；tests/test_feishu_ws.py 更新）；tests/test_monitor.py 边沿触发用例
+- [x] 网关稳定性 + 去 Hermes 化（2026-08-18）：① 根因分析（docs/GATEWAY_STABILITY_ANALYSIS.md）——Hermes 与本项目共用同一飞书应用长连接导致消息随机分流（最大根因），叠加纯 LLM 意图判定单点静默、无 @ 识别、无 token 缓存/重试；② feishu_ws 加固：@ 提及识别（MentionEvent/UserId 对象兼容）、关键词规则+LLM 双保险、管理员 ack、30s 限频、非管理员权限提示；③ feishu_push：tenant token 2h 缓存 + 发送重试 1 次；④ 微信推送去 Hermes：context-tokens 迁入 data/weixin/（migrate_context_tokens 一次性迁移），默认不再读 E 盘 Hermes 目录；⑤ scripts/disable_hermes_feishu.ps1（停用 Hermes 同应用飞书连接）；⑥ 去 Hermes 迁移记录 + 不可替代清单（docs/HERMES_FREE_MIGRATION.md）
 - [x] 调度器（2026-08-04）、企业微信推送（2026-08-04）、仪表盘 Streamlit 6 页面（2026-08-04）
 - [x] 复盘引擎（周/月/年，2026-08-04）
 - [x] 工程：依赖安装、.env 密钥、pytest.ini（2026-08-03/04）

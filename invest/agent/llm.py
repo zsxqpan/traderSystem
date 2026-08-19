@@ -37,6 +37,10 @@ class LLMClient:
     def _budget_ok(self, job: str) -> bool:
         if self.conn is None:
             return True
+        # 飞书非管理员群聊/私聊（job='group'）：由 feishu_ws 的 100 万/日限额把关
+        # （FEISHU_NONADMIN_DAILY_TOKEN_LIMIT），不受全局 6 万日预算约束
+        if job == "group":
+            return True
         row = self.conn.execute(
             "SELECT SUM(tokens) AS t FROM llm_usage WHERE date=date('now','localtime') AND job=?", (job,)
         ).fetchone()

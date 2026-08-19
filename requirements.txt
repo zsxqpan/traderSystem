@@ -9,6 +9,7 @@ APScheduler>=3.10
 fastapi>=0.110
 uvicorn>=0.27
 openai>=1.30
+lark-oapi>=1.7.2  # 飞书长连接接收（项目本体直连，替代 Hermes gateway.log）
 
 # 数据源
 akshare>=1.12

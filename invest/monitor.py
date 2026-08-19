@@ -6,14 +6,36 @@
 - 风控触发：data_guard 数据失效 + check_position 违规 → 推送降级告警；
 - 数据冲突：最近一次 realtime 留痕 stale>0 或三源全部失败 → 推送数据失效告警。
 
-推送分级：全部为 P0 级（[P0] 前缀），30 分钟限频防刷屏。
+推送分级：全部为 P0 级（[P0] 前缀）。
+2026-08-18 改：数据失效告警改为**边沿触发**——失效时通知一次、恢复时再通知一次
+（状态存 data/monitor_state.json，重启不丢）；不再按 30 分钟限频重复刷屏。
 """
 from __future__ import annotations
 
 import datetime as dt
+import json
+from pathlib import Path
 
 from invest.db import connect
 from invest.notifier import Notifier
+
+ROOT = Path(__file__).resolve().parents[1]
+_STATE_FILE = ROOT / "data" / "monitor_state.json"
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _in_trading_window(now: dt.datetime | None = None) -> bool:
@@ -99,16 +121,33 @@ def run_p0_monitor(db_path: str) -> int:
 
     返回推送成功条数。非交易时段休市，行情旧属正常现象（不是数据失效），
     一律静默返回 0，避免"实时行情不可用"刷屏；交易时段才检查数据冲突与持仓证伪。
+
+    2026-08-18：数据失效告警改边沿触发（状态存 data/monitor_state.json）：
+    - 失效：只在"健康→失效"转换时通知一次（含失效详情）；
+    - 恢复：只在"失效→健康"转换时通知一次。
     """
     from invest.intraday import fetch_batch_prices
     notifier = Notifier()
     sent = 0
 
     if _in_trading_window():
-        # 数据冲突：交易时段行情必须新鲜，stale/三源失败才算数据失效
-        for a in check_data_conflict(db_path):
-            ok = notifier.send_text(a["msg"], key=f"p0_{a['kind']}", min_interval=1800)
+        # 数据冲突（边沿触发，避免每 30 分钟重复告警）
+        conflict = check_data_conflict(db_path)
+        invalid_now = bool(conflict)
+        state = _load_state()
+        was_invalid = bool(state.get("realtime_invalid"))
+        if invalid_now and not was_invalid:
+            for a in conflict:
+                ok = notifier.send_text(a["msg"], key=f"p0_{a['kind']}_down", min_interval=300)
+                sent += int(ok)
+            _save_state({"realtime_invalid": True})
+        elif not invalid_now and was_invalid:
+            ok = notifier.send_text(
+                "[P0] 实时行情已恢复（数据失效解除，stale=0）：可以正常开仓/决策",
+                key="p0_data_conflict_up", min_interval=300,
+            )
             sent += int(ok)
+            _save_state({"realtime_invalid": False})
 
         # 持仓证伪（仅交易时段，需要新鲜价格）
         conn = connect(db_path)

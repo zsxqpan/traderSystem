@@ -1,14 +1,126 @@
 """Agent 工具注册表：定量层查询 + 观点写入 + 工单发送。"""
 from __future__ import annotations
 
+import datetime as dt
 import functools
 import sqlite3
+import time
 
 from invest.agent import tickets as ticket_mod
 
 
 def _query(conn: sqlite3.Connection, sql: str, args=()):
     return [dict(r) for r in conn.execute(sql, args)]
+
+
+# ---------- 个股日线（按需） ----------
+
+_stock_daily_cache: dict[str, tuple[float, dict]] = {}
+_STOCK_DAILY_TTL = 1800.0  # 缓存 30 分钟
+
+
+def _norm_symbol(symbol: str) -> str:
+    """归一化为 6 位股票代码（容忍 '600519.SH' / '600519' / 空格）。"""
+    s = (symbol or "").strip().upper()
+    s = s.split(".")[0] if "." in s else s
+    s = "".join(ch for ch in s if ch.isdigit())
+    return s if len(s) == 6 else ""
+
+
+def _daily_stats(symbol: str, source: str, rows: list[tuple]) -> dict:
+    """由 [(date, close), ...]（按日期倒序）计算统计。"""
+    dates = [str(d) for d, _ in rows]
+    closes = [float(c) for _, c in rows if c is not None]
+    if not closes or closes[0] <= 0:
+        return {"symbol": symbol, "source": source, "error": "无有效收盘数据"}
+
+    def pct_n(n: int):
+        return round(closes[0] / closes[n] - 1, 4) if len(closes) > n and closes[n] > 0 else None
+
+    return {
+        "symbol": symbol,
+        "source": source,  # db=本地库 / akshare=按需联网
+        "latest_date": dates[0],
+        "latest_close": round(closes[0], 2),
+        "pct_1d": pct_n(1),
+        "pct_5d": pct_n(5),
+        "pct_20d": pct_n(20),
+        "high_60d": round(max(closes), 2),
+        "low_60d": round(min(closes), 2),
+        "last_rows": [{"date": dates[i], "close": round(closes[i], 2)} for i in range(min(5, len(closes)))],
+    }
+
+
+def query_stock_daily(conn: sqlite3.Connection, symbol: str, days: int = 60) -> dict:
+    """查询个股日线（最近收盘/涨跌幅/区间高低）。
+
+    优先读本地 daily_bars；本地无该股（非候选池个股）时按需用 akshare 联网拉取
+    （东财→新浪双源回退，30 分钟缓存）。
+    周期建议（2026-08-18）：短线/游资视角 days=60；中线 days=250；长线 days=500。
+    返回 {symbol, latest_close, latest_date, pct_1d/5d/20d, high/low(窗口内), last_rows}。
+    """
+    sym = _norm_symbol(symbol)
+    if not sym:
+        return {"error": "请提供 6 位股票代码（如 600519）"}
+    days = max(20, min(int(days or 60), 750))
+
+    now = time.time()
+    cached = _stock_daily_cache.get(sym)
+    if cached and now - cached[0] < _STOCK_DAILY_TTL:
+        return cached[1]
+
+    rows = _query(
+        conn,
+        "SELECT date, close FROM daily_bars WHERE symbol=? ORDER BY date DESC LIMIT ?",
+        (sym, days),
+    )
+    if rows and len(rows) >= 5:
+        out = _daily_stats(sym, "db", [(r["date"], r["close"]) for r in rows])
+        _stock_daily_cache[sym] = (now, out)
+        return out
+
+    # 本地缺失/样本太少 → 按需联网（东财 → 新浪 双源回退，与采集层一致）
+    try:
+        import akshare as ak
+
+        end = dt.date.today().isoformat().replace("-", "")
+        start = (dt.date.today() - dt.timedelta(days=days * 2)).isoformat().replace("-", "")
+        df = None
+        em_exc = sina_exc = None
+        try:
+            _df = ak.stock_zh_a_hist(symbol=sym, period="daily",
+                                     start_date=start, end_date=end, adjust="qfq")
+            if _df is not None and not _df.empty and "收盘" in _df.columns:
+                df = _df
+        except Exception as exc:  # noqa: BLE001
+            em_exc = exc
+        if df is None:
+            try:
+                prefix = "sh" if sym.startswith(("6", "9")) else "sz"
+                _df = ak.stock_zh_a_daily(symbol=prefix + sym, adjust="qfq")
+                if _df is not None and not _df.empty:
+                    # 新浪 date 可能是 datetime：统一归一化为 YYYYMMDD 再按起始日过滤
+                    _dates = _df["date"].astype(str).str[:10].str.replace("-", "")
+                    _df = _df[_dates >= start]
+                    df = _df
+            except Exception as exc:  # noqa: BLE001
+                sina_exc = exc
+        if df is None or df.empty:
+            err = f"未查到日线数据（代码可能错误或新股）"
+            if em_exc or sina_exc:
+                err += f"；东财: {type(em_exc).__name__ if em_exc else '-'}；新浪: {type(sina_exc).__name__ if sina_exc else '-'}"
+            out = {"symbol": sym, "source": "akshare", "error": err}
+        else:
+            # 兼容东财(日期/收盘) 与 新浪(date/close) 两套列名
+            date_col = "日期" if "日期" in df.columns else "date"
+            close_col = "收盘" if "收盘" in df.columns else "close"
+            sub = df.sort_values(date_col, ascending=False).head(days)
+            rows2 = [(str(r[date_col])[:10], float(r[close_col])) for _, r in sub.iterrows()]
+            out = _daily_stats(sym, "akshare", rows2)
+        _stock_daily_cache[sym] = (now, out)
+        return out
+    except Exception as exc:  # noqa: BLE001
+        return {"symbol": sym, "source": "akshare", "error": f"日线获取失败: {type(exc).__name__}: {exc}"}
 
 
 # ---------- 查询工具 ----------
@@ -71,9 +183,23 @@ def write_viewpoint(
 
 
 def query_realtime_health(conn) -> dict:
-    """查询实时行情数据健康状态（数据失效即防守：ok=False 时禁止基于实时价做 P0 决策）。"""
+    """查询实时行情数据健康状态（数据失效即防守：ok=False 时禁止基于实时价做 P0 决策）。
+
+    2026-08-18 改：**交易时段感知**——非交易时段休市，行情旧属正常，不视为数据失效：
+    返回 ok=True 并提示改用日线/收盘数据（避免 Agent 在盘后/盘前误报"数据失效"）。
+    """
     from invest.config import get_settings
+    from invest.intraday import _in_trading_window
+
+    if not _in_trading_window():
+        return {
+            "ok": True,
+            "stale": 0,
+            "note": "非交易时段（休市），不检查实时行情；请使用日线/收盘数据（daily_bars）分析，"
+                    "不要以实时价做盘中结论。",
+        }
     from invest.data.realtime import realtime_health
+
     return realtime_health(get_settings().db_path)
 
 
@@ -209,6 +335,7 @@ TOOL_SCHEMAS = [
     {"type": "function", "function": {"name": "query_realtime_health", "description": "查询实时行情数据健康状态；ok=false 表示行情失效/过期，此时禁止基于实时价格给出开仓或止损决策", "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {"name": "request_attribution", "description": "交易→投研：归因请求单", "parameters": {"type": "object", "properties": {"obj": {"type": "string"}, "reason": {"type": "string"}}, "required": ["obj", "reason"]}}},
     {"type": "function", "function": {"name": "cross_validate", "description": "多源交叉验证：对某行业或个股汇总四维度最新信号（强度RS/趋势 / 资金风格 / 高相关联动 / 估值PE/PB分位与拥挤度），用于确认方向是否多维度共振", "parameters": {"type": "object", "properties": {"obj": {"type": "string"}, "obj_type": {"type": "string", "enum": ["industry", "stock"], "description": "默认 industry"}}, "required": ["obj"]}}},
+    {"type": "function", "function": {"name": "query_stock_daily", "description": "查询任意个股日线数据（最近收盘价/1/5/20日涨跌幅/窗口内高低/最近5条K线）。本地无该股数据时会按需联网拉取（akshare 东财→新浪）。周期决定 days：短线/游资视角=60；中线=250；长线=500。分析个股时优先用这个工具拿收盘数据，再配 cross_validate 看多维度", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "6位股票代码，如 600519"}, "days": {"type": "integer", "description": "交易日数：短线60/中线250/长线500，默认60"}}, "required": ["symbol"]}}},
 ]
 
 _IMPLEMENTATIONS = {
@@ -224,6 +351,7 @@ _IMPLEMENTATIONS = {
     "request_attribution": request_attribution,
     "query_realtime_health": query_realtime_health,
     "cross_validate": cross_validate,
+    "query_stock_daily": query_stock_daily,
 }
 
 

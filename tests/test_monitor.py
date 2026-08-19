@@ -10,7 +10,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from invest.db import connect, init_db
-from invest.monitor import check_data_conflict, check_position_falsify, run_p0_monitor
+from invest.monitor import _STATE_FILE, check_data_conflict, check_position_falsify, run_p0_monitor
 
 
 def _tmp_db():
@@ -22,6 +22,13 @@ def _tmp_db():
             pass
     init_db(p)
     return p
+
+
+def _reset_state():
+    try:
+        os.remove(_STATE_FILE)
+    except OSError:
+        pass
 
 
 def test_check_position_falsify():
@@ -65,6 +72,7 @@ def test_check_data_conflict():
 
 
 def test_run_p0_monitor_mocked():
+    _reset_state()
     p = _tmp_db()
     with mock.patch("invest.monitor.Notifier") as m:
         m.return_value.send_text.return_value = True
@@ -76,16 +84,24 @@ def test_run_p0_monitor_mocked():
 
 
 def test_run_p0_monitor_trading_window():
+    """数据失效边沿触发：失效通知一次；持续失效不再重复；恢复再通知一次。"""
+    _reset_state()
     p = _tmp_db()
+    conflict = [{"kind": "data_conflict", "symbol": "", "msg": "[P0]【数据失效】实时行情不可用"}]
+
     with mock.patch("invest.monitor.Notifier") as m:
         m.return_value.send_text.return_value = True
         with mock.patch("invest.monitor._in_trading_window", return_value=True):
-            with mock.patch("invest.monitor.check_data_conflict", return_value=[
-                {"kind": "data_conflict", "symbol": "", "msg": "[P0]【数据失效】实时行情不可用"}
-            ]):
-                n = run_p0_monitor(p)
-    assert n == 1  # 交易时段：数据冲突告警正常推送
-    assert any("[P0]" in c.args[0] for c in m.return_value.send_text.call_args_list)
+            with mock.patch("invest.monitor.check_data_conflict", return_value=conflict):
+                n1 = run_p0_monitor(p)  # 健康→失效：通知 1 次
+                n2 = run_p0_monitor(p)  # 持续失效：不重复通知
+            with mock.patch("invest.monitor.check_data_conflict", return_value=[]):
+                n3 = run_p0_monitor(p)  # 失效→恢复：通知 1 次
+                n4 = run_p0_monitor(p)  # 持续健康：不通知
+    assert n1 == 1 and n2 == 0 and n3 == 1 and n4 == 0
+    texts = [c.args[0] for c in m.return_value.send_text.call_args_list]
+    assert any("[P0]" in t for t in texts)
+    assert any("已恢复" in t for t in texts)
     print("test_run_p0_monitor_trading_window OK")
 
 
@@ -93,4 +109,5 @@ if __name__ == "__main__":
     test_check_position_falsify()
     test_check_data_conflict()
     test_run_p0_monitor_mocked()
+    test_run_p0_monitor_trading_window()
     print("\nALL MONITOR TESTS PASSED")

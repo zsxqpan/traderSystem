@@ -38,10 +38,17 @@ class Settings(BaseSettings):
     feishu_chat_id: str = ""
     feishu_proxy: str = "http://127.0.0.1:7892"
 
-    # 推送：个人微信（iLink Bot API，token 来自 Hermes weixin 登录）
+    # 推送：飞书长连接接收（项目本体直连，零 Hermes 依赖）
+    # 你的飞书 open_id（群内触发盘中报告的账号）；机器人 open_id 留空则启动时自动查询
+    feishu_owner_open_id: str = ""
+    feishu_bot_open_id: str = ""
+    # 群其他成员艾特机器人可用额度（每日 token 上限，2026-08-18 新增，默认 100 万）
+    feishu_nonadmin_daily_token_limit: int = 1_000_000
+
+    # 推送：个人微信（iLink Bot API，凭据已迁入项目本地 data/weixin/）
     weixin_token: str = ""
     weixin_to_user_id: str = ""
-    weixin_ctx_path: str = ""
+    weixin_ctx_path: str = ""  # 留空则用 data/weixin/context-tokens.json
 
     # 数据源
     tushare_token: str = ""
@@ -53,6 +60,10 @@ class Settings(BaseSettings):
     core_attention_limit: int = 10
     pool_limit: int = 20
     daily_llm_budget_tokens: int = 60_000
+
+    # 重点关注行业名单（2026-08-18 方案C，逗号分隔，如 "半导体,军工,白酒"；
+    # 日报/周报会对名单内行业做专项数据+意见，随周报等信息调整）
+    focus_industries: str = ""
 
     # 风控初始参数
     risk_max_drawdown: float = 0.15

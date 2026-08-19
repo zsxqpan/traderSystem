@@ -50,6 +50,22 @@ def collect_industry(db_path: str) -> list[dict]:
     return run_collection(db_path, tasks=tasks)
 
 
+_INDEX_SUFFIXES = ("000016", "000905", "000852", "000688", "399006", "899050")
+
+
+def collect_bars_and_indices(db_path: str) -> list[dict]:
+    """晚间补采日线+指数（2026-08-17 修复数据滞后）。
+
+    新浪/东财的当日日线、指数日线要到晚间才发布，16:00 收盘采集
+    拿不到当天数据，导致 daily_bars/index_bars 滞后 1 个交易日。
+    21:40 补采（此刻数据源已有当天数据），让 22:00 每日复盘用当天数据。
+    """
+    from invest.data.collector import TASKS, run_collection
+    names = {"daily_bars", "index_bars"} | {f"index_bars_{s}" for s in _INDEX_SUFFIXES}
+    tasks = [t for t in TASKS if t["name"] in names]
+    return run_collection(db_path, tasks=tasks)
+
+
 def collect(db_path: str, tasks=None) -> list[dict]:
     """采集数据（默认含候选池个股任务），返回任务摘要。"""
     from invest.data.collector import run_collection
@@ -458,6 +474,17 @@ def notify_premarket(db_path: str, agent_text: str = "") -> bool:
     return Notifier().send_text(msg, key="premarket", min_interval=600)
 
 
+def notify_morning_brief(db_path: str) -> bool:
+    """盘前信息早报（2026-08-16）：交易日 8:40，关键信息简明扼要。
+
+    仅发送到飞书群（用户指定，其他渠道不发送）。
+    """
+    from invest.report import morning_brief_report
+    msg = morning_brief_report(db_path)
+    from invest.push.feishu_push import send_text
+    return send_text(msg, key="morning_brief", min_interval=600)
+
+
 def notify_after_close(db_path: str, agent_text: str = "") -> bool:
     from invest.report import daily_report
     msg = daily_report(db_path, agent_text)
@@ -466,19 +493,8 @@ def notify_after_close(db_path: str, agent_text: str = "") -> bool:
 
 
 def notify_weekend(db_path: str, agent_text: str = "") -> bool:
-    conn = connect(db_path)
-    try:
-        msg = (
-            f"【A股投资系统 · 周报】\n"
-            f"数据截至: {_freshness(conn)}\n"
-            f"评级: {_ratings_block(conn)}\n"
-            f"市场温度: {_temperature(conn)}\n"
-            f"中线轨强度前5: {_top_strength(conn, 'mid')}\n"
-            f"宏观流动性:\n{_macro_text(conn)}\n"
-            f"周度观点:\n{_agent_viewpoints(conn) or agent_text or '[Agent 未运行]'}"
-        )
-    finally:
-        conn.close()
+    from invest.report import weekly_report
+    msg = weekly_report(db_path, agent_text)
     from invest.notifier import Notifier
     return Notifier().send_text(msg, key="weekend", min_interval=600)
 

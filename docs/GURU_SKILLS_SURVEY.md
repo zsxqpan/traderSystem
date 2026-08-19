@@ -50,3 +50,21 @@
 3. **stock-analysis-skill** → 直接匹配你的 Codex 环境
 
 > ⚠️ 提醒：白毛股神"3612% 收益率"为自报战绩，未独立核实；Skill 价值在于**方法论结构化**（供应链卡点逆向思维），不是照搬收益。所有 Skill 只做决策辅助，不自动交易。
+
+## 安装状态（2026-08-16）
+
+✅ 三个 skill 已克隆到 `tools/hermes_skills/`：
+| Skill | 位置 | 内容 |
+|---|---|---|
+| serenity-skill | `tools/hermes_skills/serenity-skill/` | **44,514 条推文**蒸馏的机构级投资思维（SKILL.md + scripts） |
+| UZI-skill | `tools/hermes_skills/UZI-skill/` | 66 位大佬，447 文件，含 4 子 skill（deep-analysis/investor-panel/lhb-analyzer/trap-detector）+ serenity 档案 |
+| stock-analysis-skill | `tools/hermes_skills/stock-analysis-skill/` | A股/港股/美股五步法投研（财务排雷/市值倒推/反证清单） |
+
+### 安装到 Hermes（需手动复制，E 盘沙箱不可写）
+```powershell
+Copy-Item -Recurse "C:\Users\狐狸怂\Documents\Codex\2026-08-01\la\traderSystem\tools\hermes_skills\serenity-skill" "E:\Hermes Agent CN Desktop\data\hermes-home\skills\finance\serenity-skill"
+Copy-Item -Recurse "C:\Users\狐狸怂\Documents\Codex\2026-08-01\la\traderSystem\tools\hermes_skills\stock-analysis-skill" "E:\Hermes Agent CN Desktop\data\hermes-home\skills\finance\stock-analysis-skill"
+Copy-Item -Recurse "C:\Users\狐狸怂\Documents\Codex\2026-08-01\la\traderSystem\tools\hermes_skills\UZI-skill" "E:\Hermes Agent CN Desktop\data\hermes-home\skills\finance\UZI-skill"
+```
+重启 Hermes 后验证：问"用 Serenity 视角分析一下 XX" / "用 UZI 深度分析 XX" / "做个股五步法报告"。<br>
+UZI-skill 也带 `.codex` 插件目录，可直接用于 Codex（放入 `~/.codex` 或按仓库 README）。

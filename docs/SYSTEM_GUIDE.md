@@ -128,6 +128,7 @@ RISK_MAX_DRAWDOWN=0.15
 | 时间 | 任务 | 说明 |
 |---|---|---|
 | 工作日 08:30 | premarket | 采集 + 定量 + **环境重评触发检查**（ERP/社融/10Y，触发即推送）+ 投研清单 + 盘前推送 |
+| 工作日 08:40 | morning_brief | **盘前信息早报**：隔夜市场/龙虎榜资金焦点/板块主线/今日关注/宏观（简明扼要） |
 | 盘中 4 秒 | intraday_tick | 三源实时行情轮询 + P0 监控（止损/证伪/数据冲突）；非交易时段守护空转 |
 | 工作日 16:00 | after_close | 采集 + 定量 + 交易复盘 + 仲裁 + 盘后日报 + 收盘扫描（快照/P1）+ **历史行业/ST 快照** |
 | 工作日 21:30 | industry_refresh | 同花顺当天行业数据刷新（晚间发布）+ 定量重算 |
@@ -187,33 +188,79 @@ RISK_MAX_DRAWDOWN=0.15
 
 | 级别 | 触发 | 通道 | 限频 |
 |---|---|---|---|
-| P0 | 盘中异动/止损/数据冲突 | 企业微信+飞书+微信 | 300s |
-| P1 | 收盘扫描变化（新入池/等级/评级） | 同上 | 600s |
-| P2 | 晚间例行简报 / 复盘推送 | 同上 | 600s |
+| P0 | 盘中异动（**主板 ±3% / 创业板·科创板 ±6%**）/ 止损 / 数据失效 | 企业微信+飞书+微信 | 180s |
+| P1 | 盘中异动（track）/ 收盘扫描变化（新入池/等级/评级） | 同上 | 1800s / 600s |
+| P2 | **晚间盘后报告（22:00，合并原 盘后日报/P2简报/每日复盘，只发一份）** | 同上 | 600s |
+| 周末周报 | **周日 20:00**（消息面·**大模型提炼**近3日电报 + 周度复盘） | 同上 | 600s |
 | 环境重评 | ERP 跨分位/社融拐点/10Y>20bp | 同上 | 12h |
-| 盘中实时报告（按需） | 飞书群艾特机器人/发关键词 | 飞书群 | 手动触发 |
+| 盘中实时报告（按需） | 飞书群 @机器人（**纯 LLM 语义识别触发，无关键词**） | 飞书群 | 手动触发 |
+
+**盘中节奏（2026-08-18 降频）**：实时行情轮询 **10 秒/次**（原 4s）；异动推送 P0 限频 **180s**、P1 **1800s**；
+P0 数据失效告警改**边沿触发**——失效时通知一次、恢复时再通知一次（状态存 `data/monitor_state.json`）。
+
+**盘后报告数据新鲜度门禁（2026-08-18）**：22:00 发送前先校验 `daily_bars`/`index_bars`
+是否已更新到最近交易日（当日日线数据源晚间才发布，由 21:40 `daily_refresh` 补采）。
+**数据滞后时不发报告**，改为推送一条滞后原因（含最新数据日期、最近交易日、补采任务是否执行），
+12h 限频，并把原因写入 `job_runs` 留痕。
 
 未配置 webhook 时推送自动禁用，不影响其它功能。
 
 ### 7.1 盘中实时报告机器人（飞书群 @ 触发）
 
-在飞书 hermes-agent 群里**艾特机器人**或发送含「盘中 / 实时 / 报告 / 行情 / 盘面」的消息，
-机器人自动回复盘中实时报告（核心关注实时行情 + 涨跌幅 + 持仓警戒 + 温度 + 评级仓位建议）。
+在飞书群里 **@机器人**（管理员账号 `FEISHU_OWNER_OPEN_ID`）并发送
+「盘中 / 实时 / 报告 / 行情 / 盘面」等请求，机器人自动回复盘中实时报告
+（核心关注实时行情 + 涨跌幅 + 持仓警戒 + 温度 + 评级仓位建议）。
+行为约定（2026-08-18 v4：私聊 + 群内任意 @ 全量 Agent 回应）：
+- **私聊（p2p）**：任意消息都由 Agent 回应（报告/提问/闲聊）；
+- **群内 @机器人**（管理员或其他人）：任意消息都由 Agent 回应（不再只回报告）；
+- **回复分流**：语义识别为要实时报告 → 盘中实时报告（**默认简洁版**：核心池行情/板块异动/情绪人气/龙虎榜龙头/温度仓位/今日操作建议；消息里含「详细/完整」才发完整版，完整版管理员含持仓警戒）；问候/求助（在吗/你好/help）→ 帮助提示（本地判定零 token）；其他 → 会话 Agent（run_chat，带系统数据工具，max_turns=3）回答，**Skill 由大模型按语义自选**（Serenity/youzi/stock_analysis 方法论内置 prompt），模型在回复末尾自标注「↘ 已使用 Skill：xxx」；
+- **收到消息先回 ❤️ 表情**（`im:message.reaction` 权限，需开发者后台开启），让你第一时间知道消息已收到；
+- **纯 LLM 语义触发，无关键词**：是否生成盘中报告一律由 LLM 意图识别决定；管理员群内不 @ 的发言仅语义命中报告才触发；
+- **非管理员每日 token 限额**：默认 100 万/天（`FEISHU_NONADMIN_DAILY_TOKEN_LIMIT`），私聊/群内 @ 的 LLM 用量记入 `llm_usage(job='group')`，超限只回额度提示；
+- 限频：报告 30s/人，Agent 会话 10s/人；
+- **盘中报告内容（2026-08-18 精简）**：不含指数强弱榜/市场风格；聚焦 板块异动（最近交易日涨幅TOP3）+ 情绪·人气（涨停/连板/炸板/情绪周期）+ 资金焦点·龙虎榜龙头 + 核心池实时行情 + 做T/建仓提示 + 温度仓位。
 
-启动（常驻）：
+启动（常驻，随 `run_service.py` 自动拉起）：
 ```bat
-myenv\Scripts\python.exe feishu_group_watch.py
+myenv\Scripts\python.exe scripts\run_service.py
+```
+连通性自检（不发消息）：
+```bat
+myenv\Scripts\python.exe -c "import sys; sys.path.insert(0,'.'); from invest.push.feishu_ws import check; check()"
 ```
 说明：
-- 依赖 Hermes 桌面端运行（读取其 gateway.log 增量监听群消息）；
-- 同时保留原「群监控转发」功能：群内他人消息自动转发到你的飞书 DM；
+- **项目本体直连飞书（WebSocket 长连接，lark-oapi），零 Hermes 依赖**；
+- 前置条件（开发者后台 open.feishu.cn/app，应用即群内机器人 Trader-Fox）：
+  - 事件与回调 → 事件订阅：订阅方式选**使用长连接接收事件**，订阅**接收消息 im.message.receive_v1**；
+  - 权限：`im:message`、`im:message.group_at_msg`、`im:message.p2p_msg` 等；
+  - 机器人已加入目标群（`.env` 的 `FEISHU_CHAT_ID`）；
+  - **长连接是集群模式**：同一应用同一时刻只有随机一个客户端能收到事件，
+    启用本项目前**必须停用 Hermes（或其它工具）对该应用的飞书连接**
+    （`powershell -ExecutionPolicy Bypass -File "C:\Users\狐狸怂\Documents\Codex\2026-08-01\la\traderSystem\scripts\disable_hermes_feishu.ps1"`），
+    否则消息随机分流 → “艾特机器人经常没回应”（详见 `docs/GATEWAY_STABILITY_ANALYSIS.md`）；
 - 非交易时段实时行情不可用，报告自动回退最近收盘数据并明确标注；
 - 报告生成复用 `invest/report.intraday_report`，可独立预览：
   `myenv\Scripts\python.exe -c "import sys; sys.path.insert(0,'.'); from invest.report import intraday_report; print(intraday_report('data/invest.db'))"`
-- 报告模板（`invest/report.py`，2026-08-15 优化日报）：
+- 报告模板（`invest/report.py`，2026-08-15 优化日报；盘中 2026-08-18 精简）：
   - `daily_report`：盘后日报（温度+倾向 / 评级仓位建议 / 板块涨跌 / 短中线强度 / 候选池变化 / 持仓警戒 / Agent 观点）
   - `premarket_report`：盘前清单（评级仓位 / 温度 / 环境重评触发 / Agent 关注方向）
-  - `intraday_report`：盘中实时（核心池行情 / 异动 / 持仓警戒 / 温度 / 仓位建议）
+  - `intraday_report`：盘中实时（核心池行情 / 板块异动 / 情绪人气 / 龙虎榜龙头 / 做T建仓提示 / 温度仓位；`public=True` 隐藏持仓警戒）
+
+### 7.2 定时任务调度方式（默认 OS 计划任务模式）
+
+**2026-08-18 起默认 `--ticker-only`**：`run_service.py` 不加参数即 ticker-only——
+只跑盘中 10s 轮询 + 飞书接收；定时任务由 Windows 计划任务承担（先运行
+`scripts/install_os_tasks.ps1` 注册 9 个任务）。要回到完整 APScheduler 常驻模式
+（不装 OS 任务），显式加 `--full`：
+```bat
+myenv\Scripts\python.exe -u scripts\run_service.py            :: 默认 ticker-only
+myenv\Scripts\python.exe -u scripts\run_service.py --full     :: 完整 APScheduler
+```
+说明：
+- 单任务入口 `scripts/run_job.py <job>`（running/ok/failed 留痕 + 失败推送，跑完即退）；
+- 注册脚本 `scripts/install_os_tasks.ps1` 用 schtasks /XML 注册 9 个任务
+  （StartWhenAvailable=错过补跑、IgnoreNew=不重叠、ExecutionTimeLimit=2h）；
+- 盘中 10s 轮询 OS 任务无法表达，必须由 ticker-only 常驻承载；两种模式二选一，勿同时开。
 
 ---
 

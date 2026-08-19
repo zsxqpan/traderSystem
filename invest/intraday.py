@@ -1,4 +1,4 @@
-﻿"""盘中异动监测：核心关注个股实时涨跌幅监控（三源直连轮询）。
+"""盘中异动监测：核心关注个股实时涨跌幅监控（三源直连轮询）。
 
 实时行情通道（2026-08-15 决策）：新浪 hq.sinajs.cn / 腾讯 qt.gtimg.cn /
 东财 push2 三源直连 Level-1 快照轮询，批量取核心池，3-5 秒间隔；
@@ -94,11 +94,22 @@ def _baselines(db_path: str) -> dict[str, float]:
         conn.close()
 
 
-def check_core_moves(db_path: str, threshold: float = 0.03) -> list[dict]:
+def _move_threshold(symbol: str) -> float:
+    """异动阈值（2026-08-18 按板块区分）：主板 ±3%；创业板(300/301)/科创板(688/689) ±6%。"""
+    s = (symbol or "").split(".")[0]
+    if s.startswith(("300", "301", "688", "689")):
+        return 0.06
+    return 0.03
+
+
+def check_core_moves(db_path: str, threshold: float | None = None) -> list[dict]:
     """核心关注个股盘中异动检测：批量取价一次轮询，缺失标的跳过。
 
     数据失效即防守：三源全挂或行情不新鲜时返回空列表（不推送、不抛错）；
     轮询延迟/源切换写入 job_runs(job='realtime') 留痕。
+
+    阈值（2026-08-18 按板块区分）：threshold=None 时主板 ±3%、创业板/科创板 ±6%
+    （原统一 ±5% 噪音过多）；显式传 threshold 则全标的用该值（兼容调用方）。
     """
     conn = connect(db_path)
     try:
@@ -118,8 +129,12 @@ def check_core_moves(db_path: str, threshold: float = 0.03) -> list[dict]:
         if price is None or base is None or base <= 0:
             continue
         pct = price / base - 1
-        if abs(pct) >= threshold:
-            alerts.append({"symbol": sym, "price": round(price, 2), "pct": round(pct, 4)})
+        thr = threshold if threshold is not None else _move_threshold(sym)
+        if abs(pct) >= thr:
+            alerts.append({
+                "symbol": sym, "price": round(price, 2), "pct": round(pct, 4),
+                "threshold": thr,
+            })
     return alerts
 
 
@@ -143,8 +158,8 @@ def _attribute(db_path: str, alert: dict) -> str:
 
 # 推送时效分级：候选池 level -> (优先级, 限频秒)
 _PUSH_POLICY = {
-    "core": ("P0", 300),    # 核心关注：交易时段立即推
-    "track": ("P1", 600),   # 跟踪：降频，避免噪音
+    "core": ("P0", 180),    # 核心关注：交易时段推，180s 限频（2026-08-18 由 600s 降低频率）
+    "track": ("P1", 1800),  # 跟踪：降频，1800s 限频
     "rest": ("P2", 0),      # 其余：不实时推（仅晚间汇总）
 }
 
@@ -153,7 +168,7 @@ def send_alerts(db_path: str, alerts: list[dict], attribute: bool = True) -> int
     """推送异动，按候选池等级时效分级（v3 14.3）。
 
     - 非交易时段：一律静默返回 0（防御：正常调度已由 _in_trading_window 守护）；
-    - P0（core）：立即推送，300s 限频；P1（track）：600s 限频；
+    - P0（core）：立即推送，180s 限频；P1（track）：1800s 限频；
     - P2（rest）：不实时推送，仅晚间复盘汇总（这里跳过）；
     - attribute 时为首条 P0 异动附 LLM 归因。
     """
@@ -178,7 +193,9 @@ def send_alerts(db_path: str, alerts: list[dict], attribute: bool = True) -> int
         level = levels.get(a["symbol"], "rest")
         priority, interval = _PUSH_POLICY.get(level, ("P2", 0))
         tag = f"[{priority}]"
-        msg = f"{tag}【盘中异动】{a['symbol']} 现价 {a['price']:.2f}，较昨收 {a['pct']:+.2%}"
+        thr = a.get("threshold")
+        thr_txt = f"，异动>{thr:.0%}" if thr else ""
+        msg = f"{tag}【盘中异动】{a['symbol']} 现价 {a['price']:.2f}，较昨收 {a['pct']:+.2%}{thr_txt}"
         if attribute and i == 0 and priority == "P0":
             try:
                 note = _attribute(db_path, a)

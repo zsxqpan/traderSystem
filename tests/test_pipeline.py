@@ -45,8 +45,90 @@ def test_notifier_disabled_and_mock():
 def test_scheduler_jobs():
     sched = build_scheduler()
     ids = {j.id for j in sched.get_jobs()}
-    assert {"premarket", "after_close", "weekend", "intraday_tick", "monthly", "yearly", "nightly", "industry_refresh", "p2_brief"} <= ids
+    # 2026-08-18 合并盘后报告：nightly/p2_brief → evening_report（数据滞后时跳过并推送原因）
+    assert {"premarket", "morning_brief", "after_close", "weekend", "intraday_tick",
+            "monthly", "yearly", "industry_refresh", "daily_refresh", "evening_report"} <= ids
+    assert "p2_brief" not in ids and "nightly" not in ids
     print("test_scheduler_jobs OK")
+
+
+def test_ticker_only_and_job_funcs():
+    """OS 计划任务模式：ticker_only 只留 10s 轮询；JOB_FUNCS 覆盖全部可迁移任务。"""
+    from invest.scheduler import JOB_FUNCS, build_scheduler
+
+    sched = build_scheduler(ticker_only=True)
+    assert {j.id for j in sched.get_jobs()} == {"intraday_tick"}
+    assert set(JOB_FUNCS) == {
+        "premarket", "morning_brief", "after_close", "weekend", "monthly", "yearly",
+        "industry_refresh", "daily_refresh", "evening_report",
+    }
+    print("test_ticker_only_and_job_funcs OK")
+
+
+def test_data_lag_reason():
+    """盘后数据新鲜度门禁：空库/旧数据 → 返回滞后原因；已更新到最近交易日 → 返回空串。"""
+    from invest.data.calendar import latest_trading_day
+    from invest.scheduler import _data_lag_reason
+    import datetime as dt
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        # 空库 → 滞后
+        assert _data_lag_reason(conn) != ""
+        # 写入最近交易日数据 → 新鲜
+        exp = latest_trading_day(dt.date.today()).isoformat()
+        from invest.data.storage import upsert_df
+        import pandas as pd
+        upsert_df(conn, "daily_bars", pd.DataFrame([{"date": exp, "symbol": "000001", "close": 10.0}]))
+        upsert_df(conn, "index_bars", pd.DataFrame([{"date": exp, "index_code": "000300", "close": 100.0}]))
+        assert _data_lag_reason(conn) == ""
+        # 只剩上一交易日 → 滞后
+        y = latest_trading_day(dt.date.today() - dt.timedelta(days=1)).isoformat()
+        conn.execute("UPDATE daily_bars SET date=?", (y,))
+        conn.execute("UPDATE index_bars SET date=?", (y,))
+        conn.commit()
+        assert _data_lag_reason(conn) != ""
+    finally:
+        conn.close()
+    print("test_data_lag_reason OK")
+
+
+def test_evening_report_freshness_gate():
+    """晚间盘后报告：数据滞后 → 不发报告只发原因；数据新鲜 → 正常发报告。"""
+    from invest.data.calendar import latest_trading_day
+    from invest.scheduler import _evening_report
+    import datetime as dt
+
+    # 滞后场景
+    p_stale = _tmp_db()
+    conn = connect(p_stale)
+    try:
+        with mock.patch("invest.scheduler.Notifier") as m:
+            m.return_value.send_text.return_value = True
+            _evening_report(p_stale, conn)
+        texts = [c.args[0] for c in m.return_value.send_text.call_args_list]
+        assert texts and "数据滞后" in texts[0] and "未发送" in texts[0]
+    finally:
+        conn.close()
+
+    # 新鲜场景
+    p_fresh = _tmp_db()
+    conn = connect(p_fresh)
+    try:
+        exp = latest_trading_day(dt.date.today()).isoformat()
+        from invest.data.storage import upsert_df
+        import pandas as pd
+        upsert_df(conn, "daily_bars", pd.DataFrame([{"date": exp, "symbol": "000001", "close": 10.0}]))
+        upsert_df(conn, "index_bars", pd.DataFrame([{"date": exp, "index_code": "000300", "close": 100.0}]))
+        with mock.patch("invest.scheduler.Notifier") as m:
+            m.return_value.send_text.return_value = True
+            _evening_report(p_fresh, conn)
+        texts = [c.args[0] for c in m.return_value.send_text.call_args_list]
+        assert texts and "数据滞后" not in texts[0] and "盘后日报" in texts[0]
+    finally:
+        conn.close()
+    print("test_evening_report_freshness_gate OK")
 
 
 def test_pipeline_quant():
@@ -198,6 +280,9 @@ def test_daily_movers_and_strength_text():
 if __name__ == "__main__":
     test_notifier_disabled_and_mock()
     test_scheduler_jobs()
+    test_ticker_only_and_job_funcs()
+    test_data_lag_reason()
+    test_evening_report_freshness_gate()
     test_pipeline_quant()
     test_notify_messages_no_crash()
     test_build_collect_tasks_from_pool()

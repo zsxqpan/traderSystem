@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """微信(个人微信 iLink Bot API)推送通道。
 
-API 契约从 Hermes 源码 gateway/platforms/weixin.py (v0.19.0-cn.7) 逆向还原:
+API 契约按 iLink Bot 协议实现（早期参考 Hermes 源码 gateway/platforms/weixin.py
+v0.19.0-cn.7 逆向还原，现为独立实现，运行时零 Hermes 依赖）：
   POST https://ilinkai.weixin.qq.com/ilink/bot/sendmessage
 纯 stdlib,零第三方依赖。trust_env=False 直连(绕开 WinINET 系统代理)。
+
+凭据（token / context_token）已迁入项目本地目录 data/weixin/，不再读取
+Hermes 数据目录；旧 Hermes 路径仅作一次性迁移源（见 migrate_context_tokens）。
 """
 from __future__ import annotations
 
@@ -11,10 +15,12 @@ import base64
 import json
 import logging
 import secrets
+import shutil
 import struct
 import time
 import urllib.request
 import uuid
+from pathlib import Path
 
 from invest.config import get_settings
 
@@ -26,6 +32,14 @@ ILINK_APP_CLIENT_VERSION = 131584       # 0x020200 = "2.2.0"
 CHANNEL_VERSION = "2.2.0"               # base_info.channel_version
 MAX_MESSAGE_LENGTH = 2000               # 代码实测上限(文档写 4000,以代码为准)
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CTX_FILE = PROJECT_ROOT / "data" / "weixin" / "context-tokens.json"
+# 旧 Hermes 路径：仅一次性迁移源；迁移完成后不再访问
+_LEGACY_CTX_FILE = (
+    r"E:\Hermes Agent CN Desktop\data\hermes-home\weixin\accounts"
+    r"\054eea562991@im.bot.context-tokens.json"
+)
+
 # 消息类型常量
 ITEM_TEXT = 1
 MSG_TYPE_BOT = 2
@@ -35,23 +49,39 @@ _LAST_SEND: dict[str, float] = {}
 
 
 def _random_wechat_uin() -> str:
-    """X-WECHAT-UIN: 随机 32 位无符号整数的十进制字符串的 base64(与 Hermes 相同)。"""
+    """X-WECHAT-UIN: 随机 32 位无符号整数的十进制字符串的 base64。"""
     value = struct.unpack(">I", secrets.token_bytes(4))[0]
     return base64.b64encode(str(value).encode("utf-8")).decode("ascii")
 
 
-def _context_token_path() -> str:
-    """Hermes 持久化的 context_token 文件路径(按 account+peer 存储)。"""
+def migrate_context_tokens() -> None:
+    """一次性迁移：把旧 Hermes 目录下的 context-tokens.json 复制到项目本地。
+
+    项目文件已存在则不覆盖；旧文件不存在则跳过（首次调用后即与 Hermes 解耦）。
+    """
+    if CTX_FILE.exists():
+        return
+    legacy = Path(_LEGACY_CTX_FILE)
+    if not legacy.exists():
+        return
+    try:
+        CTX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy, CTX_FILE)
+        logger.warning("已把微信 context-tokens 从 Hermes 目录迁移到项目本地: %s", CTX_FILE)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("微信 context-tokens 迁移失败: %s", exc)
+
+
+def _context_token_path() -> Path:
+    """context_token 文件路径：优先 .env 的 WEIXIN_CTX_PATH，否则项目本地默认路径。"""
     settings = get_settings()
     if getattr(settings, "weixin_ctx_path", ""):
-        return settings.weixin_ctx_path
-    return (
-        r"E:\Hermes Agent CN Desktop\data\hermes-home\weixin\accounts"
-        r"\054eea562991@im.bot.context-tokens.json"
-    )
+        return Path(settings.weixin_ctx_path)
+    return CTX_FILE
 
 
 def _load_context_token(to_user_id: str) -> str | None:
+    migrate_context_tokens()  # 首次读取时尝试从旧 Hermes 目录一次性迁移
     try:
         with open(_context_token_path(), "r", encoding="utf-8") as fp:
             ctx = json.load(fp)
@@ -96,7 +126,7 @@ def send_text(text: str, key: str = "", min_interval: float = 0.0,
     msg = {
         "from_user_id": "",
         "to_user_id": to_user_id,
-        "client_id": "hermes-weixin-" + uuid.uuid4().hex,
+        "client_id": "trader-system-weixin-" + uuid.uuid4().hex,
         "message_type": MSG_TYPE_BOT,
         "message_state": MSG_STATE_FINISH,
         "item_list": [{"type": ITEM_TEXT, "text_item": {"text": text}}],

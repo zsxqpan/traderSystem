@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""飞书群推送通道(开放平台 API 直连)。
+"""飞书群推送通道(开放平台 API 直连，零 Hermes 依赖)。
 
-依赖:requests;必须走 127.0.0.1:7892 代理(open.feishu.cn 直连被网络阻断,
-2026-08-15 实测)。trust_env=False 避免读 WinINET 代理(此处显式指定代理)。
+依赖:requests。直连 open.feishu.cn(2026-08-16 实测直连可用,
+不再依赖 FastLink 代理;8/15 曾误判直连被阻断,实为 DNS/代理残留)。
+trust_env=False 避免读 WinINET 注册表代理;NO_PROXY 已含 feishu.cn。
+2026-08-18: tenant_access_token 加缓存(2h 有效,提前 60s 过期) + 发送失败重试 1 次。
 """
 from __future__ import annotations
 
@@ -19,20 +21,30 @@ logger = logging.getLogger(__name__)
 _LAST_SEND: dict[str, float] = {}
 _SESSION: requests.Session | None = None
 
+# tenant_access_token 缓存: {token: expires_at}（有效期 2h，提前 60s 视为过期）
+_TOKEN_CACHE: dict[str, float] = {}
+_TOKEN_TTL = 2 * 3600 - 60
+
 
 def _session() -> requests.Session:
     global _SESSION
     if _SESSION is None:
         s = requests.Session()
         s.trust_env = False
-        settings = get_settings()
-        proxy = getattr(settings, "feishu_proxy", "") or "http://127.0.0.1:7892"
-        s.proxies = {"http": proxy, "https": proxy}
+        # 直连：不设置 proxies（实测 open.feishu.cn 可直连）
         _SESSION = s
     return _SESSION
 
 
-def _tenant_token() -> str | None:
+def _tenant_token(force: bool = False) -> str | None:
+    """获取 tenant_access_token（带 2h 缓存，避免每条消息都重新换取）。"""
+    now = time.time()
+    if not force:
+        for token, expires_at in list(_TOKEN_CACHE.items()):
+            if expires_at > now:
+                return token
+            _TOKEN_CACHE.pop(token, None)
+
     settings = get_settings()
     app_id = getattr(settings, "feishu_app_id", "") or ""
     app_secret = getattr(settings, "feishu_app_secret", "") or ""
@@ -45,10 +57,65 @@ def _tenant_token() -> str | None:
         if d.get("code") != 0:
             logger.warning("飞书 token 获取失败: code=%s msg=%s", d.get("code"), d.get("msg"))
             return None
-        return d["tenant_access_token"]
+        token = d["tenant_access_token"]
+        _TOKEN_CACHE[token] = now + _TOKEN_TTL
+        return token
     except Exception as exc:  # noqa: BLE001
         logger.warning("飞书 token 获取异常: %s", exc)
         return None
+
+
+def _post_message(token: str, receive_id: str, receive_id_type: str, body: dict) -> dict | None:
+    """发送一条消息，返回响应 JSON；网络异常返回 None。"""
+    url = "https://open.feishu.cn/open-apis/im/v1/messages"
+    try:
+        r = _session().post(
+            url,
+            params={"receive_id_type": receive_id_type},
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        return r.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("飞书推送异常: %s", exc)
+        return None
+
+
+def send_message(receive_id: str, receive_id_type: str, text: str) -> bool:
+    """发送文本到指定会话（群/单聊）。
+
+    receive_id_type: chat_id / open_id / user_id / email。
+    成功返回 True,失败返回 False(不抛异常)。
+    2026-08-18: token 失效/网络抖动时重试一次（换新 token + 重发）。
+    """
+    if not text or not text.strip():
+        return False
+
+    token = _tenant_token()
+    if not token:
+        return False
+
+    body = {
+        "receive_id": receive_id,
+        "msg_type": "text",
+        "content": json.dumps({"text": text}, ensure_ascii=False),
+    }
+    d = _post_message(token, receive_id, receive_id_type, body)
+    if d is not None and d.get("code") == 0:
+        return True
+
+    # 失败重试 1 次：换新 token（可能是 token 失效/过期），等 1s 再发
+    logger.warning("飞书推送首次失败(code=%s)，重试 1 次", (d or {}).get("code"))
+    time.sleep(1)
+    token = _tenant_token(force=True)
+    if not token:
+        return False
+    d = _post_message(token, receive_id, receive_id_type, body)
+    if d is not None and d.get("code") == 0:
+        return True
+    logger.warning("飞书推送重试仍失败: %s", (d or {}).get("msg"))
+    return False
 
 
 def send_text(text: str, key: str = "", min_interval: float = 0.0) -> bool:
@@ -64,31 +131,64 @@ def send_text(text: str, key: str = "", min_interval: float = 0.0) -> bool:
         if time.time() - last < min_interval:
             return False
 
+    ok = send_message(chat_id, "chat_id", text)
+    if ok and key:
+        _LAST_SEND[key] = time.time()
+    return ok
+
+
+def send_post(receive_id: str, receive_id_type: str, segments: list[dict]) -> bool:
+    """发送 post 富文本消息（2026-08-18，用于 Skill 标注等弱化行）。
+
+    segments: 消息段列表，每段 {"tag":"text","text":...,"style":[可选]}；
+    会把各段拼进一个 post 消息（最后一段自动换行分隔）。
+    """
+    if not segments:
+        return False
     token = _tenant_token()
     if not token:
         return False
-
-    url = "https://open.feishu.cn/open-apis/im/v1/messages"
-    body = {
-        "receive_id": chat_id,
-        "msg_type": "text",
-        "content": json.dumps({"text": text}, ensure_ascii=False),
+    content = {
+        "post": {
+            "zh_cn": {
+                "title": "",
+                "content": [segments],
+            }
+        }
     }
+    body = {"receive_id": receive_id, "msg_type": "post",
+            "content": json.dumps(content, ensure_ascii=False)}
+    d = _post_message(token, receive_id, receive_id_type, body)
+    if d is not None and d.get("code") == 0:
+        return True
+    logger.warning("飞书 post 消息失败(code=%s)", (d or {}).get("code"))
+    return False
+
+
+def add_reaction(message_id: str, emoji: str = "HEART") -> bool:
+    """给消息添加表情回应（2026-08-18：收到消息先回 ❤️，告知已收到）。
+
+    需要权限 im:message.reaction（开发者后台开启）。失败静默（仅日志）。
+    emoji: 飞书 emoji_type 枚举，默认 HEART（爱心）。
+    """
+    if not message_id:
+        return False
+    token = _tenant_token()
+    if not token:
+        return False
+    url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reactions"
     try:
         r = _session().post(
             url,
-            params={"receive_id_type": "chat_id"},
-            json=body,
+            json={"reaction_type": {"emoji_type": emoji}},
             headers={"Authorization": f"Bearer {token}"},
             timeout=10,
         )
         d = r.json()
         if d.get("code") != 0:
-            logger.warning("飞书群推送被拒: code=%s msg=%s", d.get("code"), d.get("msg"))
+            logger.warning("飞书表情回应失败: code=%s msg=%s", d.get("code"), d.get("msg"))
             return False
-        if key:
-            _LAST_SEND[key] = time.time()
         return True
     except Exception as exc:  # noqa: BLE001
-        logger.warning("飞书群推送异常: %s", exc)
+        logger.warning("飞书表情回应异常: %s", exc)
         return False
