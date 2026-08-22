@@ -93,7 +93,7 @@ def mood_llm(db_path: str, ctx: dict) -> dict:
 
 
 def mainline_llm(db_path: str, ctx: dict) -> dict:
-    """日内主线分析（调用 2）。ctx 含 sector_top/fund_top/ladder/core。失败返回 {}。"""
+    """日内主线分析（调用 2）。ctx 含 sector_top/fund_top/ladder/core/etf_sector。失败返回 {}。"""
     now = time.time()
     cached = _mainline_cache.get(db_path)
     if cached and now - cached[0] < _TTL:
@@ -104,22 +104,25 @@ def mainline_llm(db_path: str, ctx: dict) -> dict:
         conn = connect(db_path)
         try:
             prompt = (
-                "以下是今日盘中板块/资金/连板/核心池数据：\n"
+                "以下是今日盘中板块/资金/连板/ETF/核心池数据：\n"
                 f"板块涨幅TOP:\n{ctx.get('sector_top') or '暂无'}\n"
                 f"资金净流入TOP:\n{ctx.get('fund_top') or '暂无'}\n"
                 f"连板梯队:\n{ctx.get('ladder') or '暂无'}\n"
+                f"板块ETF(纯度高于板块指数,体现方向真实强度):\n{ctx.get('etf_sector') or '暂无'}\n"
                 f"核心关注实时行情:\n{ctx.get('core') or '暂无'}\n\n"
                 "请输出 JSON（只分析 1-3 个最强方向）：\n"
                 '{"main_lines": [{"direction": "方向名",'
                 '"reason": "上涨原因（结合资金/连板，25字内）",'
                 '"internal": "方向内部涨跌分化（大盘vs小盘、细分如医药内创新药vsCXO、机器人内电机vs执行器，25字内）",'
+                '"etf": "对应板块ETF强度（涨跌/量能/资金一句话，25字内；无数据写无）",'
+                '"picks": [{"name": "推荐关注股票名", "reason": "推荐理由15字内"}],'
                 '"leaders": [{"role": "连板龙头|趋势龙头|容量龙头|行业龙头", "name": "股票名",'
                 '"analysis": "走势分析（25字内）"}],'
                 '"outlook": "方向走势推演：一日游/见底反弹/面临分化/缩圈/扩圈量能健康持续/即将分歧（20字内）"}],\n'
                 '"core_outlook": "结合指数与板块判断，对核心关注标的今日走势的一句话推演（40字内）"}\n'
-                "只许引用给定数据，禁止编造个股。"
+                "只许引用给定数据，禁止编造个股与数字。"
             )
-            out = _llm(conn, _YOUZI_SYSTEM, prompt, max_tokens=1500)
+            out = _llm(conn, _YOUZI_SYSTEM, prompt, max_tokens=2000)
             parsed = _parse_json(out)
             if parsed:
                 _mainline_cache[db_path] = (now, parsed)

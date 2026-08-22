@@ -1,18 +1,19 @@
-"""B1 盘中实时报告 skill（2026-08-22 重构：5 节结构化输出，飞书卡片图表）。
+"""B1 盘中实时报告 skill（2026-08-22 v3：4 点结构化 + ETF + 简洁/完整版）。
 
-新结构（用户指定）：
-1. 盘面总览：主要指数实时 + 涨跌分化结构（图表：指数涨跌幅条形图）；
-2. 整体情绪判断 + 盘面预测（结合多日数据）+ 短线周期博弈判断（youzi 方法论，LLM）；
-3. 日内主线：最强方向（涨幅/资金）→ 原因/内部结构/最强股票(连板/趋势/容量/行业龙头)/
-   走势推演（LLM，失败回退直列）；
-4. 与盘后预案对照（预留：读 viewpoints source='plan'，预案模块建成后自动生效，无则省略）；
-5. 核心关注实时行情（表格）+ 结合判断的走势推演。
+结构（用户指定 v3）：
+1. 盘面总览：主要指数实时 + 涨跌分化结构 + 指数 ETF 大资金信号（图表：指数涨跌幅条形图）；
+2. 整体情绪判断 + 盘面预测 + 短线周期博弈判断（youzi 方法论，LLM）；
+3. 日内主线：最强方向 → 原因/内部结构/**板块ETF强度**/**推荐关注股票**/最强股票/走势推演（LLM）；
+4. 核心关注与预案对照（点4+5 合并）：核心关注行情表格 + 核心关注所在板块补充分析
+   （若点3 未覆盖）+ 走势推演 + 盘后预案对照（读 viewpoints source='plan'）。
 
-render 返回 {"title", "sections"}（text/table/chart 节），发送层按通道渲染
-（render_feishu 卡片含图片；render_plain 纯文本）。
+- 简洁版（brief=True，用户说"简洁/简短"时）：去所有推演/观点/预案，只留客观盘面
+  （盘面总览 + 板块/ETF 客观数据 + 核心关注行情表格）；
+- 完整版（默认）全量。
+- struct 附 "views"（情绪/主线观点摘要），由发送层落库 viewpoints source='intraday_report'，
+  供盘后日报点2 复盘（skill render 保持纯函数无副作用）。
 
 LLM：job='intraday_report'，2 次调用（mood / mainline），_intraday_llm 缓存防抖。
-旧模板可复用内容（温度/仓位/情绪人气/连板梯队/资金主线/板块异动/龙虎榜）按新结构取舍。
 """
 from __future__ import annotations
 
@@ -24,13 +25,13 @@ SKILL = {
     "id": "b1_intraday",
     "name": "盘中实时报告",
     "kind": "report",
-    "description": "盘中实时报告：盘面总览(图表)/情绪判断+预测/日内主线/预案对照/核心关注",
+    "description": "盘中实时报告：盘面总览(含ETF)/情绪判断+预测/日内主线(ETF+推荐股)/核心关注与预案对照",
     "uses": ["d8_temp_guide", "d9_rating_guide", "d11_emotion", "d12_limit_up_ladder",
              "d13_fund_line", "d21_freshness"],
     "params": {
         "db_path": "str, required",
         "public": "bool, optional, default False",
-        "brief": "bool, optional, default True",
+        "brief": "bool, optional, default False（2026-08-22：默认完整版，简洁版需显式）",
     },
 }
 
@@ -53,7 +54,6 @@ def _index_table() -> tuple[list[list[str]], str]:
         d = idx.get(code)
         if d:
             rows.append([d["name"], f"{d['price']:.2f}", f"{d['pct']:+.2f}%"])
-    # 结构分化：小盘(中证1000) vs 大盘(沪深300)
     small, large = idx.get("000852"), idx.get("000300")
     struct = ""
     if small and large and small["pct"] is not None and large["pct"] is not None:
@@ -69,8 +69,27 @@ def _index_table() -> tuple[list[list[str]], str]:
     return rows, struct
 
 
+def _index_etf_text() -> str:
+    """指数 ETF 大资金信号（公共函数，invest/data/etf）。"""
+    try:
+        from invest.data.etf import index_etf_signal_text
+
+        return index_etf_signal_text()
+    except Exception:
+        return ""
+
+
+def _sector_etf_text() -> str:
+    """全部重要板块 ETF 数据行（公共函数，invest/data/etf）。"""
+    try:
+        from invest.data.etf import sector_etf_text
+
+        return sector_etf_text()
+    except Exception:
+        return ""
+
+
 def _index_chart_data(rows: list[list[str]]) -> list[dict]:
-    """指数表格行 → 条形图数据（name/value 百分比数字，去掉 % 符号）。"""
     out = []
     for r in rows:
         try:
@@ -106,7 +125,6 @@ def _emotion_text(conn) -> str:
 
 
 def _intraday_limit_up(conn) -> str:
-    """盘中涨停池统计（limit_up_pool 5 分钟落库）：涨停数/最高板/炸板率。"""
     try:
         rows = conn.execute(
             "SELECT symbol, lianban, zhaban FROM limit_up_pool "
@@ -125,7 +143,6 @@ def _intraday_limit_up(conn) -> str:
 
 
 def _sector_top(conn, n: int = 5) -> str:
-    """板块涨幅（industry_bars 最新收盘，方向参考）。"""
     try:
         rows = conn.execute(
             """SELECT t.industry, t.close, p.close AS prev
@@ -144,7 +161,6 @@ def _sector_top(conn, n: int = 5) -> str:
 
 
 def _fund_top(conn, n: int = 5) -> str:
-    """资金主线（sector_fund_flow 盘中实时净流入）。"""
     try:
         rows = conn.execute(
             """SELECT industry, main_net FROM sector_fund_flow
@@ -158,7 +174,6 @@ def _fund_top(conn, n: int = 5) -> str:
 
 
 def _ladder_text(conn, n: int = 8) -> str:
-    """连板梯队（limit_up_pool 盘中实时）。"""
     try:
         rows = conn.execute(
             """SELECT symbol, name, lianban, zhaban FROM limit_up_pool
@@ -174,7 +189,6 @@ def _ladder_text(conn, n: int = 8) -> str:
 
 
 def _core_quotes(db_path: str) -> tuple[list[list[str]], str]:
-    """核心关注实时行情：表格行 + 文本（供 LLM 输入）。"""
     conn = connect(db_path)
     try:
         core = [r["symbol"] for r in conn.execute(
@@ -202,30 +216,43 @@ def _core_quotes(db_path: str) -> tuple[list[list[str]], str]:
     return rows, "；".join(lines)
 
 
-def _read_plan(conn) -> str:
-    """盘后预案对照（预留，2026-08-22）：读 viewpoints source='plan' 最近 active。
-
-    盘后复盘报告「预案模块」建成后写入该源，此处自动对照；无则省略。
-    """
+def _core_industry(conn, symbols: list[str]) -> str:
+    """核心关注所属行业（industry_map），供点4 补板块分析。"""
     try:
-        row = conn.execute(
+        from invest.data.industry_map import industry_of
+
+        inds = {}
+        for s in symbols:
+            ind = industry_of(conn, s)
+            if ind:
+                inds[ind] = inds.get(ind, 0) + 1
+        return "、".join(f"{k}" for k in sorted(inds, key=lambda x: -inds[x])[:3]) or ""
+    except Exception:
+        return ""
+
+
+def _read_plan(conn) -> str:
+    """盘后预案对照：读 viewpoints source='plan' 最近 active。无则省略。"""
+    try:
+        rows = conn.execute(
             """SELECT conclusion FROM viewpoints WHERE source='plan' AND status='active'
                ORDER BY created_at DESC LIMIT 3"""
         ).fetchall()
-        return "\n".join(f"  - {r['conclusion']}" for r in row)
+        return "\n".join(f"  - {r['conclusion']}" for r in rows)
     except Exception:
         return ""
 
 
 # ---------- 组装 ----------
 
-def render(db_path: str, public: bool = False, brief: bool = True) -> dict:
+def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
     from invest.skills.sections import _intraday_llm
 
     sections: list[dict] = []
+    views: dict = {}
     now = dt.datetime.now()
 
-    # ---- 1) 盘面总览 ----
+    # ---- 1) 盘面总览（指数表格 + 结构 + 图表 + 指数ETF大资金信号） ----
     idx_rows, struct = _index_table()
     if idx_rows:
         sections.append({
@@ -239,6 +266,13 @@ def render(db_path: str, public: bool = False, brief: bool = True) -> dict:
             sections.append({
                 "type": "chart", "chart": "index_bars",
                 "title": "主要指数涨跌幅（%）", "data": chart_data,
+            })
+        etf_sig = _index_etf_text()
+        if etf_sig:
+            sections.append({
+                "type": "text",
+                "text": "**【指数ETF·大资金信号】**\n" + etf_sig +
+                        "\n（量比明显放大/超大单大额进出≈国家队或大资金动作）",
             })
     else:
         sections.append({"type": "text", "text": "（指数实时暂不可用）"})
@@ -268,8 +302,8 @@ def render(db_path: str, public: bool = False, brief: bool = True) -> dict:
         if mood.get("short_term"):
             lines.append(f"**短线博弈**: {mood['short_term']}")
         sections.append({"type": "text", "text": "**【情绪与预测】**\n" + "\n".join(lines)})
-    else:
-        # 规则回退：情绪周期 + 温度 + 连板
+        views["mood"] = mood
+    elif not brief:
         parts = [f"温度 {temp_text}"]
         if emo_text:
             parts.append(emo_text)
@@ -277,7 +311,7 @@ def render(db_path: str, public: bool = False, brief: bool = True) -> dict:
             parts.append(f"盘中 {lu_text}")
         sections.append({"type": "text", "text": "**【情绪与预测】**\n" + "；".join(parts)})
 
-    # ---- 3) 日内主线（LLM，失败回退直列） ----
+    # ---- 3) 日内主线（LLM：原因/内部/ETF/推荐股/龙头/推演；失败回退直列） ----
     conn = connect(db_path)
     try:
         sector_top = _sector_top(conn)
@@ -286,9 +320,10 @@ def render(db_path: str, public: bool = False, brief: bool = True) -> dict:
     finally:
         conn.close()
     _core_rows, core_lines = _core_quotes(db_path)
+    etf_sector = _sector_etf_text()
     mainline = _intraday_llm.mainline_llm(db_path, {
         "sector_top": sector_top, "fund_top": fund_top,
-        "ladder": ladder, "core": core_lines,
+        "ladder": ladder, "core": core_lines, "etf_sector": etf_sector,
     })
     lines: list[str] = []
     for ml in (mainline.get("main_lines") or []):
@@ -297,13 +332,18 @@ def render(db_path: str, public: bool = False, brief: bool = True) -> dict:
             lines.append(f"  · 原因: {ml['reason']}")
         if ml.get("internal"):
             lines.append(f"  · 内部: {ml['internal']}")
+        if ml.get("etf"):
+            lines.append(f"  · ETF: {ml['etf']}")
+        for pk in (ml.get("picks") or []):
+            lines.append(f"  · 关注: {pk.get('name', '')}（{pk.get('reason', '')}）")
         for ld in (ml.get("leaders") or []):
             lines.append(f"  · {ld.get('role', '')} {ld.get('name', '')}：{ld.get('analysis', '')}")
         if ml.get("outlook"):
             lines.append(f"  → 推演: {ml['outlook']}")
     if lines:
         sections.append({"type": "text", "text": "**【日内主线】**\n" + "\n".join(lines)})
-    elif sector_top or fund_top:
+        views["mainline"] = mainline.get("main_lines")
+    elif not brief and (sector_top or fund_top):
         blocks = []
         if fund_top:
             blocks.append("资金主线(实时):\n" + fund_top)
@@ -311,28 +351,42 @@ def render(db_path: str, public: bool = False, brief: bool = True) -> dict:
             blocks.append("板块涨幅(收盘参考):\n" + sector_top)
         if ladder:
             blocks.append("连板梯队:\n" + ladder)
+        if etf_sector:
+            blocks.append("板块ETF:\n" + etf_sector)
         sections.append({"type": "text", "text": "**【日内主线】**\n" + "\n\n".join(blocks)})
+    elif not brief and etf_sector:
+        sections.append({"type": "text", "text": "**【板块ETF强度】**\n" + etf_sector})
 
-    # ---- 4) 预案对照（预留；盘后预案模块建成后自动生效） ----
+    # ---- 4) 核心关注与预案对照（点4+5 合并） ----
     conn = connect(db_path)
     try:
+        core_inds = _core_industry(conn, [r[0] for r in _core_rows]) if _core_rows else ""
         plan = _read_plan(conn)
     finally:
         conn.close()
-    if plan:
-        sections.append({"type": "text", "text": "**【与盘后预案对照】**\n" + plan})
-
-    # ---- 5) 核心关注实时行情 ----
     if _core_rows:
         sections.append({
             "type": "table", "title": "核心关注实时行情",
             "columns": ["标的", "现价", "涨跌幅"], "rows": _core_rows,
         })
-        if mainline.get("core_outlook"):
-            sections.append({"type": "text", "text": f"**走势推演**: {mainline['core_outlook']}"})
+        # 核心关注所在板块：若点3 未覆盖则补一句客观数据
+        if core_inds and brief:
+            sections.append({
+                "type": "text",
+                "text": f"核心关注所属板块: {core_inds}（客观数据见上，推演见完整版）",
+            })
+        if not brief:
+            if core_inds:
+                sections.append({"type": "text", "text": f"**核心关注板块**: {core_inds}"})
+            if mainline.get("core_outlook"):
+                sections.append({"type": "text", "text": f"**走势推演**: {mainline['core_outlook']}"})
+    if plan and not brief:
+        sections.append({"type": "text", "text": "**【与盘后预案对照】**\n" + plan})
 
-    sections.append({
-        "type": "text",
-        "text": f"（数据失效即防守：行情不新鲜时不作 P0 决策）· {now.strftime('%H:%M')}",
-    })
-    return {"title": f"A股投资系统 · 盘中报告 {now.strftime('%H:%M')}", "sections": sections}
+    if not brief:
+        sections.append({
+            "type": "text",
+            "text": "（数据失效即防守：行情不新鲜时不作 P0 决策）· " + now.strftime("%H:%M"),
+        })
+    return {"title": f"A股投资系统 · 盘中报告 {now.strftime('%H:%M')}",
+            "sections": sections, "views": views}

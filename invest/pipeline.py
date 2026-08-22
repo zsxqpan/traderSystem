@@ -473,39 +473,66 @@ def _agent_viewpoints(conn, n: int = 5) -> str:
     return "\n".join(lines)
 
 
-def notify_morning_brief(db_path: str) -> bool:
-    """盘前报告推送（2026-08-22：A1+A2 合并版 a0_premarket）。
-
-    - 飞书：interactive 卡片（表格/加粗，render_feishu），失败回退纯文本；
-    - 企微/微信：纯文本（render_plain，表格转紧凑行）。
-    """
+def _send_structured(struct: dict, key: str, min_interval: float = 600.0) -> bool:
+    """结构化报告分通道发送（2026-08-22）：飞书卡片（失败回退 text）+ 企微/微信纯文本。"""
+    from invest.config import get_settings
+    from invest.notifier import Notifier
     from invest.push.feishu_push import send_card, send_text
     from invest.push.render import render_feishu, render_plain
-    from invest.skills.runner import run_structured
 
-    struct = run_structured("a0_premarket", db_path=db_path)
     plain = render_plain(struct)
     ok = False
-    # 飞书卡片（表格/加粗）；失败回退 text
     card = render_feishu(struct)
-    from invest.config import get_settings
-
-    settings = get_settings()
-    chat_id = getattr(settings, "feishu_chat_id", "") or ""
+    chat_id = getattr(get_settings(), "feishu_chat_id", "") or ""
     if chat_id:
-        ok = send_card(chat_id, "chat_id", card) or send_text(plain, key="morning_brief", min_interval=600)
-    # 企微/微信（纯文本，跳过飞书避免重复）
-    from invest.notifier import Notifier
-    ok = Notifier().send_text(plain, key="morning_brief", min_interval=600, feishu=False) or ok
+        ok = send_card(chat_id, "chat_id", card) or send_text(plain, key=key, min_interval=min_interval)
+    ok = Notifier().send_text(plain, key=key, min_interval=min_interval, feishu=False) or ok
     return ok
 
 
+def notify_morning_brief(db_path: str) -> bool:
+    """盘前报告推送（2026-08-22：A1+A2 合并版 a0_premarket，飞书卡片 + 企微/微信纯文本）。"""
+    from invest.skills.runner import run_structured
+
+    struct = run_structured("a0_premarket", db_path=db_path)
+    return _send_structured(struct, key="morning_brief")
+
+
 def notify_after_close(db_path: str, agent_text: str = "") -> bool:
-    """盘后日报推送（2026-08-22：经 Skill Runner 调 a3_daily）。"""
-    from invest.skills.runner import run as run_skill
-    msg = run_skill("a3_daily", db_path=db_path, agent_text=agent_text)
-    from invest.notifier import Notifier
-    return Notifier().send_text(msg, key="after_close", min_interval=600)
+    """盘后日报推送（2026-08-22：a3_daily 结构化，飞书卡片 + 企微/微信纯文本）。"""
+    from invest.skills.runner import run_structured
+
+    struct = run_structured("a3_daily", db_path=db_path, agent_text=agent_text)
+    # 2026-08-22：明日预案落库（source='plan'，供 B1 对照/次日复盘）
+    _persist_plan(struct.get("plan_data") or {})
+    return _send_structured(struct, key="after_close")
+
+
+def _persist_plan(plan_data: dict) -> None:
+    """明日预案落库（2026-08-22）：viewpoints source='plan'，conclusion=JSON。失败静默。"""
+    if not plan_data:
+        return
+    try:
+        import json as _json
+
+        from invest.db import connect as _connect
+
+        conn = _connect(str(Path(__file__).resolve().parents[1] / "data" / "invest.db"))
+        try:
+            conn.execute(
+                """INSERT INTO viewpoints(source, conclusion, period_tag, confidence,
+                   evidence_json, invalid_condition, status, created_at, obj_type, obj)
+                   VALUES('plan', ?, 'short', 0.5, '[]', '次日盘面验证', 'active',
+                          datetime('now','localtime'), 'market', 'plan')""",
+                (_json.dumps(plan_data, ensure_ascii=False)[:2000],),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning("明日预案落库失败", exc_info=True)
 
 
 def notify_weekend(db_path: str, agent_text: str = "") -> bool:

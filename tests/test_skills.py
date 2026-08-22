@@ -104,7 +104,7 @@ def test_runner_byte_identical_reports():
     a3/a4 内含 LLM 消息面提炼（_news_block 调真实 LLM，输出非确定），
     因此比对时 mock 掉 LLMClient 保证确定性。
     """
-    from invest.report import daily_report, weekly_report
+    from invest.report import weekly_report
 
     class _FakeLLM:
         def __init__(self, *a, **k):
@@ -115,8 +115,52 @@ def test_runner_byte_identical_reports():
 
     p = _fresh_db()
     with mock.patch("invest.agent.llm.LLMClient", _FakeLLM):
-        assert run_skill("a3_daily", db_path=p, agent_text="") == daily_report(p, "")
         assert run_skill("a4_weekly", db_path=p, agent_text="") == weekly_report(p, "")
+
+
+def test_a3_structured(monkeypatch):
+    """a3 盘后日报（2026-08-22 重构）：4 点结构化 + 预案闭环（plan_data）。"""
+    import invest.skills.sections._daily_llm as _dl
+    from invest.skills.runner import run_structured
+
+    _dl.intraday_review_llm = lambda db, ctx: {
+        "verdict": "预测部分正确", "wrong_reasons": ["量能判断失误"],
+        "lessons": ["放量日需看承接"]}
+    _dl.board_analysis_llm = lambda db, ctx: {
+        "boards": [{"name": "AI硬件", "active": True, "analysis": "半导体ETF放量上行，龙头走强",
+                    "stock_move": ""},
+                   {"name": "机器人", "active": False, "analysis": "横盘待变盘", "stock_move": "某股异动: 消息刺激"}]}
+    _dl.plan_gen_llm = lambda db, ctx: {
+        "direction": "继续关注AI硬件", "picks": [{"name": "某股", "symbol": "600001",
+        "reason": "ETF验证", "plan": "回踩低吸"}],
+        "plans": [{"symbol": "600519", "action": "持有"}]}
+    _dl.plan_review_llm = lambda db, ctx: {
+        "quality": "昨日预案基本兑现", "fixes": ["增加ETF量能权重"]}
+
+    p = _fresh_db()
+    monkeypatch.setattr("invest.data.index_realtime.fetch_index_realtime", lambda: {
+        "000001": {"name": "上证指数", "price": 3905.2, "pct": 0.35}})
+    monkeypatch.setattr("invest.data.etf.fetch_etf_quotes", lambda codes=None: {
+        "510300": {"name": "沪深300ETF", "price": 4.0, "pct": 0.5, "amount": 8e9,
+                   "turnover": 2.1, "vol_ratio": 1.8, "main_net": 5e8, "super_net": 3e8}})
+    monkeypatch.setattr("invest.data.etf.index_etf_signal_text", lambda: "沪深300ETF 量比1.80（明显放量）")
+    monkeypatch.setattr("invest.data.etf.sector_etf_text", lambda: "[AI硬件] 半导体ETF +1.2% 成交80亿")
+    # 预案历史（质量复盘输入）
+    monkeypatch.setattr("invest.skills.reports.a3_daily._plan_history",
+                        lambda conn: [{"date": "2026-08-21", "plan_summary": "看多半导体",
+                                       "actual_summary": "半导体 +1.2% 兑现"}])
+
+    struct = run_structured("a3_daily", db_path=p)
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+    tables = [s for s in struct["sections"] if s.get("type") == "table"]
+    assert any(t["title"] == "点1 盘面总览·指数" for t in tables)
+    assert any(t["title"] == "点1 指数ETF（量能/资金/大资金进出）" for t in tables)
+    assert "点2 盘中观点复盘" in texts and "量能判断失误" in texts
+    assert "点3 重要板块总分析" in texts and "AI硬件" in texts and "机器人" in texts
+    assert "点4 明日预案" in texts and "600519" in texts
+    assert "预案质量复盘" in texts and "增加ETF量能权重" in texts
+    # 预案闭环：plan_data 可落库
+    assert struct.get("plan_data", {}).get("direction") == "继续关注AI硬件"
 
 
 def test_b1_structured(monkeypatch):

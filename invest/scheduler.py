@@ -349,11 +349,11 @@ def _evening_report(db: str, conn) -> None:
         "SELECT COUNT(*) FROM viewpoints WHERE date(created_at)=date('now','localtime')"
     ).fetchone()[0]
 
-    # 2026-08-22：盘后日报经 Skill Runner 调 a3_daily（输出逐字节一致）
-    from invest.skills.runner import run as run_skill
+    # 2026-08-22：盘后日报经 Skill Runner 调 a3_daily（结构化，4 点 + 预案闭环）
+    from invest.skills.runner import run_structured
 
-    msg = run_skill("a3_daily", db_path=db)
-    msg += f"\n【今日】到期进复盘 {expired} 条 | 工单超时 {overdue} 张 | 新增观点 {new_vp} 条"
+    struct = run_structured("a3_daily", db_path=db)
+    tail = f"【今日】到期进复盘 {expired} 条 | 工单超时 {overdue} 张 | 新增观点 {new_vp} 条"
     # 数据质量报告（PIT 四状态）追加
     try:
         from invest.data.pit import quality_report
@@ -361,13 +361,24 @@ def _evening_report(db: str, conn) -> None:
         report = quality_report(conn)
         bad = {t: st for t, (st, _info) in report.items() if st != "valid"}
         if bad:
-            msg += "\n数据质量: " + ", ".join(f"{t}={st}" for t, st in list(bad.items())[:8])
+            tail += "\n数据质量: " + ", ".join(f"{t}={st}" for t, st in list(bad.items())[:8])
     except Exception as exc:
         logger.warning("数据质量报告失败: %s", exc)
-    ok = Notifier().send_text(msg, key="evening_report", min_interval=600)
+    struct["sections"].append({"type": "text", "text": tail})
+    # 明日预案落库（source='plan'，供 B1 对照 / 次日预案质量复盘）
+    try:
+        from invest.pipeline import _persist_plan
+
+        _persist_plan(struct.get("plan_data") or {})
+    except Exception as exc:
+        logger.warning("预案落库失败: %s", exc)
+    # 发送：飞书卡片 + 企微/微信纯文本
+    from invest.pipeline import _send_structured
+
+    ok = _send_structured(struct, key="evening_report", min_interval=600)
     if not ok:
         time.sleep(5)  # 网络抖动时重试一次
-        ok = Notifier().send_text(msg, key="evening_report", min_interval=600)
+        ok = _send_structured(struct, key="evening_report", min_interval=600)
     if not ok:
         logger.warning("22:00 盘后报告推送失败或未配置 webhook")
         return "push_failed(webhook unreachable)"

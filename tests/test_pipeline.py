@@ -183,7 +183,14 @@ def test_evening_report_freshness_gate():
         from invest.data.storage import upsert_df
         upsert_df(conn, "daily_bars", pd.DataFrame([{"date": exp, "symbol": "000001", "close": 10.0}]))
         upsert_df(conn, "index_bars", pd.DataFrame([{"date": exp, "index_code": "000300", "close": 100.0}]))
-        with mock.patch("invest.scheduler.Notifier") as m:
+        # 2026-08-22：盘后日报走结构化发送（_send_structured：send_card + Notifier feishu=False）
+        fake_struct = {"title": "盘后日报", "sections": [
+            {"type": "text", "text": "**【A股投资系统 · 盘后日报】**\n数据截至: 新鲜"},
+        ]}
+        with mock.patch("invest.skills.runner.run_structured",
+                        return_value=fake_struct), \
+             mock.patch("invest.push.feishu_push.send_card", return_value=False), \
+             mock.patch("invest.notifier.Notifier") as m:
             m.return_value.send_text.return_value = True
             _evening_report(p_fresh, conn)
         texts = [c.args[0] for c in m.return_value.send_text.call_args_list]

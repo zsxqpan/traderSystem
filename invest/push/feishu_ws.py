@@ -303,6 +303,35 @@ def _build_intraday_report(public: bool = False, brief: bool = True) -> dict:
         return {"sections": [{"type": "text", "text": f"[报告生成失败: {type(exc).__name__}: {exc}]"}]}
 
 
+def _persist_intraday_views(views: dict) -> None:
+    """盘中报告观点落库（2026-08-22）：source='intraday_report'，供盘后日报点2 复盘。失败静默。"""
+    if not views:
+        return
+    try:
+        import json
+
+        from invest.db import connect as _connect
+
+        conn = _connect(str(ROOT / "data" / "invest.db"))
+        try:
+            for kind in ("mood", "mainline"):
+                content = views.get(kind)
+                if not content:
+                    continue
+                conn.execute(
+                    """INSERT INTO viewpoints(source, conclusion, period_tag, confidence,
+                       evidence_json, invalid_condition, status, created_at, obj_type, obj)
+                       VALUES('intraday_report', ?, 'micro', 0.5, '[]', '当日收盘复盘', 'active',
+                              datetime('now','localtime'), 'market', ?)""",
+                    (json.dumps(content, ensure_ascii=False)[:2000], kind),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("盘中观点落库失败: %s", exc)
+
+
 def _send_report(chat_id: str, struct: dict) -> bool:
     """发送结构化报告：飞书卡片（表格/图表/加粗）优先，失败回退纯文本。"""
     from invest.push.feishu_push import send_card, send_message
@@ -378,12 +407,14 @@ def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False
         if _rate_limited(sender_id):
             logger.info("报告请求限频跳过（120s 内重复）: %s", text[:30])
             return
-        # 2026-08-18 方案E：默认简洁版；明确要"详细/完整"才发完整版（私聊/群聊一致）
-        detailed = any(k in text for k in ("详细", "完整", "详细版", "完整版"))
-        logger.info("盘中报告请求（nonadmin=%s brief=%s）: %s", nonadmin, not detailed, text[:40])
+        # 2026-08-22：默认完整版；说"简洁/简短/精简"才发简洁版（只留客观盘面）
+        brief = any(k in text for k in ("简洁", "简短", "精简", "简版", "简略"))
+        logger.info("盘中报告请求（nonadmin=%s brief=%s）: %s", nonadmin, brief, text[:40])
         send_message(chat_id, "chat_id", "⏳ 收到，正在生成盘中实时报告…")
-        report = _build_intraday_report(public=nonadmin, brief=not detailed)
+        report = _build_intraday_report(public=nonadmin, brief=brief)
         ok = _send_report(chat_id, report)
+        # 2026-08-22：盘中观点落库（source='intraday_report'），供盘后日报点2 复盘
+        _persist_intraday_views(report.get("views") or {})
         logger.info("盘中报告回复完成 ok=%s", ok)
         return
 
@@ -502,6 +533,7 @@ def _handle_event(data: P2ImMessageReceiveV1) -> None:
             send_message(chat_id, "chat_id", "⏳ 收到，正在生成盘中实时报告…")
             report = _build_intraday_report()
             ok = _send_report(chat_id, report)
+            _persist_intraday_views(report.get("views") or {})
             logger.info("盘中报告回复完成 ok=%s", ok)
         return  # 管理员普通发言（未 @ 且非报告）不回复
 
