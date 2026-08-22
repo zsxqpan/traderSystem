@@ -468,8 +468,9 @@ def _agent_viewpoints(conn, n: int = 5) -> str:
 
 
 def notify_premarket(db_path: str, agent_text: str = "") -> bool:
-    from invest.report import premarket_report
-    msg = premarket_report(db_path, agent_text)
+    """盘前清单推送（2026-08-22：经 Skill Runner 调 a1_premarket，输出逐字节一致）。"""
+    from invest.skills.runner import run as run_skill
+    msg = run_skill("a1_premarket", db_path=db_path, agent_text=agent_text)
     from invest.notifier import Notifier
     return Notifier().send_text(msg, key="premarket", min_interval=600)
 
@@ -478,23 +479,26 @@ def notify_morning_brief(db_path: str) -> bool:
     """盘前信息早报（2026-08-16）：交易日 8:40，关键信息简明扼要。
 
     仅发送到飞书群（用户指定，其他渠道不发送）。
+    2026-08-22：经 Skill Runner 调 a2_morning_brief。
     """
-    from invest.report import morning_brief_report
-    msg = morning_brief_report(db_path)
+    from invest.skills.runner import run as run_skill
+    msg = run_skill("a2_morning_brief", db_path=db_path)
     from invest.push.feishu_push import send_text
     return send_text(msg, key="morning_brief", min_interval=600)
 
 
 def notify_after_close(db_path: str, agent_text: str = "") -> bool:
-    from invest.report import daily_report
-    msg = daily_report(db_path, agent_text)
+    """盘后日报推送（2026-08-22：经 Skill Runner 调 a3_daily）。"""
+    from invest.skills.runner import run as run_skill
+    msg = run_skill("a3_daily", db_path=db_path, agent_text=agent_text)
     from invest.notifier import Notifier
     return Notifier().send_text(msg, key="after_close", min_interval=600)
 
 
 def notify_weekend(db_path: str, agent_text: str = "") -> bool:
-    from invest.report import weekly_report
-    msg = weekly_report(db_path, agent_text)
+    """周报推送（2026-08-22：经 Skill Runner 调 a4_weekly）。"""
+    from invest.skills.runner import run as run_skill
+    msg = run_skill("a4_weekly", db_path=db_path, agent_text=agent_text)
     from invest.notifier import Notifier
     return Notifier().send_text(msg, key="weekend", min_interval=600)
 
@@ -506,27 +510,7 @@ def _macro_text(conn) -> str:
     return "；".join(f"{r['indicator']}={r['value']}" for r in rows) or "-"
 
 
-def notify_p2_brief(db_path: str, agent_text: str = "") -> bool:
-    """P2 例行简报（[A]8）：每日榜单摘要 + 宏观仪表盘，rest 级关注推送。
-
-    内容：数据新鲜度 / 评级 / 当日涨跌幅榜 / 短线强度前5 / 宏观流动性；
-    与盘后日报区别：更轻量，面向 rest 级关注与日常巡检。
-    """
-    conn = connect(db_path)
-    try:
-        msg = (
-            f"【A股投资系统 · P2 例行简报】\n"
-            f"数据截至: {_freshness(conn)}\n"
-            f"评级: {_ratings_block(conn)}\n"
-            f"{_daily_movers_block(conn, n=3)}\n"
-            f"短线强度前5（RS 5/10/20日超额）:\n{_top_strength(conn, 'short')}\n"
-            f"宏观流动性:\n{_macro_text(conn)}\n"
-            f"Agent 简报:\n{agent_text or '[Agent 未运行]'}"
-        )
-    finally:
-        conn.close()
-    from invest.notifier import Notifier
-    return Notifier().send_text(msg, key="p2_brief", min_interval=600)
+# A7 P2 例行简报已于 2026-08-22 删除（内容与 22:00 合并版盘后日报重复、无任务调度）
 
 
 # ---------- 收盘快照（2026-08-20 方案3：16:10 实时源直接落当日收盘价） ----------

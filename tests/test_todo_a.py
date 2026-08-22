@@ -10,7 +10,6 @@ import datetime as dt
 import os
 import sys
 import tempfile
-from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -255,18 +254,7 @@ def test_weekly_card_review_and_monthly_env():
     print("test_weekly_card_review_and_monthly_env OK")
 
 
-# ---------- [A]8 P2 简报 ----------
-
-def test_p2_brief():
-    from invest.pipeline import notify_p2_brief
-    p = _tmp_db("p2brief")
-    with mock.patch("invest.notifier.Notifier") as m:
-        m.return_value.send_text.return_value = True
-        assert notify_p2_brief(p, "test") is True
-        text = m.return_value.send_text.call_args.args[0]
-        assert "P2 例行简报" in text and "宏观流动性" in text
-    print("test_p2_brief OK")
-
+# ---------- [A]8 P2 简报（2026-08-22 删除：内容与 22:00 合并版盘后日报重复、无任务调度） ----------
 
 # ---------- [A]9 快照重建 ----------
 
@@ -413,7 +401,6 @@ if __name__ == "__main__":
     test_check_and_add_require_mispricing()
     test_cycle_drift()
     test_weekly_card_review_and_monthly_env()
-    test_p2_brief()
     test_snapshot_rebuild()
     test_universe_snapshot()
     test_cycle_mirrors_and_automation()

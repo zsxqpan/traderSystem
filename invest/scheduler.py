@@ -172,25 +172,23 @@ def _weekend(db: str, conn) -> None:
 def _monthly(db: str, conn) -> None:
     from invest.review.monthly import monthly_review
     from invest.review.report import save_report
+    from invest.skills.runner import run as run_skill
     content = monthly_review(conn)
     save_report(conn, "monthly", "monthly", content)
-    env = content.get("environment_quality", {})
-    env_note = ""
-    if env.get("verdict") == "warn":
-        env_note = "；环境质量告警: " + "；".join(env.get("warnings", []))
-    Notifier().send_text(
-        f"月度复盘: 观点命中率 {content['overall_accuracy'] if content['overall_accuracy'] is not None else '暂无'} | "
-        f"待复盘 {content['pending_review']} 条 | 环境质量 {env.get('verdict', 'ok')}{env_note}",
-        key="monthly",
-    )
+    # 2026-08-22：摘要文案迁入 a5_monthly skill（content 传入避免重复计算）
+    msg = run_skill("a5_monthly", db_path=db, content=content)
+    Notifier().send_text(msg, key="monthly")
 
 
 def _yearly(db: str, conn) -> None:
     from invest.review.report import save_report
     from invest.review.yearly import yearly_review
+    from invest.skills.runner import run as run_skill
     content = yearly_review(conn)
     save_report(conn, "yearly", "yearly", content)
-    Notifier().send_text(f"年度复盘已生成: {len(content['backtest_summary'])} 组回测结论待检视", key="yearly")
+    # 2026-08-22：摘要文案迁入 a6_yearly skill（content 传入避免重复计算）
+    msg = run_skill("a6_yearly", db_path=db, content=content)
+    Notifier().send_text(msg, key="yearly")
 
 
 _last_pool_fetch = 0.0
@@ -347,9 +345,10 @@ def _evening_report(db: str, conn) -> None:
         "SELECT COUNT(*) FROM viewpoints WHERE date(created_at)=date('now','localtime')"
     ).fetchone()[0]
 
-    from invest.report import daily_report
+    # 2026-08-22：盘后日报经 Skill Runner 调 a3_daily（输出逐字节一致）
+    from invest.skills.runner import run as run_skill
 
-    msg = daily_report(db)
+    msg = run_skill("a3_daily", db_path=db)
     msg += f"\n【今日】到期进复盘 {expired} 条 | 工单超时 {overdue} 张 | 新增观点 {new_vp} 条"
     # 数据质量报告（PIT 四状态）追加
     try:

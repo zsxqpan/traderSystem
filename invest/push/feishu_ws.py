@@ -290,12 +290,12 @@ def _nonadmin_budget_exceeded() -> bool:
 
 
 def _build_intraday_report(public: bool = False, brief: bool = True) -> str:
-    """生成盘中实时报告（复用 invest.report.intraday_report）。失败返回错误说明。"""
+    """生成盘中实时报告（2026-08-22：经 Skill Runner 调 b1_intraday）。失败返回错误说明。"""
     try:
-        from invest.report import intraday_report
+        from invest.skills.runner import run as run_skill
 
         db = str(ROOT / "data" / "invest.db")
-        text = intraday_report(db, public=public, brief=brief)
+        text = run_skill("b1_intraday", db_path=db, public=public, brief=brief)
         if len(text) > MAX_REPORT_LEN:
             text = text[:MAX_REPORT_LEN] + "\n…(截断)"
         return text
