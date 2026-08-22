@@ -33,3 +33,6 @@ mypy>=2.0
 yfinance>=0.2.40
 baostock>=0.8.9
 ddgs>=9.0.0
+
+# 盘中报告图表（2026-08-22，matplotlib 生成 PNG 上传飞书卡片）
+matplotlib>=3.8

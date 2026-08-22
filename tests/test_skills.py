@@ -104,7 +104,7 @@ def test_runner_byte_identical_reports():
     a3/a4 内含 LLM 消息面提炼（_news_block 调真实 LLM，输出非确定），
     因此比对时 mock 掉 LLMClient 保证确定性。
     """
-    from invest.report import daily_report, intraday_report, weekly_report
+    from invest.report import daily_report, weekly_report
 
     class _FakeLLM:
         def __init__(self, *a, **k):
@@ -117,9 +117,39 @@ def test_runner_byte_identical_reports():
     with mock.patch("invest.agent.llm.LLMClient", _FakeLLM):
         assert run_skill("a3_daily", db_path=p, agent_text="") == daily_report(p, "")
         assert run_skill("a4_weekly", db_path=p, agent_text="") == weekly_report(p, "")
+
+
+def test_b1_structured(monkeypatch):
+    """b1 盘中报告（2026-08-22 重构）：结构化输出含 5 节（盘面总览/情绪/主线/核心关注）。"""
+    import invest.skills.sections._intraday_llm as _il
+    from invest.skills.runner import run_structured
+
+    _il.mood_llm = lambda db, ctx: {
+        "mood": "情绪偏暖", "prediction": "滞涨小心回落", "short_term": "短线主升日"}
+    _il.mainline_llm = lambda db, ctx: {
+        "main_lines": [{"direction": "半导体", "reason": "资金流入",
+                        "internal": "小盘强于大盘",
+                        "leaders": [{"role": "连板龙头", "name": "某股", "analysis": "放量走强"}],
+                        "outlook": "扩圈量能健康"}],
+        "core_outlook": "核心标的今日偏强"}
+
+    p = _fresh_db()
+    monkeypatch.setattr("invest.data.index_realtime.fetch_index_realtime", lambda: {
+        "000001": {"name": "上证指数", "price": 3905.2, "pct": 0.35},
+        "000300": {"name": "沪深300", "price": 4618.9, "pct": 0.1},
+        "000852": {"name": "中证1000", "price": 7601.8, "pct": 0.9},
+    })
     with mock.patch("invest.report._live_quotes", return_value=({"600519": 105.0}, {"600519": 0.05})):
-        assert run_skill("b1_intraday", db_path=p, public=True, brief=False) == \
-            intraday_report(p, public=True, brief=False)
+        struct = run_structured("b1_intraday", db_path=p)
+    tables = [s for s in struct["sections"] if s.get("type") == "table"]
+    charts = [s for s in struct["sections"] if s.get("type") == "chart"]
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+    assert any(t["title"] == "盘面总览" for t in tables)
+    assert any(t["title"] == "核心关注实时行情" for t in tables)
+    assert charts and charts[0]["chart"] == "index_bars"  # 图表节
+    assert "情绪与预测" in texts and "短线主升日" in texts
+    assert "日内主线" in texts and "半导体" in texts and "扩圈量能健康" in texts
+    assert "核心标的今日偏强" in texts  # 核心关注推演
 
 
 def test_runner_byte_identical_sections():

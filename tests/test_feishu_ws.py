@@ -24,6 +24,13 @@ def _fake_settings(monkeypatch):
     monkeypatch.setattr(feishu_ws, "_bot_open_id_cache", "ou_bot")
     feishu_ws._last_reply_at.clear()
     monkeypatch.setattr(feishu_ws, "_nonadmin_budget_exceeded", lambda: False)
+    # 2026-08-22：盘中报告走卡片发送——全局防真实发送（测试只验回退到 send_message）
+    monkeypatch.setattr("invest.push.feishu_push.send_card", lambda *a, **k: False)
+
+
+def _report_struct(text: str = "R") -> dict:
+    """盘中报告 mock 返回的结构（2026-08-22 b1 结构化后）。"""
+    return {"title": "测试盘中报告", "sections": [{"type": "text", "text": text}]}
 
 
 def _msg(text: str, mentions=(), msg_type="text", chat_id="oc_test", chat_type="group"):
@@ -171,7 +178,7 @@ def test_owner_mentioned_report_flow(monkeypatch):
     monkeypatch.setattr("invest.push.feishu_push.send_message",
         lambda cid, ctype, text: sent.append(text) or True,
     )
-    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: "【盘中报告】正文")
+    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: _report_struct("【盘中报告】正文"))
     feishu_ws._handle_event(_event("ou_owner", "来一份盘中报告", mentions=["ou_bot"]))
     assert sent[0].startswith("⏳")
     assert "【盘中报告】正文" in sent[1]
@@ -207,7 +214,7 @@ def test_owner_semantic_without_mention(monkeypatch):
     monkeypatch.setattr("invest.push.feishu_push.send_message",
         lambda cid, ctype, text: sent.append(text) or True,
     )
-    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: "R")
+    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: _report_struct())
     _patch_llm(monkeypatch, answer="yes")
     feishu_ws._handle_event(_event("ou_owner", "现在行情怎么样"))
     assert len(sent) == 2
@@ -226,7 +233,7 @@ def test_non_owner_mentioned_report_gets_public(monkeypatch):
         lambda cid, ctype, text: sent.append(text) or True,
     )
     monkeypatch.setattr(feishu_ws, "_build_intraday_report",
-        lambda public=False, brief=True: calls.__setitem__("public", public) or "【公开版报告】")
+        lambda public=False, brief=True: calls.__setitem__("public", public) or _report_struct("【公开版报告】"))
     feishu_ws._handle_event(_event("ou_other", "来一份盘中报告", mentions=["ou_bot"]))
     assert calls["public"] is True
     assert sent[0].startswith("⏳")
@@ -293,7 +300,7 @@ def test_rate_limit(monkeypatch):
     monkeypatch.setattr("invest.push.feishu_push.send_message",
         lambda cid, ctype, text: sent.append(text) or True,
     )
-    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: "R")
+    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: _report_struct())
     feishu_ws._last_reply_at.clear()
     _patch_llm(monkeypatch, answer="yes")
     feishu_ws._handle_event(_event("ou_owner", "盘中报告", mentions=["ou_bot"]))
@@ -331,7 +338,7 @@ def test_dm_owner_report(monkeypatch):
     monkeypatch.setattr("invest.push.feishu_push.send_message",
         lambda cid, ctype, text: sent.append(text) or True,
     )
-    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: "【完整报告】")
+    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: _report_struct("【完整报告】"))
     _patch_llm(monkeypatch, answer="yes")
     feishu_ws._handle_event(_event("ou_owner", "来一份盘中报告", chat_type="p2p"))
     assert sent[0].startswith("⏳")
@@ -360,7 +367,7 @@ def test_dm_non_owner_public_report(monkeypatch):
         lambda cid, ctype, text: sent.append(text) or True,
     )
     monkeypatch.setattr(feishu_ws, "_build_intraday_report",
-        lambda public=False, brief=True: calls.__setitem__("public", public) or "【公开版】")
+        lambda public=False, brief=True: calls.__setitem__("public", public) or _report_struct("【公开版】"))
     feishu_ws._handle_event(_event("ou_other", "来一份盘中报告", chat_type="p2p"))
     assert calls["public"] is True
     assert "【公开版】" in sent[1]
@@ -383,7 +390,7 @@ def test_group_mention_report_keyword_shortcut(monkeypatch):
     monkeypatch.setattr("invest.push.feishu_push.send_message",
         lambda cid, ctype, text: sent.append(text) or True,
     )
-    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: "R")
+    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: _report_struct())
     _patch_llm(monkeypatch, answer="no")
     feishu_ws._handle_event(_event("ou_owner", "来一份盘中报告", mentions=["ou_bot"]))
     assert len(sent) == 2 and "R" in sent[1]
@@ -395,7 +402,7 @@ def test_dm_report_needs_llm_yes(monkeypatch):
     monkeypatch.setattr("invest.push.feishu_push.send_message",
         lambda cid, ctype, text: sent.append(text) or True,
     )
-    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: "R")
+    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: _report_struct())
     monkeypatch.setattr("invest.agent.agents.run_chat",
         lambda conn, text, job="feishu_chat", skill="": "（会话回答，不触发报告）")
     _patch_llm(monkeypatch, answer="no")

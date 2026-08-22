@@ -74,7 +74,7 @@ def setup_file_logging() -> None:
         print(f"[feishu_ws] 文件日志初始化失败: {exc}")
 
 MAX_REPORT_LEN = 3800
-REPLY_MIN_INTERVAL = 30.0  # 同一发送者两次报告回复的最小间隔（秒）
+REPLY_MIN_INTERVAL = 120.0  # 同一发送者两次报告回复的最小间隔（秒）；2026-08-22 由 30s 提到 120s（报告含 LLM）
 CHAT_MIN_INTERVAL = 10.0   # 同一发送者两次 Agent 会话回复的最小间隔（秒）
 _CHAT_MAX_LEN = 2000       # Agent 会话回复最大长度
 
@@ -289,18 +289,32 @@ def _nonadmin_budget_exceeded() -> bool:
         return False
 
 
-def _build_intraday_report(public: bool = False, brief: bool = True) -> str:
-    """生成盘中实时报告（2026-08-22：经 Skill Runner 调 b1_intraday）。失败返回错误说明。"""
+def _build_intraday_report(public: bool = False, brief: bool = True) -> dict:
+    """生成盘中实时报告结构（2026-08-22：经 Skill Runner 调 b1_intraday，结构化输出）。
+
+    失败返回含错误文本的节（调用方按卡片/纯文本统一发送）。
+    """
     try:
-        from invest.skills.runner import run as run_skill
+        from invest.skills.runner import run_structured
 
         db = str(ROOT / "data" / "invest.db")
-        text = run_skill("b1_intraday", db_path=db, public=public, brief=brief)
-        if len(text) > MAX_REPORT_LEN:
-            text = text[:MAX_REPORT_LEN] + "\n…(截断)"
-        return text
+        return run_structured("b1_intraday", db_path=db, public=public, brief=brief)
     except Exception as exc:
-        return f"[报告生成失败: {type(exc).__name__}: {exc}]"
+        return {"sections": [{"type": "text", "text": f"[报告生成失败: {type(exc).__name__}: {exc}]"}]}
+
+
+def _send_report(chat_id: str, struct: dict) -> bool:
+    """发送结构化报告：飞书卡片（表格/图表/加粗）优先，失败回退纯文本。"""
+    from invest.push.feishu_push import send_card, send_message
+    from invest.push.render import render_feishu, render_plain
+
+    card = render_feishu(struct)
+    if card.get("body", {}).get("elements") and send_card(chat_id, "chat_id", card):
+        return True
+    plain = render_plain(struct)
+    if len(plain) > MAX_REPORT_LEN:
+        plain = plain[:MAX_REPORT_LEN] + "\n…(截断)"
+    return send_message(chat_id, "chat_id", plain)
 
 
 def _is_greeting(text: str) -> bool:
@@ -362,14 +376,14 @@ def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False
         text, track_job="group" if nonadmin else None, keyword=chat_type != "p2p")
     if want_report:
         if _rate_limited(sender_id):
-            logger.info("报告请求限频跳过（30s 内重复）: %s", text[:30])
+            logger.info("报告请求限频跳过（120s 内重复）: %s", text[:30])
             return
         # 2026-08-18 方案E：默认简洁版；明确要"详细/完整"才发完整版（私聊/群聊一致）
         detailed = any(k in text for k in ("详细", "完整", "详细版", "完整版"))
         logger.info("盘中报告请求（nonadmin=%s brief=%s）: %s", nonadmin, not detailed, text[:40])
         send_message(chat_id, "chat_id", "⏳ 收到，正在生成盘中实时报告…")
         report = _build_intraday_report(public=nonadmin, brief=not detailed)
-        ok = send_message(chat_id, "chat_id", report)
+        ok = _send_report(chat_id, report)
         logger.info("盘中报告回复完成 ok=%s", ok)
         return
 
@@ -482,12 +496,12 @@ def _handle_event(data: P2ImMessageReceiveV1) -> None:
         elif _is_report_request(text):
             # 未 @ 的管理员发言：仅语义识别为要实时报告才触发
             if _rate_limited(sender_id):
-                logger.info("管理员请求限频跳过（30s 内重复）: %s", text[:30])
+                logger.info("管理员请求限频跳过（120s 内重复）: %s", text[:30])
                 return
             logger.info("管理员请求盘中报告（未@）: %s", text[:40])
             send_message(chat_id, "chat_id", "⏳ 收到，正在生成盘中实时报告…")
             report = _build_intraday_report()
-            ok = send_message(chat_id, "chat_id", report)
+            ok = _send_report(chat_id, report)
             logger.info("盘中报告回复完成 ok=%s", ok)
         return  # 管理员普通发言（未 @ 且非报告）不回复
 

@@ -160,3 +160,25 @@ def test_render_plain():
     assert "*" not in plain
     assert "【标题】" in plain and "强调" in plain
     assert "隔夜外围" in plain and "市场 道指" in plain and "+0.98%" in plain
+
+
+def test_render_feishu_chart(mock_upload=None):
+    """图表节 → 飞书卡片 image 组件（upload_fn mock 返回 img_key）；上传失败降级文本。"""
+    struct = {
+        "title": "盘中",
+        "sections": [
+            {"type": "chart", "chart": "index_bars", "title": "指数涨跌幅",
+             "data": [{"name": "上证指数", "value": 0.35}, {"name": "中证1000", "value": 0.9}]},
+        ],
+    }
+    # 上传成功 → image 组件
+    card = render_feishu(struct, upload_fn=lambda png: "img_key_1")
+    elems = card["body"]["elements"]
+    assert any(e.get("tag") == "img" and e.get("img_key") == "img_key_1" for e in elems)
+    # 上传失败 → 降级为文本行（不阻断）
+    card2 = render_feishu(struct, upload_fn=lambda png: None)
+    texts = [e["text"]["content"] for e in card2["body"]["elements"] if e.get("tag") == "div"]
+    assert any("上证指数" in t and "+0.35%" in t for t in texts)
+    # 纯文本通道：图表转数据行
+    plain = render_plain(struct)
+    assert "📊 指数涨跌幅" in plain and "中证1000 +0.90%" in plain

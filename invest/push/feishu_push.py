@@ -184,6 +184,35 @@ def send_card(receive_id: str, receive_id_type: str, card: dict) -> bool:
     return False
 
 
+def upload_image(image_bytes: bytes, image_type: str = "message") -> str | None:
+    """上传图片（消息用），返回 image_key（供卡片 image 组件）；失败返回 None。
+
+    2026-08-22：B1 盘中报告图表（matplotlib PNG → 卡片展示）。
+    需要权限 im:image（开发者后台）。
+    """
+    if not image_bytes:
+        return None
+    token = _tenant_token()
+    if not token:
+        return None
+    url = "https://open.feishu.cn/open-apis/im/v1/images"
+    try:
+        r = _session().post(
+            url,
+            data={"image_type": image_type},
+            files={"image": ("chart.png", image_bytes, "image/png")},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        d = r.json()
+        if d.get("code") == 0:
+            return d.get("data", {}).get("image_key")
+        logger.warning("飞书图片上传失败: code=%s msg=%s", d.get("code"), d.get("msg"))
+    except Exception as exc:
+        logger.warning("飞书图片上传异常: %s", exc)
+    return None
+
+
 def add_reaction(message_id: str, emoji: str = "HEART") -> bool:
     """给消息添加表情回应（2026-08-18：收到消息先回 ❤️，告知已收到）。
 
