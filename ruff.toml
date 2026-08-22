@@ -1,0 +1,23 @@
+# ruff 配置（2026-08-21 引入）
+line-length = 120
+target-version = "py310"
+
+[lint]
+# 忽略项目约定项：
+# - DTZ*：项目用本地时间（datetime.now()/date.today()）是统一约定，不强制 tz
+# - S110：try-except-pass 静默容错是约定（采集/推送/LLM 失败不阻断主流程）
+# - BLE001：broad-except 容错优先（网络/数据源抖动场景）
+# - PLW1510 / RUF012 / UP031：存量风格项，暂不强制
+extend-ignore = [
+    "DTZ",
+    "S110",
+    "BLE001",
+    "PLW1510",
+    "RUF012",
+    "UP031",
+    "PYI034",
+]
+
+[lint.per-file-ignores]
+# 测试文件允许未使用变量（断言辅助）
+"tests/**" = ["F841"]

@@ -27,3 +27,9 @@ Thumbs.db
 
 # 虚拟环境
 myenv/
+
+# external vendor repos (independent git repos; keep out of main repo)
+tools/
+.claude/
+=  # 0-byte accidental empty file
+=

@@ -95,9 +95,8 @@ def validate_card(conn: sqlite3.Connection, card_id: int) -> list[str]:
         problems.append("缺入场区间")
     if row["target"] is None:
         problems.append("缺目标价")
-    if row["stop_loss"] is not None and row["target"] is not None:
-        if row["stop_loss"] >= row["target"]:
-            problems.append("止损 >= 目标，赔率必然 <=0")
+    if row["stop_loss"] is not None and row["target"] is not None and row["stop_loss"] >= row["target"]:
+        problems.append("止损 >= 目标，赔率必然 <=0")
     return problems
 
 

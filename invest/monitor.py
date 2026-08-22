@@ -26,7 +26,7 @@ _STATE_FILE = ROOT / "data" / "monitor_state.json"
 def _load_state() -> dict:
     try:
         return json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+    except Exception:
         return {}
 
 
@@ -34,7 +34,7 @@ def _save_state(state: dict) -> None:
     try:
         _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
@@ -107,7 +107,7 @@ def check_data_conflict(db_path: str) -> list[dict]:
                 "symbol": "",
                 "msg": f"[P0]【数据失效】实时行情不可用（stale={stale} {detail}）：禁止新开仓",
             })
-    except Exception:  # noqa: BLE001
+    except Exception:
         alerts.append({
             "kind": "data_conflict",
             "symbol": "",
@@ -177,5 +177,5 @@ def _log_p0(db_path: str, sent: int, detail: str = "") -> None:
                 )
         finally:
             conn.close()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass

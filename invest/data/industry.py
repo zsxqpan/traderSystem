@@ -103,7 +103,7 @@ def fetch_industry_list(cache_path: Path | None = None, force: bool = False) -> 
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(df.to_dict(orient="records"), f, ensure_ascii=False)
             return df
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_err = f"{host}: {exc}"
     raise RuntimeError(f"行业列表获取失败: {last_err}")
 
@@ -135,7 +135,7 @@ def _kline_request(host: str, params: dict, retries: int = 2) -> list[str]:
                 last = f"{host}: 空数据"
                 continue
             return klines
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last = f"{host}(第{attempt}次): {exc}"
     raise RuntimeError(last)
 
@@ -148,7 +148,9 @@ def load_ths_map(force: bool = False) -> dict[str, str]:
     if not force and _cache_valid(_THS_MAP_CACHE):
         with open(_THS_MAP_CACHE, "r", encoding="utf-8") as f:
             return json.load(f)
-    from akshare.stock_feature.stock_board_industry_ths import _get_stock_board_industry_name_ths
+    from akshare.stock_feature.stock_board_industry_ths import (
+        _get_stock_board_industry_name_ths,
+    )
     m = _get_stock_board_industry_name_ths()
     _THS_MAP_CACHE.parent.mkdir(parents=True, exist_ok=True)
     with open(_THS_MAP_CACHE, "w", encoding="utf-8") as f:
@@ -165,7 +167,7 @@ def _parse_ths_year_text(text: str) -> pd.DataFrame:
     try:
         import demjson
         data = demjson.decode(body)
-    except Exception:  # noqa: BLE001
+    except Exception:
         import json as _json
         data = _json.loads(body[: body.rfind("}") + 1])
     rows = [r.split(",") for r in str(data.get("data", "")).split(";") if r]
@@ -199,7 +201,7 @@ def _top_up_ths_latest(name: str, df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         extra = ak.stock_board_industry_index_ths(symbol=name, start_date=start, end_date=end)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return pd.DataFrame()
     if extra is None or extra.empty:
         return pd.DataFrame()
@@ -228,7 +230,6 @@ def fetch_ths_industries(
 
     import py_mini_racer
     import requests
-
     from akshare.stock_feature.stock_board_industry_ths import _get_file_content_ths
 
     code_map = load_ths_map()
@@ -269,7 +270,7 @@ def fetch_ths_industries(
                 df = _concat_industry_years([df, extra])
             df["行业"] = name
             frames.append(df)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             errors.append(f"{name}: {exc}")
         time.sleep(delay)
     if not frames:
@@ -316,7 +317,7 @@ def fetch_industry_hist(
                 _GOOD_KLINE_HOST = host
                 _save_good_host(host)
                 break
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 last_err = f"{host}: {exc}"
                 time.sleep(0.3)
         if klines is None:

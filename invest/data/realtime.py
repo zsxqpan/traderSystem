@@ -220,7 +220,7 @@ def _fetch_em(session: requests.Session, symbols: list[str]) -> dict[str, Quote]
                 )
             if out:
                 return out
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_exc = exc
             continue
     if last_exc is not None:
@@ -277,7 +277,7 @@ class RealtimeQuoter:
                         self.source_failures[src] = 0
                         return quotes
                     self.source_failures[src] += 1
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     last_err = exc
                     self.source_failures[src] += 1
                     if attempt < self.retries:
@@ -287,7 +287,7 @@ class RealtimeQuoter:
     def close(self) -> None:
         self.session.close()
 
-    def __enter__(self) -> "RealtimeQuoter":
+    def __enter__(self) -> RealtimeQuoter:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -370,7 +370,7 @@ def log_realtime_health(db_path, quotes, failures):
                 )
         finally:
             conn.close()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return detail
 
@@ -421,6 +421,6 @@ def realtime_health(db_path: str, max_lag: float = 10.0) -> dict:
                 pass
         if out["stale"] > 0:
             out["ok"] = False  # 最近留痕有 stale -> 不可支撑 P0
-    except Exception:  # noqa: BLE001
+    except Exception:
         out["ok"] = False  # 查询失败保守视为不可用
     return out

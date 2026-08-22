@@ -82,7 +82,7 @@ def detect_level_breaks(
     stack = [s]
     while stack:
         seg = stack.pop()
-        i, stat = _best_block_break(seg, k, min_samples)
+        i, _stat = _best_block_break(seg, k, min_samples)
         if i is None:
             continue
         breaks.append(seg.index[i])
@@ -143,7 +143,7 @@ def truncate_at_break(
         }
     return kept, kept_dates, {
         "truncated": True, "cutoff": str(dates_s.iloc[pos]), "source": "detected",
-        "removed": pos, "kept": int(len(kept)),
+        "removed": pos, "kept": len(kept),
     }
 
 
@@ -234,7 +234,7 @@ def industry_pe_spread(
         return {"ok": False, "note": f"{industry} PE 历史经断点截断后为空"}
     result = spread_analysis(hist, current)
     result["industry"] = industry
-    result["n_samples"] = int(len(hist))
+    result["n_samples"] = len(hist)
     result["break"] = break_info
     return result
 
@@ -274,7 +274,7 @@ def price_spread(
         return {"ok": False, "note": f"{symbol} 价格历史经断点截断后为空"}
     result = spread_analysis(hist, current)
     result["symbol"] = symbol
-    result["n_samples"] = int(len(hist))
+    result["n_samples"] = len(hist)
     result["break"] = break_info
     result["note"] = "价格口径为未复权收盘价，分位/Z 分受除权影响（qfq 数据接入后校准）"
     return result
@@ -352,9 +352,8 @@ def mispricing_necessary(
     z = spread_result.get("z_score")
     if pct is not None and pct < cheap_pct:
         return True, f"历史分位 {pct:.2%} < {cheap_pct:.0%}，具备错价必要条件"
-    if pct is None or (min_z is not None and z is not None and z < min_z):
-        if z is not None and z < 0:
-            return True, f"分位不可用但 Z={z:.2f} 显著低于锚，具备错价必要条件"
+    if (pct is None or (min_z is not None and z is not None and z < min_z)) and z is not None and z < 0:
+        return True, f"分位不可用但 Z={z:.2f} 显著低于锚，具备错价必要条件"
     return False, f"不满足过错价必要条件（分位 {pct if pct is None else f'{pct:.2%}'}，Z={z if z is None else f'{z:.2f}'}）"
 
 

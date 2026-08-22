@@ -46,7 +46,7 @@ def test_scheduler_jobs():
     sched = build_scheduler()
     ids = {j.id for j in sched.get_jobs()}
     # 2026-08-18 合并盘后报告：nightly/p2_brief → evening_report（数据滞后时跳过并推送原因）
-    assert {"premarket", "morning_brief", "after_close", "weekend", "intraday_tick",
+    assert {"premarket", "morning_brief", "after_close", "snapshot_close", "weekend", "intraday_tick",
             "monthly", "yearly", "industry_refresh", "daily_refresh", "evening_report"} <= ids
     assert "p2_brief" not in ids and "nightly" not in ids
     print("test_scheduler_jobs OK")
@@ -59,7 +59,7 @@ def test_ticker_only_and_job_funcs():
     sched = build_scheduler(ticker_only=True)
     assert {j.id for j in sched.get_jobs()} == {"intraday_tick"}
     assert set(JOB_FUNCS) == {
-        "premarket", "morning_brief", "after_close", "weekend", "monthly", "yearly",
+        "premarket", "morning_brief", "after_close", "snapshot_close", "weekend", "monthly", "yearly",
         "industry_refresh", "daily_refresh", "evening_report",
     }
     print("test_ticker_only_and_job_funcs OK")
@@ -67,9 +67,10 @@ def test_ticker_only_and_job_funcs():
 
 def test_data_lag_reason():
     """盘后数据新鲜度门禁：空库/旧数据 → 返回滞后原因；已更新到最近交易日 → 返回空串。"""
+    import datetime as dt
+
     from invest.data.calendar import latest_trading_day
     from invest.scheduler import _data_lag_reason
-    import datetime as dt
 
     p = _tmp_db()
     conn = connect(p)
@@ -78,13 +79,15 @@ def test_data_lag_reason():
         assert _data_lag_reason(conn) != ""
         # 写入最近交易日数据 → 新鲜
         exp = latest_trading_day(dt.date.today()).isoformat()
-        from invest.data.storage import upsert_df
         import pandas as pd
+
+        from invest.data.storage import upsert_df
         upsert_df(conn, "daily_bars", pd.DataFrame([{"date": exp, "symbol": "000001", "close": 10.0}]))
         upsert_df(conn, "index_bars", pd.DataFrame([{"date": exp, "index_code": "000300", "close": 100.0}]))
         assert _data_lag_reason(conn) == ""
-        # 只剩上一交易日 → 滞后
-        y = latest_trading_day(dt.date.today() - dt.timedelta(days=1)).isoformat()
+        # 只剩上一交易日 → 滞后（注意：今天若为周末，today-1d 可能仍是最近交易日，
+        # 2026-08-22 修复：改为取最近交易日的前一个交易日，任何星期几都成立）
+        y = latest_trading_day(dt.date.fromisoformat(exp) - dt.timedelta(days=1)).isoformat()
         conn.execute("UPDATE daily_bars SET date=?", (y,))
         conn.execute("UPDATE index_bars SET date=?", (y,))
         conn.commit()
@@ -94,11 +97,69 @@ def test_data_lag_reason():
     print("test_data_lag_reason OK")
 
 
+def test_data_freshness_and_snapshot_close():
+    """2026-08-20：① query_data_freshness 校验数据时点；② snapshot_close 收盘快照落库。"""
+    import datetime as dt
+
+    from invest.agent.tools import query_data_freshness
+    from invest.data.calendar import latest_trading_day
+    from invest.data.storage import upsert_df
+    from invest.pipeline import snapshot_close
+
+    p = _tmp_db()
+    conn = connect(p)
+    # 空库 → 数据滞后
+    f = query_data_freshness(conn)
+    assert f["fresh"] is False
+    # 写入最近交易日日线/指数 → 新鲜
+    exp = latest_trading_day(dt.date.today()).isoformat()
+    upsert_df(conn, "daily_bars", pd.DataFrame([
+        {"symbol": "000001", "date": exp, "close": 10.0, "src": "akshare"},
+    ]))
+    upsert_df(conn, "index_bars", pd.DataFrame([
+        {"index_code": "000300", "date": exp, "close": 100.0, "src": "akshare"},
+    ]))
+    upsert_df(conn, "quant_strength", pd.DataFrame([
+        {"run_date": exp, "obj_type": "industry", "obj": "A", "period": "short",
+         "rs": 0.1, "calc_version": "v1"},
+    ]))
+    assert query_data_freshness(conn)["fresh"] is True
+    conn.close()
+
+    # snapshot_close：交易日 + mock 行情/指数源
+    from invest.data.realtime import Quote
+    if dt.date.today().weekday() < 5:  # 交易日才写入
+        conn = connect(p)
+        upsert_df(conn, "candidate_pool", pd.DataFrame([
+            {"symbol": "000001", "level": "core", "in_date": exp, "out_date": None},
+        ]))
+        conn.close()
+        class _FakeQuoter:
+            source_failures = {"sina": 0, "tencent": 0, "em_push2": 0}
+            def __enter__(self): return self
+            def __exit__(self, *a): return None
+            def fetch(self, symbols):
+                return {"sz000001": Quote(symbol="sz000001", price=10.66, ts=dt.datetime.now(), src="sina")}
+        with mock.patch("invest.data.realtime.RealtimeQuoter", _FakeQuoter), mock.patch(
+                "invest.pipeline._fetch_index_closes",
+                return_value=[{"index_code": "000300", "date": exp, "close": 4000.5, "src": "snapshot"}]):
+            r = snapshot_close(p)
+        assert r.get("stock") == 1 and r.get("index") == 1
+        conn = connect(p)
+        row = conn.execute(
+            "SELECT close FROM daily_bars WHERE symbol='000001' AND date=? AND src='snapshot'", (exp,)
+        ).fetchone()
+        assert row and abs(float(row["close"]) - 10.66) < 1e-6
+        conn.close()
+    print("test_data_freshness_and_snapshot_close OK")
+
+
 def test_evening_report_freshness_gate():
     """晚间盘后报告：数据滞后 → 不发报告只发原因；数据新鲜 → 正常发报告。"""
+    import datetime as dt
+
     from invest.data.calendar import latest_trading_day
     from invest.scheduler import _evening_report
-    import datetime as dt
 
     # 滞后场景
     p_stale = _tmp_db()
@@ -117,8 +178,9 @@ def test_evening_report_freshness_gate():
     conn = connect(p_fresh)
     try:
         exp = latest_trading_day(dt.date.today()).isoformat()
-        from invest.data.storage import upsert_df
         import pandas as pd
+
+        from invest.data.storage import upsert_df
         upsert_df(conn, "daily_bars", pd.DataFrame([{"date": exp, "symbol": "000001", "close": 10.0}]))
         upsert_df(conn, "index_bars", pd.DataFrame([{"date": exp, "index_code": "000300", "close": 100.0}]))
         with mock.patch("invest.scheduler.Notifier") as m:
@@ -281,6 +343,7 @@ if __name__ == "__main__":
     test_notifier_disabled_and_mock()
     test_scheduler_jobs()
     test_ticker_only_and_job_funcs()
+    test_data_freshness_and_snapshot_close()
     test_data_lag_reason()
     test_evening_report_freshness_gate()
     test_pipeline_quant()

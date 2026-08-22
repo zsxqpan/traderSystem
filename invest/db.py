@@ -138,6 +138,31 @@ CREATE TABLE IF NOT EXISTS quant_linkage (
     PRIMARY KEY (run_date, a, b)
 );
 
+-- 涨停/炸板池个股明细（2026-08-20：东财 push2ex，盘中实时，连板梯队/涨停龙头）
+CREATE TABLE IF NOT EXISTS limit_up_pool (
+    date            TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    name            TEXT,
+    lianban         INTEGER DEFAULT 0,
+    first_seal_time TEXT,
+    seal_amount     REAL,
+    zhaban          INTEGER DEFAULT 0,
+    src             TEXT DEFAULT 'eastmoney',
+    PRIMARY KEY (date, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_lup_date_lianban ON limit_up_pool(date, lianban);
+
+-- 行业板块主力资金（2026-08-20：东财 clist 行业资金流，主力净流入）
+CREATE TABLE IF NOT EXISTS sector_fund_flow (
+    date          TEXT NOT NULL,
+    industry      TEXT NOT NULL,
+    main_net      REAL,
+    main_net_pct  REAL,
+    src           TEXT DEFAULT 'eastmoney',
+    PRIMARY KEY (date, industry)
+);
+CREATE INDEX IF NOT EXISTS idx_sff_date_net ON sector_fund_flow(date, main_net);
+
 CREATE TABLE IF NOT EXISTS quant_valuation (
     run_date TEXT NOT NULL,
     obj      TEXT NOT NULL,

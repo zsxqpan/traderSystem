@@ -69,7 +69,7 @@ def industry_of(conn: sqlite3.Connection | None, symbol: str, mapping: dict | No
             ).fetchone()
             if row and row["industry"]:
                 return str(row["industry"])
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     return ""
 

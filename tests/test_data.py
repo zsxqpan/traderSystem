@@ -197,7 +197,7 @@ def test_daily_normalize():
 def test_cross_check_and_upsert():
     d1 = pd.DataFrame({"date": ["2024-01-02", "2024-01-03"], "close": [10.0, 11.0]})
     d2 = pd.DataFrame({"date": ["2024-01-02", "2024-01-03"], "close": [10.001, 11.0]})
-    ok, rep = cross_check(d1, d2)
+    ok, _rep = cross_check(d1, d2)
     assert ok is True
     d3 = d2.copy()
     d3.loc[0, "close"] = 99.0
@@ -302,8 +302,9 @@ def test_backfill_tasks():
 
 def test_emotion_build_and_collect():
     import tempfile
-    from invest.data.emotion import build_emotion_df
+
     from invest.data.collector import run_collection
+    from invest.data.emotion import build_emotion_df
     from invest.data.sources.akshare_source import AkShareSource
 
     zt = [{"lbc": 1}, {"lbc": 4}, {"lbc": 7}]
@@ -512,7 +513,9 @@ def test_dragon_tiger_normalize_and_dedupe():
 def test_tushare_ts_code_and_normalize():
     """备用源：代码转交易所后缀；normalize 只保留 schema 列并统一日期格式。"""
     from invest.data.sources.tushare_source import (
-        TushareSource, _index_ts_code, _stock_ts_code,
+        TushareSource,
+        _index_ts_code,
+        _stock_ts_code,
     )
     assert _stock_ts_code("000001") == "000001.SZ"
     assert _stock_ts_code("600519") == "600519.SH"

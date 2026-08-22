@@ -8,7 +8,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from invest.db import connect, init_db
-from invest.discipline import pool, plans, rating, records, risk
+from invest.discipline import plans, pool, rating, records, risk
 
 
 def _tmp_db():

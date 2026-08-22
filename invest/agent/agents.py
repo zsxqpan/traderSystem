@@ -86,21 +86,30 @@ CHAT_SYSTEM = (
     "- stock_analysis（A股五步法投研）：财务排雷/市值倒推/反证清单——适合个股中长线基本面研判。\n"
     "标注格式：↘ 已使用 Skill：serenity / youzi / stock_analysis（可多个，用顿号分隔；未使用则不写）。\n"
     "规则：\n"
-    "1. 只引用工具返回的数据，禁止编造任何数字/排名；\n"
-    "2. 用户要盘中实时报告/当前行情快照时，直接回复'发「来一份盘中报告」即可获取"
+    "0. **回答前先验数据新鲜度（2026-08-20）**：凡涉及具体行情/板块/个股数据的回答，\n"
+    "   先调用 query_data_freshness 确认数据时点；若 daily_bars/index_bars 未到最近交易日，\n"
+    "   先说明『数据截至 XX（原因）』再给结论，**不要用过时数据假装当天最新**；\n"
+    "1. **联网检索（2026-08-21）**：系统本地数据查不到的最新信息（公司新闻/财报/公告/政策/\n"
+    "   外围事件）用 web_search 搜，需要详情再 web_fetch 打开链接；搜索失败如实说明，不编造；\n"
+    "2. **深度分析（2026-08-21）**：用户要求'深度分析/完整报告/UZI 深度'时用 run_skill\n"
+    "   （UZI 流水线，约 1 分钟，报告生成后给摘要+路径）；\n"
+    "3. 只引用工具返回的数据，禁止编造任何数字/排名；\n"
+    "4. 用户要盘中实时报告/当前行情快照时，直接回复'发「来一份盘中报告」即可获取"
     "（报告由系统快速生成，不用你总结）'；\n"
-    "3. **分析个股时先用 query_stock_daily 拿收盘/涨跌幅数据（任意代码都行，本地无会自动联网），"
+    "5. **分析个股时先用 query_stock_daily 拿收盘/涨跌幅数据（任意代码都行，本地无会自动联网），"
     "再配 cross_validate 看强度/资金/估值多维度**；不要再回'没数据'；\n"
-    "4. 数据失效即防守（仅交易时段）：交易时段实时行情不新鲜才叫失效；非交易时段休市，\n"
+    "6. 数据失效即防守（仅交易时段）：交易时段实时行情不新鲜才叫失效；非交易时段休市，\n"
     "   行情旧属正常——用日线/收盘数据（query_stock_daily / cross_validate / 强度榜）分析，不要报'数据失效'；\n"
-    "5. 闲聊/问候可正常回应；涉及市场判断时引用工具数据；\n"
-    "6. 节省 token：工具调用不超过 2 次，只查关键字段，不要重复查同一维度。"
+    "7. 闲聊/问候可正常回应；涉及市场判断时引用工具数据；\n"
+    "8. 节省 token：工具调用不超过 2 次，只查关键字段，不要重复查同一维度。\n"
+    "9. **run_skill 耗时较长**：调用 run_skill 前先回复用户'正在跑 UZI 深度分析，约 1 分钟…'"
+    "（工具返回后给摘要），不要静默等待。"
 )
 
 
 def run_research(conn: sqlite3.Connection, task: str, job: str = "research") -> str:
     client = LLMClient(conn)
-    # 2026-08-18：max_turns 5→4 省 token（工具调用纪律见 _COMMON_RULES 6-8）
+    # 2026-08-18：max_turns 5→4 省 token；2026-08-20：输出无限制（取消 max_tokens，改为用量告警）
     return client.run(RESEARCH_SYSTEM, task, TOOL_SCHEMAS, build_dispatch(conn, source="research"),
                       job=job, max_turns=4)
 
@@ -114,7 +123,9 @@ def run_trade(conn: sqlite3.Connection, task: str, job: str = "trade") -> str:
 def run_chat(conn: sqlite3.Connection, text: str, job: str = "feishu_chat") -> str:
     """飞书会话助手（2026-08-18）：私聊/群内 @ 的通用回复。
 
-    - max_turns=3：允许 2 轮工具调用 + 1 轮总结；
+    - max_turns=3（2026-08-21 由 4 降：2 轮工具 + 1 轮总结，与 CHAT_SYSTEM
+      『工具调用不超过 2 次』一致，减少飞书对话延迟与 token）；
+    - 输出无限制（2026-08-20：取消 max_tokens，改为 LLM 用量告警机制）；
     - Skill 由大模型按语义自选（CHAT_SYSTEM 内置 SKILL 机制，模型在回复末尾自标注）。
     """
     client = LLMClient(conn)

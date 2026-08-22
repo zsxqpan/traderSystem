@@ -32,9 +32,8 @@ def test_symbol_mapping():
 
 def test_fetch_success_and_order():
     with mock.patch.object(rt, "_fetch_sina", side_effect=_fake_sina), \
-         mock.patch.object(rt, "_fetch_tencent", side_effect=AssertionError("不应调用腾讯")):
-        with rt.RealtimeQuoter() as q:
-            quotes = q.fetch(["600519", "000001"])
+         mock.patch.object(rt, "_fetch_tencent", side_effect=AssertionError("不应调用腾讯")), rt.RealtimeQuoter() as q:
+        quotes = q.fetch(["600519", "000001"])
     assert len(quotes) == 2
     assert all(v.src == "sina" for v in quotes.values())
     print("test_fetch_success_and_order OK")
@@ -42,10 +41,9 @@ def test_fetch_success_and_order():
 
 def test_failover_to_next_source():
     with mock.patch.object(rt, "_fetch_sina", side_effect=rt.requests.ConnectionError("sina down")), \
-         mock.patch.object(rt, "_fetch_tencent", side_effect=_fake_sina):
-        with rt.RealtimeQuoter() as q:
-            quotes = q.fetch(["600519"])
-    assert quotes and list(quotes.values())[0].src == "sina"  # _fake_sina 标记 sina，仅验证已切换
+         mock.patch.object(rt, "_fetch_tencent", side_effect=_fake_sina), rt.RealtimeQuoter() as q:
+        quotes = q.fetch(["600519"])
+    assert quotes and next(iter(quotes.values())).src == "sina"  # _fake_sina 标记 sina，仅验证已切换
     assert quotes  # 新浪失败后腾讯兜底成功
     print("test_failover_to_next_source OK")
 
@@ -53,21 +51,19 @@ def test_failover_to_next_source():
 def test_all_sources_down_raises():
     with mock.patch.object(rt, "_fetch_sina", side_effect=RuntimeError("x")), \
          mock.patch.object(rt, "_fetch_tencent", side_effect=RuntimeError("x")), \
-         mock.patch.object(rt, "_fetch_em", side_effect=RuntimeError("x")):
-        with rt.RealtimeQuoter() as q:
-            try:
-                q.fetch(["600519"])
-                raise AssertionError("应抛 RuntimeError")
-            except RuntimeError:
-                pass
+         mock.patch.object(rt, "_fetch_em", side_effect=RuntimeError("x")), rt.RealtimeQuoter() as q:
+        try:
+            q.fetch(["600519"])
+            raise AssertionError("应抛 RuntimeError")
+        except RuntimeError:
+            pass
     print("test_all_sources_down_raises OK")
 
 
 def test_empty_result_falls_through():
     with mock.patch.object(rt, "_fetch_sina", return_value={}), \
-         mock.patch.object(rt, "_fetch_tencent", side_effect=_fake_sina):
-        with rt.RealtimeQuoter() as q:
-            quotes = q.fetch(["600519"])
+         mock.patch.object(rt, "_fetch_tencent", side_effect=_fake_sina), rt.RealtimeQuoter() as q:
+        quotes = q.fetch(["600519"])
     assert len(quotes) == 1  # 新浪空结果不算成功，切腾讯
     print("test_empty_result_falls_through OK")
 
@@ -99,7 +95,8 @@ def test_parse_sina_line():
 def _health_db():
     import os as _os
     import tempfile as _tf
-    from invest.db import connect, init_db
+
+    from invest.db import init_db
     p = _os.path.join(_tf.gettempdir(), "invest_realtime_health_test.db")
     for s in ("", "-wal", "-shm"):
         try:

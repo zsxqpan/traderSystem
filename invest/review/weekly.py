@@ -52,7 +52,7 @@ def weekly_review(conn: sqlite3.Connection) -> dict:
         drift = drift_report(conn, as_of=today.isoformat())
         if drift["n_drift"]:
             violations.append(f"周期漂移 {drift['n_drift']} 个计划超期未平仓")
-    except Exception:  # noqa: BLE001
+    except Exception:
         drift = {"n_drift": 0, "drifts": []}
 
     # 持仓卡片复评（[A]7）：locked/review 卡片对当前价格 vs 止损/目标的健康状况
@@ -98,7 +98,7 @@ def position_card_review(conn: sqlite3.Connection) -> list[dict]:
                 (card["symbol"],),
             ).fetchone()
             close = float(row["close"]) if row else None
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         item = {
             "card_id": card["id"],

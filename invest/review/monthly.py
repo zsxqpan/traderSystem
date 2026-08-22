@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import sqlite3
 
 from invest.viewpoints.accuracy import accuracy_stats
@@ -45,7 +46,7 @@ def environment_quality(conn: sqlite3.Connection, months: int = 3) -> dict:
             """SELECT value FROM ratings WHERE kind=? AND date >= ? ORDER BY date""",
             (kind, since),
         ).fetchall()
-        n = sum(1 for a, b in zip(rows, rows[1:]) if a["value"] != b["value"])
+        n = sum(1 for a, b in itertools.pairwise(rows) if a["value"] != b["value"])
         changes[kind] = n
 
     unstable = [k for k, n in changes.items() if n >= 3]
@@ -54,7 +55,7 @@ def environment_quality(conn: sqlite3.Connection, months: int = 3) -> dict:
         from invest.data.pit import quality_report
         report = quality_report(conn)
         data_quality = {t: st for t, (st, _info) in report.items() if st != "valid"}
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
     warn = []

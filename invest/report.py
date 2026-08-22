@@ -27,6 +27,7 @@ def _style_block(conn) -> str:
     读最新一期指数相对强度，渲染为报告小节。无数据返回空串。"""
     try:
         import pandas as _pd
+
         from invest.quant.style import style_to_text
         df = _pd.read_sql_query(
             """SELECT obj, rs, momentum, trend_stage, run_date
@@ -59,7 +60,7 @@ def _style_block(conn) -> str:
             return style_to_text(style_result)
         full = compute_style(closes, closes["000300"].dropna())
         return style_to_text(full)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return ""
 
 
@@ -191,9 +192,6 @@ def _abnormal_moves(conn, n: int = 5) -> list[dict]:
     - 长上影/长下影：影线占振幅 > 60%。
     返回 [{symbol, signal, detail}]，仅限候选池标的（防噪音）。
     """
-    pool = {r["symbol"] for r in conn.execute(
-        "SELECT symbol FROM candidate_pool WHERE out_date IS NULL"
-    )} if conn.execute("SELECT name FROM sqlite_master WHERE name='candidate_pool'").fetchone() else set()
     rows = conn.execute(
         """SELECT symbol, date, open, high, low, close, volume FROM daily_bars
            ORDER BY symbol, REPLACE(date,'-','') DESC LIMIT 10000"""
@@ -280,6 +278,7 @@ def _entry_timing_hints(conn) -> list[str]:
     hints: list[str] = []
     try:
         import pandas as _pd
+
         from invest.quant.emotion_cycle import emotion_cycle
         emo = _pd.read_sql_query(
             "SELECT date, limit_up_count, max_lianban, zhaban_rate FROM market_emotion ORDER BY date", conn,
@@ -292,7 +291,7 @@ def _entry_timing_hints(conn) -> list[str]:
             hints.append("情绪周期「冰点」：短线观望，等反包/回暖信号")
         elif stage == "退潮":
             hints.append("情绪周期「退潮」：不接力高位，防守为主")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     try:
         temp = conn.execute(
@@ -302,7 +301,7 @@ def _entry_timing_hints(conn) -> list[str]:
             s = float(temp["score"])
             if 40 <= s < 70:
                 hints.append(f"温度{s:.0f}（中性偏暖）：正常仓，回调低吸机会")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     # 候选池低估值 + 强度转强
     try:
@@ -325,7 +324,7 @@ def _entry_timing_hints(conn) -> list[str]:
             if row and srow and row["pe_pct"] is not None and float(row["pe_pct"]) < 0.3 \
                and srow["trend_stage"] in ("启动", "加速"):
                 hints.append(f"{r['symbol']}({ind}) 低估值+强度启动：建仓窗口候选")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return hints[:5]
 
@@ -337,7 +336,7 @@ def _live_quotes(db_path: str, core: list[str]) -> tuple[dict[str, float], dict[
     try:
         from invest.intraday import fetch_batch_prices
         live = fetch_batch_prices(core, db_path=db_path)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return {}, {}
     conn = connect(db_path)
     try:
@@ -379,7 +378,7 @@ def _focus_industries_block(conn, db_path: str) -> str:
             ).fetchone()
             if row:
                 parts.append(f"RS {float(row['rs']):+.1%} [{row['trend_stage']}]")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         try:
             val = conn.execute(
@@ -390,7 +389,7 @@ def _focus_industries_block(conn, db_path: str) -> str:
                 parts.append(f"PE分位{float(val['pe_pct']):.0%}")
                 if val["crowding_state"]:
                     parts.append(f"拥挤:{val['crowding_state']}")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         try:
             cap = conn.execute(
@@ -399,7 +398,7 @@ def _focus_industries_block(conn, db_path: str) -> str:
             ).fetchone()
             if cap and cap["style"]:
                 parts.append(f"资金:{cap['style']}")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         data_lines.append("  " + "｜".join(parts))
     if not data_lines:
@@ -426,7 +425,7 @@ def _focus_industries_block(conn, db_path: str) -> str:
             if out and not out.startswith("[预算不足"):
                 lines.append("【重点行业意见】")
                 lines.append(out.strip())
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("重点行业 LLM 意见失败: %s", exc)
     return "\n".join(lines)
 
@@ -470,7 +469,7 @@ def daily_report(db_path: str, agent_text: str = "") -> str:
             if macro and macro != "-":
                 lines.append("")
                 lines.append("【宏观】" + macro)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         lines.append("")
         lines.append("📊 市场温度: " + (
@@ -487,6 +486,7 @@ def daily_report(db_path: str, agent_text: str = "") -> str:
         # 情绪周期
         try:
             import pandas as _pd
+
             from invest.quant.emotion_cycle import emotion_cycle
             emo = _pd.read_sql_query(
                 "SELECT date, limit_up_count, max_lianban, zhaban_rate FROM market_emotion ORDER BY date", conn,
@@ -496,7 +496,7 @@ def daily_report(db_path: str, agent_text: str = "") -> str:
             if cyc.get("reasons"):
                 lines.append(f"   → {'；'.join(cyc['reasons'])}")
             lines.append(f"   → {cyc.get('guide', '')}")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         lines.append("")
         lines.append("【当日板块】")
@@ -561,7 +561,7 @@ def premarket_report(db_path: str, agent_text: str = "") -> str:
             env = check_env_retrigger(conn)
             if env["triggers"]:
                 env_notes = "\n[环境重评] " + "\n  ".join(env["triggers"])
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         temp_row = conn.execute(
             "SELECT score FROM quant_temperature ORDER BY run_date DESC LIMIT 1"
@@ -609,7 +609,7 @@ def _fetch_telegraph_lines(days: int = 3) -> list[str]:
         cutoff = (dt.date.today() - dt.timedelta(days=days)).isoformat()
         try:
             df = df[df["发布日期"].astype(str).str[:10] >= cutoff]
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         rows = df.sort_values("发布时间", ascending=False).head(40)
         out: list[str] = []
@@ -621,7 +621,7 @@ def _fetch_telegraph_lines(days: int = 3) -> list[str]:
                 continue
             out.append(f"{str(r['发布时间'])[:16]} | {text[:120]}")
         return out
-    except Exception:  # noqa: BLE001
+    except Exception:
         return []
 
 
@@ -659,7 +659,7 @@ def _news_block(db_path: str, n: int = 5, days: int = 3, job: str = "weekly") ->
                     return out.strip()
             finally:
                 conn.close()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("消息面 LLM 提炼失败，回退直列: %s", exc)
     # 兜底：直列素材
     return "\n".join(f"  - {ln}" for ln in raw_lines[:n])
@@ -737,6 +737,7 @@ def _emotion_block(conn) -> str:
     """情绪·人气：最新交易日涨停/最高连板/炸板率 + 情绪周期阶段。无数据返回空串。"""
     try:
         import pandas as _pd
+
         from invest.quant.emotion_cycle import emotion_cycle
 
         emo = _pd.read_sql_query(
@@ -758,7 +759,7 @@ def _emotion_block(conn) -> str:
             parts.append(f"炸板率{float(zr):.0%}")
         parts.append(f"情绪:{cyc['stage']}")
         return " ".join(parts)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return ""
 
 
@@ -781,7 +782,7 @@ def _sector_moves_block(conn, n: int = 3) -> str:
         return "\n".join(
             f"  {r['industry']}  {(r['close'] / r['prev'] - 1):+.2%}" for r in rows
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         return ""
 
 
@@ -799,7 +800,7 @@ def _capital_leaders_block(conn, n: int = 3) -> str:
         return "\n".join(
             f"  {r['symbol']} {r['name'] or ''} 净买{float(r['net'])/1e8:.2f}亿" for r in rows
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         return ""
 
 
@@ -807,13 +808,14 @@ def _action_guide(conn, score: float | None) -> str:
     """今日操作建议（2026-08-18 方案A）：温度 + 情绪周期 → 一句话操作倾向。"""
     try:
         import pandas as _pd
+
         from invest.quant.emotion_cycle import emotion_cycle
 
         emo = _pd.read_sql_query(
             "SELECT date, limit_up_count, max_lianban, zhaban_rate FROM market_emotion ORDER BY date", conn,
         )
         stage = emotion_cycle(emo)["stage"] if not emo.empty else "数据不足"
-    except Exception:  # noqa: BLE001
+    except Exception:
         stage = "数据不足"
     if score is None:
         temp_txt = "温度数据不足"
@@ -833,6 +835,50 @@ def _action_guide(conn, score: float | None) -> str:
     }
     act = acts.get(stage, "中性操作，按计划执行")
     return f"{temp_txt}｜情绪{stage} → {act}"
+
+
+def _limit_up_ladder_block(conn, n: int = 6) -> str:
+    """连板梯队/涨停龙头（2026-08-20，东财涨停池个股明细，盘中实时）。
+
+    取最新日期 limit_up_pool：按连板数降序 TOP n（含炸板标记）；无数据返回空串。
+    """
+    try:
+        rows = conn.execute(
+            """SELECT symbol, name, lianban, seal_amount, zhaban FROM limit_up_pool
+               WHERE date = (SELECT MAX(date) FROM limit_up_pool) AND zhaban=0
+               ORDER BY lianban DESC, seal_amount DESC NULLS LAST LIMIT ?""",
+            (n,),
+        ).fetchall()
+        if not rows:
+            return ""
+        lines = []
+        for r in rows:
+            tag = f"{int(r['lianban'])}板" if r["lianban"] else "首板"
+            seal = f" 封单{float(r['seal_amount'])/1e4:.1f}万" if r["seal_amount"] is not None else ""
+            lines.append(f"  {r['symbol']} {r['name'] or ''} {tag}{seal}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _fund_line_block(conn, n: int = 3) -> str:
+    """资金主线：行业板块主力净流入 TOP n（2026-08-20，东财行业资金流）。"""
+    try:
+        rows = conn.execute(
+            """SELECT industry, main_net, main_net_pct FROM sector_fund_flow
+               WHERE date = (SELECT MAX(date) FROM sector_fund_flow)
+               ORDER BY main_net DESC LIMIT ?""",
+            (n,),
+        ).fetchall()
+        if not rows:
+            return ""
+        return "\n".join(
+            f"  {r['industry']}  主力净流入{float(r['main_net'])/1e8:+.2f}亿"
+            + (f"（占比{float(r['main_net_pct']):+.1f}%）" if r["main_net_pct"] is not None else "")
+            for r in rows
+        )
+    except Exception:
+        return ""
 
 
 # ---------- 盘中实时报告 ----------
@@ -917,6 +963,18 @@ def intraday_report(db_path: str, public: bool = False, brief: bool = True) -> s
         if emo:
             lines.append("")
             lines.append(f"🔥 情绪·人气: {emo}")
+        # 连板梯队/涨停龙头（2026-08-20，盘中实时）
+        ladder = _limit_up_ladder_block(conn)
+        if ladder:
+            lines.append("")
+            lines.append("【连板梯队·涨停龙头】")
+            lines.append(ladder)
+        # 资金主线（2026-08-20，行业主力净流入）
+        fund = _fund_line_block(conn)
+        if fund:
+            lines.append("")
+            lines.append("【资金主线·主力净流入TOP3】")
+            lines.append(fund)
         # 板块异动（收盘口径方向）
         sec = _sector_moves_block(conn)
         if sec:
@@ -981,17 +1039,27 @@ def morning_brief_report(db_path: str) -> str:
         cycle_txt = ""
         try:
             import pandas as _pd
+
             from invest.quant.emotion_cycle import emotion_cycle
             emo = _pd.read_sql_query(
                 "SELECT date, limit_up_count, max_lianban, zhaban_rate FROM market_emotion ORDER BY date", conn,
             )
             cyc = emotion_cycle(emo) if not emo.empty else {"stage": "数据不足"}
             cycle_txt = f" | 情绪:{cyc['stage']}"
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         style_txt = _style_block(conn).split("\n")[0] if _style_block(conn) else ""
         temp_txt = f"温度{score:.0f}/100" + (f"·宽度{width:.0%}" if width is not None else "") if score is not None else "温度暂无"
         lines.append(f"【隔夜市场】{temp_txt}{cycle_txt}" + (f" | {style_txt}" if style_txt else ""))
+        # 隔夜外围（2026-08-21：美股/富时A50/商品/汇率快照）
+        try:
+            from invest.data.global_snapshot import global_snapshot_text
+
+            global_txt = global_snapshot_text()
+            if global_txt:
+                lines.append(f"【隔夜外围】{global_txt}")
+        except Exception:
+            pass
         lines.append("")
 
         # 2) 资金焦点：龙虎榜净买入 TOP5（隔夜资金动向）
@@ -1007,7 +1075,7 @@ def morning_brief_report(db_path: str) -> str:
                     name = r["name"] or r["symbol"]
                     lines.append(f"  {name} 净买{r['net']/1e8:+.2f}亿")
                 lines.append("")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
         # 3) 板块主线：昨日涨幅 + 短线强度（取强度榜前3）
@@ -1024,14 +1092,14 @@ def morning_brief_report(db_path: str) -> str:
                 lines.append("  强度: " + " | ".join(
                     f"{r['obj']}(rs{r['rs']:+.0%},{r['trend_stage']})" for r in top
                 ))
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         try:
             mv = _movers_block(conn, n=3)
             if mv and "当日涨幅前3" in mv or mv and "当日涨幅前5" in mv:
                 up_lines = [l for l in mv.split("\n") if "当日涨幅前" in l or (l and l[0] not in "当")]
                 lines.append("  " + " | ".join(up_lines[1:4]) if len(up_lines) > 1 else "")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         lines.append("")
 
@@ -1046,7 +1114,7 @@ def morning_brief_report(db_path: str) -> str:
                     f"{r['symbol']}({r['level']})" + (f"[{r['industry']}]" if r["industry"] else "") for r in pool
                 ))
                 lines.append("")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         abnormal = _abnormal_moves(conn, n=3)
         if abnormal:

@@ -50,7 +50,8 @@ def create_viewpoint(
          invalid_condition, status),
     )
     conn.commit()
-    return int(cur.lastrowid)
+    lastrowid = cur.lastrowid
+    return int(lastrowid) if lastrowid is not None else 0
 
 
 def get_viewpoint(conn: sqlite3.Connection, vid: int) -> dict | None:

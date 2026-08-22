@@ -1,16 +1,17 @@
-# -*- coding: utf-8 -*-
 """飞书长连接接收器（项目本体直连，lark-oapi WebSocket，零 Hermes 依赖）。
 
 替代旧方案（Hermes 桌面端 gateway.log 轮询 / Hermes 飞书连接）。功能（2026-08-18 v4）：
 1) **私聊（p2p）**：任何消息都由 Agent 回应（报告/提问/闲聊），非管理员计入每日限额；
 2) **群内 @机器人**（管理员或其他人 @）：任意消息都由 Agent 回应，不再只回报告；
-3) 管理员群内不 @ 的发言：仅语义识别为要实时报告才触发（纯语义，无关键词）；
+3) 管理员群内不 @ 的发言：仅识别为要实时报告才触发（2026-08-21 起两级意图识别：
+   关键词快速判定优先、未命中再走 LLM 语义兜底，绝大多数报告请求零 token）；
 4) 非管理员（群内 @ 或私聊）每日 token 限额 `FEISHU_NONADMIN_DAILY_TOKEN_LIMIT`（默认 100 万，
    记入 llm_usage job='group'），超限只回额度提示、不再消耗 token；
 5) 机器人自己的消息 → 忽略。
 
 回复分流（_agent_reply）：
-- 语义识别为要实时报告 → 盘中实时报告（非管理员=公开版，无持仓警戒）；LLM 失败/超时 → 不生成；
+- 识别为要实时报告 → 盘中实时报告（非管理员=公开版，无持仓警戒）；LLM 失败/超时 → 不生成；
+  **意图识别（2026-08-21）**：群聊=关键词优先+LLM 兜底；私聊 p2p=始终 LLM 语义判断（不走关键词）；
 - 问候/求助（在吗/你好/help…，本地判定零 token）→ 帮助提示；
 - 其他 → 会话 Agent（run_chat，带系统数据工具）回答，max_turns=3 控制成本；
   **按需求路由 Skill**（产业链/基本面→Serenity；短线/异动/游资→youzi；五步法→stock_analysis），
@@ -69,7 +70,7 @@ def setup_file_logging() -> None:
         # apscheduler 每 4 秒一条 INFO 会刷爆文件，降到 WARNING
         logging.getLogger("apscheduler").setLevel(logging.WARNING)
         _log_handler_attached = True
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"[feishu_ws] 文件日志初始化失败: {exc}")
 
 MAX_REPORT_LEN = 3800
@@ -78,6 +79,12 @@ CHAT_MIN_INTERVAL = 10.0   # 同一发送者两次 Agent 会话回复的最小�
 _CHAT_MAX_LEN = 2000       # Agent 会话回复最大长度
 
 _GREETING_KEYWORDS = ("在吗", "在不在", "你好", "您好", "hello", "hi", "help", "帮助", "你是谁", "你会什么", "怎么用")
+
+# 意图判定第一级负向词（2026-08-21）：明确非"当前实时报告"意图 → 直接 no，省一次 LLM
+_REPORT_NEG = (
+    "历史", "上周", "上月", "上个月", "去年", "周报", "月报", "年报", "季度报",
+    "回测", "模拟", "新闻", "政策", "财报", "公告", "研报", "复盘总结",
+)
 
 _HELP_TEXT = (
     "在的。可以这样用我：\n"
@@ -88,6 +95,7 @@ _HELP_TEXT = (
 
 _bot_open_id_cache: str = ""
 _last_reply_at: dict[str, float] = {}
+_last_skill_ack = 0.0
 
 
 def _bot_open_id() -> str:
@@ -117,7 +125,7 @@ def _bot_open_id() -> str:
         d = r.json()
         if d.get("code") == 0:
             _bot_open_id_cache = d["bot"]["open_id"]
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("获取机器人 open_id 失败: %s", exc)
     return _bot_open_id_cache
 
@@ -133,7 +141,7 @@ def _extract_text(content: str | None, msg_type: str | None) -> str:
         return ""
     try:
         d = json.loads(content)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return content
     if msg_type == "text":
         return d.get("text", "") if isinstance(d, dict) else ""
@@ -181,14 +189,53 @@ def _is_mentioned(msg) -> bool:
     return False
 
 
-def _is_report_request(text: str, track_job: str | None = None) -> bool:
-    """意图判定：**纯 LLM 语义识别**（2026-08-18 按用户要求去掉关键词触发）。
+def _keyword_report_request(text: str) -> bool | None:
+    """意图判定**第一级：关键词快速判定**（2026-08-21 新增，零 token）。
 
-    - 只认语义：明确要「当前/实时行情报告、盘中异动、今日盘面」才返回 True；
-    - LLM 失败/超时/无 key → False（此时 @ 场景仍会回帮助提示，不会完全静默）；
-    - track_job 非空（非管理员）：LLMClient 带 conn，用量记入 llm_usage(job=track_job)，
+    返回 True=要实时报告 / False=明确不要 / None=未决（交 LLM 兜底）。
+    - 负向词先查（历史/周报/新闻等明确非"当前实时报告"意图 → False，省一次 LLM）；
+    - 正向=「名词(报告/行情/盘面/盘口/异动) + 限定(现在/今天/实时/来一份…)」组合 → True；
+    - 含 6 位股票代码且不含"报告"的文本（如"600519 现在行情怎么样"）→ None 交 LLM，
+      避免把个股查询误判成盘中报告。
+    """
+    import re
+
+    t = (text or "").strip()
+    if not t:
+        return False
+    if any(k in t for k in _REPORT_NEG):
+        return False
+    # 纯"报告"类极短消息（"报告" / "来一份报告"）
+    if len(t) <= 12 and t in ("报告", "来报告", "发报告", "来份报告", "来一份报告", "实时报告"):
+        return True
+    has_noun = any(k in t for k in ("报告", "行情", "盘面", "盘口", "异动"))
+    has_qual = any(k in t for k in ("盘中", "现在", "今天", "当前", "目前", "实时",
+                                    "来一份", "来份", "发我", "发个", "发份", "看看", "怎么样", "如何"))
+    if has_noun and has_qual:
+        has_code = re.search(r"\d{6}", t) is not None
+        if has_code and "报告" not in t:
+            return None  # 个股查询（"600519 现在行情"），交 LLM 语义判断
+        return True
+    return None
+
+
+def _is_report_request(text: str, track_job: str | None = None, keyword: bool = True) -> bool:
+    """意图判定：**两级识别**（2026-08-21 由纯 LLM 改为关键词优先 + LLM 兜底）。
+
+    - 第一级 `_keyword_report_request`：零 token 快速判定，命中即返回（绝大多数
+      "来一份盘中报告/现在行情怎么样" 类请求不再消耗 LLM）；
+    - 未决（None）才走 LLM 语义识别（保留对多样表达的语义能力）；
+    - keyword=False（**私聊 p2p，2026-08-21**）：跳过关键词第一级，始终 LLM 语义判断
+      （私聊对话上下文更随意，避免关键词误判/漏判）；
+    - 负向词/LLM 说 no → False；LLM 失败/超时/无 key → False
+      （此时 @ 场景仍会回帮助提示，不会完全静默）；
+    - track_job 非空（非管理员）：LLM 兜底调用带 conn，用量记入 llm_usage(job=track_job)，
       供每日 token 限额核算。
     """
+    if keyword:
+        kw = _keyword_report_request(text)
+        if kw is not None:
+            return kw
     try:
         from invest.agent.llm import LLMClient
 
@@ -214,7 +261,7 @@ def _is_report_request(text: str, track_job: str | None = None) -> bool:
         finally:
             if conn is not None:
                 conn.close()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("意图判定 LLM 失败: %s", exc)
         return False
 
@@ -238,7 +285,7 @@ def _nonadmin_budget_exceeded() -> bool:
             return (row["t"] or 0) >= limit
         finally:
             conn.close()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
 
@@ -252,7 +299,7 @@ def _build_intraday_report(public: bool = False, brief: bool = True) -> str:
         if len(text) > MAX_REPORT_LEN:
             text = text[:MAX_REPORT_LEN] + "\n…(截断)"
         return text
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return f"[报告生成失败: {type(exc).__name__}: {exc}]"
 
 
@@ -284,17 +331,19 @@ def _agent_chat(text: str, nonadmin: bool = False) -> str:
         if len(out) > _CHAT_MAX_LEN:
             out = out[:_CHAT_MAX_LEN] + "\n…(截断)"
         return out
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Agent 回复失败: %s", exc)
         return f"[Agent 回复失败: {type(exc).__name__}: {exc}]"
 
 
-def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False) -> None:
+def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False,
+                 chat_type: str = "group") -> None:
     """统一回复入口（2026-08-18）：私聊 / 群内 @ 的任意消息。
 
-    分流：语义识别为要实时报告 → 盘中实时报告（非管理员=公开版，不计 Agent token）；
+    分流：识别为要实时报告 → 盘中实时报告（非管理员=公开版，不计 Agent token）；
           问候/求助 → 帮助提示（本地判定，零 token）；
           其他 → 会话 Agent（run_chat）回答。
+    意图识别（2026-08-21）：群聊（group）关键词优先 + LLM 兜底；私聊（p2p）始终 LLM 语义判断。
     非管理员：任何 LLM 调用都计入 job='group'，受 FEISHU_NONADMIN_DAILY_TOKEN_LIMIT（100万/日）约束。
     """
     from invest.push.feishu_push import send_message
@@ -304,7 +353,13 @@ def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False
                      "今日非管理员 token 额度（100万）已用完，请明天再试。")
         return
 
-    want_report = _is_report_request(text, track_job="group" if nonadmin else None)
+    # 2026-08-21：UZI 深度分析请求先系统级 ack（异步跑，约 5-20 分钟，防止长时间静默）
+    if _is_skill_request(text) and _skill_ack_ok():
+        send_message(chat_id, "chat_id",
+                     "⏳ 收到，正在用 UZI 深度分析，约 5-20 分钟（完成后自动发送报告摘要与路径）。")
+
+    want_report = _is_report_request(
+        text, track_job="group" if nonadmin else None, keyword=chat_type != "p2p")
     if want_report:
         if _rate_limited(sender_id):
             logger.info("报告请求限频跳过（30s 内重复）: %s", text[:30])
@@ -336,6 +391,22 @@ def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False
     logger.info("Agent 回复完成 ok=%s len=%d", ok, len(reply))
 
 
+def _is_skill_request(text: str) -> bool:
+    """是否请求 UZI 深度分析（2026-08-21）。"""
+    t = (text or "").lower()
+    return any(k in t for k in ("深度分析", "深度报告", "uzi", "完整报告", "用 skill"))
+
+
+def _skill_ack_ok() -> bool:
+    """UZI ack 限频：60s 内不重复发。"""
+    global _last_skill_ack
+    now = time.time()
+    if now - _last_skill_ack < 60.0:
+        return False
+    _last_skill_ack = now
+    return True
+
+
 def _rate_limited(sender_id: str) -> bool:
     """同一发送者限频：REPLY_MIN_INTERVAL 内不重复回复。"""
     now = time.time()
@@ -363,6 +434,13 @@ def _handle_event(data: P2ImMessageReceiveV1) -> None:
         return
     chat_id = msg.chat_id or ""
     text = _extract_text(msg.content, msg.message_type)
+    # 记录当前会话 id（thread-local），供 run_skill 异步完成回调发回原会话
+    try:
+        from invest.agent.tools import set_current_chat
+
+        set_current_chat(chat_id)
+    except Exception:
+        pass
     # 所有收到的事件都落日志（含非目标群），便于排查"艾特没回应"
     logger.info(
         "收到事件 chat=%s chat_type=%s type=%s mentioned=%s mentions=%r text=%r",
@@ -383,8 +461,10 @@ def _handle_event(data: P2ImMessageReceiveV1) -> None:
     from invest.push.feishu_push import send_message
 
     # ---- 私聊（p2p）：任何消息都回应（非管理员计入每日限额）----
+    # 意图识别：私聊始终走 LLM 语义判断（keyword=False），不用群聊的关键词短路
     if getattr(msg, "chat_type", "") == "p2p":
-        _agent_reply(chat_id, text, sender_id, nonadmin=sender_id != owner_open_id)
+        _agent_reply(chat_id, text, sender_id, nonadmin=sender_id != owner_open_id,
+                     chat_type="p2p")
         return
 
     if chat_id != target_chat:
@@ -417,33 +497,72 @@ def _handle_event(data: P2ImMessageReceiveV1) -> None:
     # 未 @ 的非管理员消息：忽略（不打扰群聊）
 
 
+def _format_skill_result(result: dict) -> str:
+    """run_skill 异步完成结果 → 飞书消息。"""
+    if result.get("ok"):
+        lines = ["✅ UZI 深度分析完成"]
+        summary = (result.get("summary") or "").strip()
+        if summary:
+            lines.append(summary)
+        path = result.get("report_path")
+        if path:
+            lines.append(f"📄 报告路径: {path}")
+        return "\n".join(lines)
+    err = result.get("error") or "未知错误"
+    return f"❌ UZI 深度分析失败：{str(err)[:500]}"
+
+
+def _register_run_skill_sink() -> None:
+    """注册 run_skill 异步完成回调：把结果发回原会话（私聊/群聊均支持）。"""
+    try:
+        from invest.agent.tools import set_run_skill_sink
+        from invest.push.feishu_push import send_message as _send
+
+        def _sink(result: dict, chat_id: str) -> None:
+            if not chat_id:
+                return
+            _send(chat_id, "chat_id", _format_skill_result(result))
+            logger.info("run_skill 异步结果已发送 chat=%s ok=%s", chat_id, result.get("ok"))
+
+        set_run_skill_sink(_sink)
+    except Exception as exc:
+        logger.warning("注册 run_skill sink 失败: %s", exc)
+
+
+def _should_react(msg) -> bool:
+    """是否给消息回 ❤️（2026-08-20：仅当艾特了机器人，或私聊 p2p 才回；普通群聊消息不回）。"""
+    if getattr(msg, "chat_type", "") == "p2p":
+        return True
+    return _is_mentioned(msg)
+
+
 def _handle_event_async(data: P2ImMessageReceiveV1) -> None:
     """包装：事件处理放入守护线程，不阻塞 SDK 的事件循环（报告生成较耗时）。
 
     线程内异常必须落日志（pythonw 无控制台，异常默认不可见——2026-08-18 排查修复）。
     2026-08-18：处理前先给消息加 ❤️ 表情回应（告知已收到；失败静默），需权限 im:message.reaction。
+    2026-08-20：仅艾特机器人/私聊的消息回爱心，普通群聊消息不回。
     """
 
     def _wrapper() -> None:
         try:
             msg = getattr(getattr(data, "event", None), "message", None)
-            if msg is not None and getattr(msg, "message_id", None):
+            if msg is not None and getattr(msg, "message_id", None) and _should_react(msg):
                 try:
                     from invest.push.feishu_push import add_reaction
 
                     add_reaction(msg.message_id, "HEART")
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning("消息表情回应失败: %s", exc)
             _handle_event(data)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("事件处理异常: %s", exc)
+        except Exception:
+            logger.exception("事件处理异常")
 
     threading.Thread(target=_wrapper, daemon=True).start()
 
 
 def _ignore_event(_data) -> None:
     """忽略未订阅业务的事件（如表情回应 created/deleted），避免日志 ERROR 噪音。"""
-    pass
 
 
 def check() -> None:
@@ -497,12 +616,18 @@ def run() -> bool:
         print("[feishu_ws] 未配置 FEISHU_APP_ID / FEISHU_APP_SECRET，退出")
         return False
 
+    # run_skill 异步完成回调（2026-08-21：深度分析不阻塞对话，完成后自动发结果）
+    _register_run_skill_sink()
+
     handler = (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(_handle_event_async)
-        # 未订阅业务的推送事件（表情回应等）静默忽略，避免 "processor not found" ERROR 刷屏
+        # 未订阅业务的推送事件（表情回应 created/deleted）静默忽略，避免 "processor not found" ERROR 刷屏。
+        # 2026-08-21：WS 长连接事件用 v2 信封（p2.xxx 键），须 p1/p2 双注册才兜得住
         .register_p1_customized_event("im.message.reaction.created_v1", _ignore_event)
         .register_p1_customized_event("im.message.reaction.deleted_v1", _ignore_event)
+        .register_p2_customized_event("im.message.reaction.created_v1", _ignore_event)
+        .register_p2_customized_event("im.message.reaction.deleted_v1", _ignore_event)
         .build()
     )
     setup_file_logging()

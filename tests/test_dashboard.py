@@ -30,7 +30,6 @@ def test_queries():
 
 def test_strength_industry_only():
     """回归：行业榜不再混入个股。"""
-    import sqlite3
     from invest.db import connect as db_connect
     df = q.load_strength(DB)
     conn = db_connect(DB)

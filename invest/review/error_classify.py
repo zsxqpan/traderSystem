@@ -40,7 +40,7 @@ def classify(record: dict) -> str:
     """
     note = str(record.get("deviation_note") or "")
     avp = str(record.get("actual_vs_plan") or "")
-    emotion = str(record.get("emotion_note") or "")
+    _emotion_unused = str(record.get("emotion_note") or "")
     pnl = record.get("pnl")
 
     # 数据错误：偏差标注提及数据问题

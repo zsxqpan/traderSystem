@@ -1,5 +1,4 @@
-﻿# -*- coding: utf-8 -*-
-"""真实因子评估：从 industry_bars 构造动量/RS 因子面板并检验有效性。
+﻿"""真实因子评估：从 industry_bars 构造动量/RS 因子面板并检验有效性。
 
 用法: python scripts/eval_factors.py [--horizon 10] [--groups 5]
 """

@@ -1,7 +1,6 @@
 """P0 监控单元测试。用法: python tests/test_monitor.py"""
 from __future__ import annotations
 
-import datetime as dt
 import os
 import sys
 import tempfile
@@ -10,7 +9,12 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from invest.db import connect, init_db
-from invest.monitor import _STATE_FILE, check_data_conflict, check_position_falsify, run_p0_monitor
+from invest.monitor import (
+    _STATE_FILE,
+    check_data_conflict,
+    check_position_falsify,
+    run_p0_monitor,
+)
 
 
 def _tmp_db():

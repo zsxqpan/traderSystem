@@ -72,7 +72,7 @@ def quality_status(
             f"SELECT MAX({date_col}) d FROM {table}"
         ).fetchone()
         latest = str(row["d"]) if row and row["d"] else None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return CONFLICT, {"table": table, "error": str(exc)}
     if latest is None:
         return STALE, {"table": table, "latest": None, "note": "无数据"}
@@ -97,7 +97,7 @@ def quality_status(
         ).fetchone()
         if run and run["status"] == "failed":
             return CONFLICT, {"table": table, "latest": latest, "age_days": age, "note": "最近采集失败"}
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return VALID, {"table": table, "latest": latest, "age_days": age, "max_days": max_days}
 
@@ -127,7 +127,7 @@ def record_provenance(
         (as_of_time, object_id, object_type, reference_id, cycle, data_version, rule_version, note),
     )
     conn.commit()
-    return cur.lastrowid
+    return cur.lastrowid or 0
 
 
 def record_decision(
@@ -147,7 +147,7 @@ def record_decision(
         (decision, symbol, level, industry, reason),
     )
     conn.commit()
-    return cur.lastrowid
+    return cur.lastrowid or 0
 
 
 def list_decisions(conn: sqlite3.Connection, symbol: str = "", limit: int = 50) -> list[dict]:

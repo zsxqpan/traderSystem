@@ -62,12 +62,12 @@ def data_guard(conn: sqlite3.Connection, db_path: str = "") -> list[str]:
         try:
             from invest.config import get_settings
             db_path = get_settings().db_path
-        except Exception:  # noqa: BLE001
+        except Exception:
             db_path = ""
     try:
         from invest.data.realtime import realtime_health
         h = realtime_health(db_path) if db_path else {"ok": False}
-    except Exception:  # noqa: BLE001
+    except Exception:
         h = {"ok": False}
     if not h.get("ok"):
         stale = h.get("stale", 0)
@@ -80,7 +80,7 @@ def data_guard(conn: sqlite3.Connection, db_path: str = "") -> list[str]:
             age = (_dt.date.today() - latest).days
             if age > 7:
                 violations.append(f"日线数据陈旧（最新 {row['d']}，距今 {age} 天）：禁止新开仓")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return violations
 
@@ -107,7 +107,7 @@ def check_position(
         from .costs import is_frozen
         if symbol and is_frozen(conn, symbol):
             violations.append(f"{symbol} 流动性冻结：禁止新开仓（止损无法成交闭环）")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     cap = get_position_limit(conn)
     if total_position + proposed > cap:

@@ -1,7 +1,8 @@
 """数据源适配器注册表。"""
+from invest.config import get_settings
+
 from .akshare_source import AkShareSource
 from .tushare_source import TushareSource
-from invest.config import get_settings
 
 SOURCE_REGISTRY = {
     "akshare": AkShareSource(),

@@ -28,7 +28,7 @@ def _percentile_rows(history: pd.DataFrame, column: str, col_pct: str) -> pd.Dat
             latest = g.tail(1)
         cur = float(latest[column].iloc[0])
         pct = float((g[column] <= cur).mean())
-        rows.append({"industry": ind, **{column: cur}, **{col_pct: round(pct, 4)}})
+        rows.append({"industry": ind, column: cur, col_pct: round(pct, 4)})
     return pd.DataFrame(rows)
 
 

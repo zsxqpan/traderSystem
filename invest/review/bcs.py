@@ -8,7 +8,6 @@
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 
 # 一票否决条件（v3：数据失效即防守 / 纪律硬约束）
@@ -141,7 +140,7 @@ def veto_check(
             violations.append("候选池满（>20）仍开仓")
         if core["c"] > 10:
             violations.append("核心关注超限（>10）仍开仓")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     # 4) 无止损计划
     try:
@@ -150,7 +149,7 @@ def veto_check(
         ).fetchone()["c"]
         if n:
             violations.append(f"存在 {n} 个无止损的 active 计划")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     # 5) 计划外交易
     try:
@@ -161,7 +160,7 @@ def veto_check(
         ).fetchone()["c"]
         if n:
             violations.append(f"存在 {n} 条计划外交易记录")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return {
         "passed": not violations,
@@ -189,7 +188,7 @@ def full_assessment(
         from invest.data.pit import quality_report
         report = quality_report(conn)
         data_quality = all(st == "valid" for st, _ in report.values())
-    except Exception:  # noqa: BLE001
+    except Exception:
         data_quality = False
     # 实时行情健康自动检测
     realtime_ok = True
@@ -197,7 +196,7 @@ def full_assessment(
         from invest.config import get_settings
         from invest.data.realtime import realtime_health
         realtime_ok = realtime_health(get_settings().db_path).get("ok", False)
-    except Exception:  # noqa: BLE001
+    except Exception:
         realtime_ok = False
 
     bcs = bcs_score(
@@ -215,7 +214,7 @@ def full_assessment(
     try:
         from invest.discipline.kill_gate import kill_gate_check
         kill_gate = kill_gate_check(conn=conn)
-    except Exception:  # noqa: BLE001
+    except Exception:
         kill_gate = {"passed": False, "note": "kill-gate 计算失败", "metrics": {}}
     overall = "通过" if (bcs["grade"] in ("A", "B") and vms["grade"] in ("A", "B")
                          and veto["passed"] and (kill_gate is None or kill_gate["passed"])) else "不通过"

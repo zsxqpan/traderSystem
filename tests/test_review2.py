@@ -14,7 +14,7 @@ from invest.review.attribution import (
     build_attributed_records,
     top_losers,
 )
-from invest.review.error_classify import CATEGORIES, classify, error_report
+from invest.review.error_classify import classify, error_report
 from invest.review.yearly import (
     kelly_calibration,
     level_monotonicity,
@@ -33,7 +33,7 @@ def _tmp_db_with_trades():
             pass
     init_db(p)
     conn = connect(p)
-    from invest.discipline import pool, plans, records
+    from invest.discipline import plans, pool, records
     pool.add_to_pool(conn, "X1", level="core")
     pool.add_to_pool(conn, "X2", level="track")
     plan1 = plans.create_plan(conn, "X1", stop_loss=9.0, buy_range="10.0,10.5")

@@ -38,7 +38,7 @@ def hard_gate_check(
         ).fetchone()["c"]
         if n < min_days:
             violations.append(f"{symbol} 上市交易日不足（{n}<{min_days}）")
-    except Exception:  # noqa: BLE001
+    except Exception:
         violations.append(f"{symbol} 无法校验上市时长（无日线数据）")
     # 20 日均成交额
     try:
@@ -53,7 +53,7 @@ def hard_gate_check(
                 violations.append(f"{symbol} 20日均成交额 {adv/1e8:.2f}亿 < 下限 {min_adv/1e8:.2f}亿")
         else:
             violations.append(f"{symbol} 无成交额数据")
-    except Exception:  # noqa: BLE001
+    except Exception:
         violations.append(f"{symbol} 无法校验成交额")
     return violations
 
@@ -82,7 +82,7 @@ def check_and_add(
                 conn, decision="reject", symbol=symbol, level=level,
                 industry=industry, reason="硬门槛否决: " + "; ".join(violations),
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         raise ValueError(f"{symbol} 未通过硬门槛: {'; '.join(violations)}")
     if require_mispricing:
@@ -95,7 +95,7 @@ def check_and_add(
                     conn, decision="reject", symbol=symbol, level=level,
                     industry=industry, reason="错价必要条件否决: " + verdict["reason"],
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             raise ValueError(f"{symbol} 未过错价必要条件: {verdict['reason']}")
     from .pool import add_to_pool

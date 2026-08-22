@@ -50,7 +50,7 @@ def cross_check(
                 "max_rel": float(rel.max()),
             })
     ok = not issues
-    return ok, {"rows": int(len(merged)), "issues": issues}
+    return ok, {"rows": len(merged), "issues": issues}
 
 
 def update_credibility(conn: sqlite3.Connection, source: str, success: bool) -> None:

@@ -42,8 +42,7 @@ def _max_drawdown(pnls: list[float]) -> float:
     mdd = 0.0
     for p in pnls:
         equity += p
-        if equity > peak:
-            peak = equity
+        peak = max(peak, equity)
         if peak > 0:
             mdd = max(mdd, (peak - equity) / peak)
     return mdd

@@ -75,7 +75,7 @@ def test_stress_test():
     assert worst["scenario"].startswith("跌停无法退出-创业板")
     assert worst["stage"] == "halt"
     # 全仓低开 5% -> warn
-    low_open = [s for s in stress if s["scenario"] == "全仓低开5%"][0]
+    low_open = next(s for s in stress if s["scenario"] == "全仓低开5%")
     assert low_open["stage"] == "warn"
     # 空列表
     assert worst_scenario([]) == {}

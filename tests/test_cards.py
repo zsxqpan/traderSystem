@@ -7,10 +7,11 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pandas as pd
+
+from invest.data.storage import upsert_df
 from invest.db import connect, init_db
-from invest.discipline import pool
 from invest.discipline.cards import (
-    CARD_LIMIT,
     compute_rr,
     create_card,
     evict_weakest,
@@ -25,12 +26,8 @@ from invest.discipline.pool_rules import (
     freeze_symbol,
     hard_gate_check,
     is_frozen_symbol,
-    list_l2_industries,
     unfreeze_symbol,
 )
-from invest.data.storage import upsert_df
-
-import pandas as pd
 
 
 def _tmp_db():

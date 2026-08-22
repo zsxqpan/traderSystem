@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 
 import pandas as pd
 import requests
@@ -29,7 +28,7 @@ def _fetch_pool(endpoint: str, date: str) -> dict:
             r = requests.get(host + f"/{endpoint}", params=params, timeout=_TIMEOUT)
             r.raise_for_status()
             return r.json()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_err = f"{host}: {exc}"
     raise RuntimeError(f"{endpoint} 获取失败: {last_err}")
 
@@ -67,11 +66,63 @@ def fetch_emotion(date: str) -> pd.DataFrame:
     try:
         zb = _fetch_pool("getTopicZBPool", date)
         zb_rows = ((zb or {}).get("data") or {}).get("pool") or []
-    except Exception:  # noqa: BLE001  炸板池仅近30天，失败不阻断
+    except Exception:
         zb_rows = None
     if not zt_rows and not zb_rows:
         return pd.DataFrame()
     return build_emotion_df(date, zt_rows, zb_rows)
+
+
+def _to_float(v) -> float | None:
+    import math
+
+    try:
+        f = float(v)
+        return f if not math.isnan(f) else None  # NaN → None
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_limit_up_pool(date: str) -> pd.DataFrame:
+    """涨停+炸板池个股明细（2026-08-20，东财 push2ex，盘中实时）。
+
+    涨停池字段：c代码 / n名称 / lbc连板数 / fbt首封时间 / fund封单额；
+    炸板池同样字段，zhaban=1 标记。两者均为空视为非交易日，返回空 DataFrame。
+    """
+    rows: list[dict] = []
+    try:
+        zt = _fetch_pool("getTopicZTPool", date)
+        for r in (((zt or {}).get("data") or {}).get("pool") or []):
+            rows.append({
+                "date": date,
+                "symbol": str(r.get("c", "")),
+                "name": r.get("n", ""),
+                "lianban": int(r.get("lbc", 0) or 0),
+                "first_seal_time": str(r.get("fbt", "") or ""),
+                "seal_amount": _to_float(r.get("fund")),
+                "zhaban": 0,
+                "src": "eastmoney",
+            })
+    except Exception as exc:
+        raise RuntimeError(f"getTopicZTPool 获取失败: {exc}") from exc
+    try:
+        zb = _fetch_pool("getTopicZBPool", date)
+        for r in (((zb or {}).get("data") or {}).get("pool") or []):
+            rows.append({
+                "date": date,
+                "symbol": str(r.get("c", "")),
+                "name": r.get("n", ""),
+                "lianban": int(r.get("lbc", 0) or 0),
+                "first_seal_time": str(r.get("fbt", "") or ""),
+                "seal_amount": _to_float(r.get("fund")),
+                "zhaban": 1,
+                "src": "eastmoney",
+            })
+    except Exception:
+        pass
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
 
 def today_str() -> str:

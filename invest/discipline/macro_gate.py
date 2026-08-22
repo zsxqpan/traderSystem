@@ -108,7 +108,7 @@ def check_env_retrigger(conn: sqlite3.Connection) -> dict:
         prev_y10 = None
         try:
             from datetime import timedelta
-            week_ago = (dt.date.fromisoformat(y10["date"]) - timedelta(days=7)).isoformat()
+            _week_ago = (dt.date.fromisoformat(y10["date"]) - timedelta(days=7)).isoformat()
             prev_y10 = _prev_macro(conn, "中国国债收益率10年", y10["date"])
         except ValueError:
             prev_y10 = None

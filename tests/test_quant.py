@@ -32,7 +32,7 @@ def _make_closes(n=120, seed=7):
 
 
 def test_strength_ranking():
-    closes, _, returns, bench = _make_closes()
+    closes, _, _returns, bench = _make_closes()
     df = compute_strength(closes, bench)
     assert df["obj"].tolist() == ["A", "B", "C"]
     rs = dict(zip(df["obj"], df["rs"]))
@@ -63,7 +63,7 @@ def test_trend_stage():
 
 
 def test_rotation():
-    closes, amounts, returns, _ = _make_closes()
+    _closes, amounts, returns, _ = _make_closes()
     df = compute_rotation(returns, amounts)
     assert len(df) == 3
     assert set(df.columns) == {"run_date", "industry", "rank", "lead_lag", "turnover_share"}
@@ -75,7 +75,7 @@ def test_rotation():
 
 def test_rotation_nan_rank():
     """回归：最新一期某行业缺数时不应崩溃，缺数行业排名置底。"""
-    closes, amounts, returns, _ = _make_closes()
+    _closes, amounts, returns, _ = _make_closes()
     returns.loc[returns.index[-1], "B"] = np.nan
     df = compute_rotation(returns, amounts)
     assert len(df) == 3
@@ -86,7 +86,7 @@ def test_rotation_nan_rank():
 
 
 def test_temperature():
-    closes, amounts, returns, _ = _make_closes()
+    _closes, amounts, returns, _ = _make_closes()
     df = compute_temperature(returns, amounts)
     assert len(df) == 1
     score = df.iloc[0]["score"]
@@ -192,7 +192,7 @@ def test_macro_liquidity():
 
 def test_temperature_with_emotion():
     from invest.quant.temperature import compute_temperature, temperature_series
-    closes, amounts, returns, _ = _make_closes(n=120, seed=21)
+    _closes, amounts, returns, _ = _make_closes(n=120, seed=21)
     emotion = pd.DataFrame({
         "date": returns.index,
         "limit_up_count": np.concatenate([np.full(60, 30.0), np.linspace(30, 120, 60)]),
@@ -219,7 +219,11 @@ def test_backfill_emotion_tasks():
 
 
 def test_seat_classification_and_stock_capital():
-    from invest.quant.capital import aggregate_fund_types, classify_seat, compute_stock_capital
+    from invest.quant.capital import (
+        aggregate_fund_types,
+        classify_seat,
+        compute_stock_capital,
+    )
     assert classify_seat("机构专用") == "机构"
     assert classify_seat("深股通专用") == "北向"
     assert classify_seat("某某量化营业部") == "量化"

@@ -69,7 +69,7 @@ def test_tools_query():
 
 def test_query_stock_daily_db_and_akshare():
     """2026-08-18：个股日线工具——本地优先，本地缺失按需联网（东财→新浪回退）。"""
-    from invest.agent.tools import query_stock_daily, _stock_daily_cache
+    from invest.agent.tools import _stock_daily_cache, query_stock_daily
 
     p = _tmp_db()
     conn = connect(p)
@@ -99,8 +99,7 @@ def test_query_stock_daily_db_and_akshare():
             "close": [1307.88, 1297.99, 1293.09, 1341.99, 1355.29],
         })
         _stock_daily_cache.clear()
-        with mock.patch("akshare.stock_zh_a_hist", side_effect=ConnectionError("em down")):
-            with mock.patch("akshare.stock_zh_a_daily", return_value=sina_df):
+        with mock.patch("akshare.stock_zh_a_hist", side_effect=ConnectionError("em down")), mock.patch("akshare.stock_zh_a_daily", return_value=sina_df):
                 r3 = query_stock_daily(conn, "000858")
         assert r3["source"] == "akshare"
         assert r3["latest_close"] == 1307.88
@@ -108,6 +107,49 @@ def test_query_stock_daily_db_and_akshare():
     finally:
         conn.close()
     print("test_query_stock_daily_db_and_akshare OK")
+
+
+def test_llm_usage_alerts():
+    """2026-08-20：用量告警——单次调用超 2 万（1h 限频）+ 当日累计超 50 万（每天一次）。"""
+    import pathlib as _pl
+
+    from invest.agent import llm as llm_mod
+    from invest.agent.llm import LLMClient
+
+    p = _tmp_db()
+    conn = connect(p)
+    state_file = os.path.join(tempfile.gettempdir(), "llm_alert_state_test.json")
+    pushed = []
+    try:
+        try:
+            os.remove(state_file)
+        except OSError:
+            pass
+        with mock.patch.object(llm_mod, "ALERT_STATE_FILE", _pl.Path(state_file)), \
+             mock.patch.object(llm_mod, "_push_alert", lambda title, detail: pushed.append(title)):
+            client = LLMClient(conn=conn, settings=type("S", (), {
+                "llm_api_key": "sk-test", "llm_base_url": "x", "llm_model": "m"})())
+            # 单次超 2 万 → 告警；1 小时内再触发 → 限频不重复
+            client._maybe_alert_usage("feishu_chat", 25_000)
+            assert len(pushed) == 1 and "单次" in pushed[0]
+            client._maybe_alert_usage("feishu_chat", 30_000)
+            assert len(pushed) == 1  # 限频
+            # 当日累计超 50 万 → 告警（每天一次）
+            conn.execute(
+                "INSERT INTO llm_usage(date, job, tokens) VALUES(date('now','localtime'), 'research', 500000)"
+            )
+            conn.commit()
+            client._maybe_alert_usage("research", 500)
+            assert len(pushed) == 2 and "当日累计" in pushed[1]
+            client._maybe_alert_usage("research", 500)
+            assert len(pushed) == 2  # 当天不重复
+    finally:
+        conn.close()
+        try:
+            os.remove(state_file)
+        except OSError:
+            pass
+    print("test_llm_usage_alerts OK")
 
 
 def test_chat_system_has_skill_mechanism():
@@ -132,10 +174,10 @@ def test_realtime_health_trading_window_aware():
     assert "非交易时段" in out["note"]
 
     # 交易时段 → 走真实 realtime_health（mock 其返回）
-    with mock.patch("invest.intraday._in_trading_window", return_value=True):
-        with mock.patch("invest.data.realtime.realtime_health",
-                        return_value={"ok": False, "stale": 2, "last_detail": "stale=2"}):
-            out2 = query_realtime_health(None)
+    with mock.patch("invest.intraday._in_trading_window", return_value=True), mock.patch(
+            "invest.data.realtime.realtime_health",
+            return_value={"ok": False, "stale": 2, "last_detail": "stale=2"}):
+        out2 = query_realtime_health(None)
     assert out2["ok"] is False and out2["stale"] == 2
     print("test_realtime_health_trading_window_aware OK")
 
@@ -338,6 +380,7 @@ if __name__ == "__main__":
     test_tickets_flow()
     test_tools_query()
     test_query_stock_daily_db_and_akshare()
+    test_llm_usage_alerts()
     test_chat_system_has_skill_mechanism()
     test_realtime_health_trading_window_aware()
     test_conflict_detection()

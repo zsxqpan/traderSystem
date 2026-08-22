@@ -122,6 +122,48 @@ def test_check_core_moves_default_threshold():
     print("test_check_core_moves_default_threshold OK")
 
 
+def test_send_alerts_attribution_rate_limited():
+    """2026-08-21：LLM 归因与发送同限频——限频窗口内不重复调用 _attribute（防止每 tick 都归因爆 token）。"""
+    from invest import intraday as intr
+
+    p = _tmp_db()
+    intr._attr_limited.clear()
+    calls = {"n": 0}
+    alerts = [{"symbol": "000001", "price": 10.5, "pct": 0.05}]
+    with mock.patch("invest.intraday._in_trading_window", return_value=True), \
+         mock.patch("invest.notifier.Notifier") as m:
+        m.return_value.send_text.return_value = False  # 发送被限频/失败
+        with mock.patch("invest.intraday._attribute", side_effect=lambda *a, **k: calls.__setitem__("n", calls["n"] + 1) or "资金推动"):
+            # 第一次：限频表空 → 归因调用 1 次
+            intr.send_alerts(p, alerts, attribute=True)
+            # 第二次（同标的关键期内）：归因不再调用（发送仍被 Notifier 限频吞掉）
+            intr.send_alerts(p, alerts, attribute=True)
+    assert calls["n"] == 1  # 只归因一次
+    intr._attr_limited.clear()
+    print("test_send_alerts_attribution_rate_limited OK")
+
+
+def test_push_policy_30min():
+    """2026-08-21：单只个股盘中异动 30 分钟最多通知一次（core 原 180s 上调至 1800s，与 track 一致）。"""
+    from invest import intraday as intr
+
+    assert intr._PUSH_POLICY["core"] == ("P0", 1800)    # 30 分钟
+    assert intr._PUSH_POLICY["track"] == ("P1", 1800)   # 30 分钟
+    p = _tmp_db()
+    intr._attr_limited.clear()
+    with mock.patch("invest.intraday._in_trading_window", return_value=True), \
+         mock.patch("invest.notifier.Notifier") as m:
+        m.return_value.send_text.return_value = True
+        with mock.patch("invest.intraday._attribute", return_value="资金推动"):
+            n = intr.send_alerts(p, [{"symbol": "000001", "price": 10.5, "pct": 0.05}])
+    assert n == 1
+    kw = m.return_value.send_text.call_args.kwargs
+    assert kw["min_interval"] == 1800       # 30 分钟限频传给 Notifier
+    assert kw["key"] == "intraday_000001"   # 按标的独立限频
+    intr._attr_limited.clear()
+    print("test_push_policy_30min OK")
+
+
 def test_send_alerts_mocked():
     p = _tmp_db()
     # 交易时段内：000001 为 core -> P0 立即推，附归因
@@ -174,6 +216,7 @@ if __name__ == "__main__":
     test_trading_window()
     test_check_core_moves()
     test_check_core_moves_default_threshold()
+    test_push_policy_30min()
     test_send_alerts_mocked()
     test_send_alerts_off_hours_silent()
     test_send_alerts_priority_filter()

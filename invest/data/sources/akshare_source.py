@@ -180,8 +180,9 @@ class AkShareSource(BaseSource):
             if kind == "industry_valuation":
                 # 非交易日传 date 会返回空导致 JSON 解析失败：
                 # 失败自动回退最近交易日（collector 层已回退，这里双保险）。
-                from invest.data.calendar import latest_trading_day
                 import datetime as _dt
+
+                from invest.data.calendar import latest_trading_day
                 d = task.get("date") or latest_trading_day().strftime("%Y%m%d")
                 try:
                     return ak.stock_industry_pe_ratio_cninfo(
@@ -294,10 +295,10 @@ class AkShareSource(BaseSource):
                             df["date"] = dstr
                             df["symbol"] = sym
                             frames.append(df)
-                        except Exception as exc:  # noqa: BLE001
+                        except Exception as exc:
                             errors.append(f"{sym} {dstr} {flag}: {exc}")
                         time.sleep(0.3)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(f"{sym}: {exc}")
             time.sleep(0.2)
         if not frames:
@@ -323,7 +324,7 @@ class AkShareSource(BaseSource):
                     df = df.copy()
                     df["symbol"] = sym
                     frames.append(df)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(f"{sym}: {exc}")
             time.sleep(0.2)
         if not frames:

@@ -97,8 +97,9 @@ def test_fetch_and_record_cost():
             pass
     init_db(p)
     conn = connect(p)
-    from invest.data.storage import upsert_df
     import pandas as pd
+
+    from invest.data.storage import upsert_df
     upsert_df(conn, "daily_bars", pd.DataFrame([
         {"symbol": "600519", "date": "2026-08-13", "close": 10.0, "amount": 1e8, "src": "akshare"},
         {"symbol": "600519", "date": "2026-08-12", "close": 9.8, "amount": 9e7, "src": "akshare"},
@@ -133,8 +134,8 @@ def test_liquidity_breach_freeze():
             pass
     init_db(p)
     conn = connect(p)
+    from invest.discipline import pool, risk
     from invest.discipline.costs import is_frozen, mark_liquidity_breach
-    from invest.discipline import risk, pool
     pool.add_to_pool(conn, "600519", level="core", reason="测试")
     mark_liquidity_breach(conn, "600519", "跌停无法卖出")
     assert is_frozen(conn, "600519") is True

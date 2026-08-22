@@ -56,7 +56,7 @@ def add_to_pool(
             industry=industry,
             reason="入池" if existing is None else f"更新级别→{level}",
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return {"symbol": symbol, "level": level, "industry": industry}
 
@@ -72,7 +72,7 @@ def remove_from_pool(conn: sqlite3.Connection, symbol: str, note: str = "") -> N
     try:
         from invest.data.pit import record_decision
         record_decision(conn, decision="remove", symbol=symbol, reason=note or "移出候选池")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     if cur.rowcount == 0:
         raise ValueError(f"{symbol} 不在候选池中")

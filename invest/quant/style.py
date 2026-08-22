@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .indicators import get_params
-from .strength import calc_rs, calc_momentum, calc_trend_stage
+from .strength import calc_momentum, calc_rs, calc_trend_stage
 
 # 指数分组（用于风格归类）
 _INDEX_GROUPS = {
@@ -157,8 +157,8 @@ def style_to_text(style_result: dict) -> str:
     if not style:
         return "指数数据不足，无法判断市场风格"
     lines = [
-        f"【市场风格】{style.get('size', '')}；{style.get('growth', '')}；"
-        f"{style.get('beijing', '')}；{style.get('structure', '')}",
+        (f"【市场风格】{style.get('size', '')}；{style.get('growth', '')}；"
+        f"{style.get('beijing', '')}；{style.get('structure', '')}"),
         "【指数强弱榜】",
     ]
     for i, r in enumerate(style.get("ranking", [])[:7], 1):

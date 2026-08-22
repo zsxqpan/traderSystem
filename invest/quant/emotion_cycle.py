@@ -47,8 +47,7 @@ def _judge(d: dict, prev_avg: float | None = None) -> tuple[str, list[str]]:
     t = THRESHOLDS
 
     # 冰点：涨停少 + 连板低 + 炸板高
-    if (lu is not None and lu < t["freeze_limit_up"]) or (zr is not None and zr > t["freeze_zhaban_rate"]):
-        if ml is not None and ml <= t["freeze_max_lianban"]:
+    if ((lu is not None and lu < t["freeze_limit_up"]) or (zr is not None and zr > t["freeze_zhaban_rate"])) and (ml is not None and ml <= t["freeze_max_lianban"]):
             reasons.append(f"涨停{lu:.0f} 连板最高{ml:.0f} 炸板率{zr:.0%}" if lu and zr else "涨停少/炸板高")
             return "冰点", reasons
 
@@ -63,8 +62,7 @@ def _judge(d: dict, prev_avg: float | None = None) -> tuple[str, list[str]]:
             return "退潮", reasons
 
     # 主升：涨停多 + 连板高 + 炸板低
-    if (lu is not None and lu > t["boom_limit_up"]) or (ml is not None and ml >= t["boom_max_lianban"]):
-        if zr is None or zr < t["boom_zhaban_rate"]:
+    if ((lu is not None and lu > t["boom_limit_up"]) or (ml is not None and ml >= t["boom_max_lianban"])) and (zr is None or zr < t["boom_zhaban_rate"]):
             reasons.append(f"涨停{lu:.0f} 连板最高{ml:.0f} 炸板率{zr:.0%}" if lu and zr else "涨停多/连板高")
             return "主升", reasons
 

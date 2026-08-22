@@ -98,6 +98,7 @@ def test_oos_eval_empty():
 def test_oos_eval_correct_path():
     import numpy as np
     import pandas as pd
+
     from invest.data.storage import upsert_df
     p = _tmp_db()
     conn = connect(p)

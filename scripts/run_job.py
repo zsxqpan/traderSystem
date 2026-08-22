@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """单任务执行入口（供操作系统计划任务调用，替代 APScheduler 常驻）。
 
 用法: myenv\\Scripts\\python.exe -u scripts/run_job.py <job_name>
@@ -16,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from invest.scheduler import run_job_once  # noqa: E402
+from invest.scheduler import run_job_once
 
 
 def main() -> int:
@@ -30,7 +29,7 @@ def main() -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         import traceback
 
         traceback.print_exc(file=sys.stderr)

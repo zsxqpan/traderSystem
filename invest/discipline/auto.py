@@ -15,7 +15,6 @@ import sqlite3
 import pandas as pd
 
 from invest.discipline.spread import (
-    ROLE_WEIGHT,
     factor_score,
     industry_pe_spread,
     price_spread,

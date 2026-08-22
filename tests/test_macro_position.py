@@ -49,11 +49,12 @@ def test_macro_rating():
 def test_env_retrigger():
     """环境重评触发条件（[B]8）：ERP 跨分位 / 社融拐点 / 10Y>20bp。"""
     import pandas as pd
+
+    from invest.data.storage import upsert_df
     from invest.discipline.macro_gate import (
         check_env_retrigger,
         env_retrigger_text,
     )
-    from invest.data.storage import upsert_df
     p = _tmp_db()
     conn = connect(p)
     # 全 A PE 分位 0.85（>0.80 变贵 → 触发）
@@ -85,8 +86,9 @@ def test_env_retrigger():
 def test_env_retrigger_no_trigger():
     """无触发：PE 分位 0.5、社融上行、10Y 微动 → 空触发列表。"""
     import pandas as pd
-    from invest.discipline.macro_gate import check_env_retrigger
+
     from invest.data.storage import upsert_df
+    from invest.discipline.macro_gate import check_env_retrigger
     p = _tmp_db()
     conn = connect(p)
     upsert_df(conn, "macro_series", pd.DataFrame([
@@ -185,11 +187,12 @@ def test_single_cap():
 def test_create_plan_from_card():
     p = _tmp_db()
     conn = connect(p)
-    from invest.discipline import pool
-    from invest.discipline.cards import create_card, lock_card
-    from invest.data.storage import upsert_df
     import datetime as dt
+
     import pandas as pd
+
+    from invest.data.storage import upsert_df
+    from invest.discipline.cards import create_card, lock_card
     # 入池 + 建卡 + 锁卡
     rows = [{"symbol": "600519", "date": (dt.date(2026, 1, 1) + dt.timedelta(days=i)).isoformat(),
              "close": 100.0, "amount": 1e9, "src": "akshare"} for i in range(80)]

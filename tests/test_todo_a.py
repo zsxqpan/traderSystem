@@ -17,8 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 
-from invest.db import connect, init_db
 from invest.data.storage import upsert_df
+from invest.db import connect, init_db
 
 
 def _tmp_db(name="invest_todo_a"):
@@ -44,7 +44,11 @@ def _seed_daily(conn, symbol, days=80, adv=1e8, start="2026-01-01"):
 # ---------- [A]2 个股→行业映射 ----------
 
 def test_industry_map_load_and_query():
-    from invest.data.industry_map import industry_of, load_industry_stocks, save_industry_stocks
+    from invest.data.industry_map import (
+        industry_of,
+        load_industry_stocks,
+        save_industry_stocks,
+    )
     p = _tmp_db("industry_map")
     conn = connect(p)
     m = load_industry_stocks()
@@ -69,7 +73,12 @@ def test_industry_map_load_and_query():
 # ---------- [A]3 L3 主题清单 ----------
 
 def test_themes():
-    from invest.data.themes import find_themes, load_themes, theme_by_id, themes_of_stock
+    from invest.data.themes import (
+        find_themes,
+        load_themes,
+        theme_by_id,
+        themes_of_stock,
+    )
     themes = load_themes()
     assert len(themes) >= 10  # 首批 ≥10
     assert len({t["id"] for t in themes}) == len(themes)
@@ -98,7 +107,7 @@ def test_structural_break_truncation():
     values = pd.Series([50.0] * 100 + [20.0] * 100)
     breaks = detect_level_breaks(values, dates, k=3.0, window=30, min_samples=40)
     assert breaks, "应检测到结构断点"
-    kept, kept_dates, info = truncate_at_break(
+    kept, _kept_dates, info = truncate_at_break(
         values, dates, entity="白酒", k=3.0, window=30, min_samples=40
     )
     assert info["truncated"] is True
@@ -146,7 +155,7 @@ def test_industry_pe_spread_with_breaks():
 def test_mispricing_necessary():
     from invest.discipline.spread import discover_eligible, mispricing_necessary
     # 分位低 → 通过
-    ok, reason = mispricing_necessary({"ok": True, "pct_rank": 0.10, "z_score": -1.5})
+    ok, _reason = mispricing_necessary({"ok": True, "pct_rank": 0.10, "z_score": -1.5})
     assert ok is True
     # 分位高 → 拒绝
     ok2, _ = mispricing_necessary({"ok": True, "pct_rank": 0.60, "z_score": 1.0})
@@ -164,8 +173,8 @@ def test_mispricing_necessary():
 
 
 def test_check_and_add_require_mispricing():
-    from invest.discipline.pool_rules import check_and_add
     from invest.data.pit import list_decisions
+    from invest.discipline.pool_rules import check_and_add
     p = _tmp_db("mispricing_pool")
     conn = connect(p)
     _seed_daily(conn, "600519")
@@ -189,8 +198,8 @@ def test_check_and_add_require_mispricing():
 # ---------- [A]6 周期漂移检测 ----------
 
 def test_cycle_drift():
-    from invest.discipline.records import detect_cycle_drift, drift_report
     from invest.discipline import plans
+    from invest.discipline.records import detect_cycle_drift, drift_report
     p = _tmp_db("cycle_drift")
     conn = connect(p)
     conn.execute("INSERT INTO candidate_pool(symbol, level, industry, in_date) VALUES('600519','core','白酒',date('now','localtime'))")
@@ -218,8 +227,8 @@ def test_cycle_drift():
 # ---------- [A]7 复盘 v1 ----------
 
 def test_weekly_card_review_and_monthly_env():
-    from invest.review.weekly import position_card_review, weekly_review
     from invest.review.monthly import environment_quality, monthly_review
+    from invest.review.weekly import position_card_review, weekly_review
     p = _tmp_db("review_a7")
     conn = connect(p)
     _seed_daily(conn, "600519")
@@ -263,7 +272,13 @@ def test_p2_brief():
 
 def test_snapshot_rebuild():
     import json
-    from invest.scan import rebuild_quant, rebuild_ratings, rebuild_snapshot, rebuild_pool
+
+    from invest.scan import (
+        rebuild_pool,
+        rebuild_quant,
+        rebuild_ratings,
+        rebuild_snapshot,
+    )
     snap_dir = os.path.join(tempfile.gettempdir(), "snap_rebuild_test")
     os.makedirs(snap_dir, exist_ok=True)
     for f in os.listdir(snap_dir):
@@ -296,10 +311,13 @@ def test_snapshot_rebuild():
 # ---------- [A]10 历史行业归属/ST 快照 ----------
 
 def test_universe_snapshot():
-    from invest.data.universe import (
-        industry_at, record_universe_snapshot, st_at, universe_at,
-    )
     from invest.data.industry_map import load_industry_stocks
+    from invest.data.universe import (
+        industry_at,
+        record_universe_snapshot,
+        st_at,
+        universe_at,
+    )
     p = _tmp_db("universe")
     conn = connect(p)
     conn.execute("INSERT INTO candidate_pool(symbol, level, industry, in_date) VALUES('600519','core','白酒',date('now','localtime'))")
@@ -323,7 +341,11 @@ def test_universe_snapshot():
 # ---------- [A]11+12 因子与价差自动化 ----------
 
 def test_cycle_mirrors_and_automation():
-    from invest.discipline.auto import CYCLE_MIRRORS, auto_factor_score, run_pool_automation
+    from invest.discipline.auto import (
+        CYCLE_MIRRORS,
+        auto_factor_score,
+        run_pool_automation,
+    )
     assert set(CYCLE_MIRRORS.keys()) == {"波段", "配置", "事件博弈", "趋势"}  # 四套周期镜像
     p = _tmp_db("auto")
     conn = connect(p)
@@ -358,7 +380,11 @@ def test_cycle_mirrors_and_automation():
 # ---------- [A]1 行业 PB 分位 ----------
 
 def test_pb_percentile():
-    from invest.quant.valuation import compute_pb_percentile, compute_pe_percentile, merge_valuation
+    from invest.quant.valuation import (
+        compute_pb_percentile,
+        compute_pe_percentile,
+        merge_valuation,
+    )
     hist = pd.DataFrame([
         {"date": "2026-01-31", "industry": "白酒", "pb": 3.0, "pe": 30.0},
         {"date": "2026-02-28", "industry": "白酒", "pb": 2.5, "pe": 25.0},

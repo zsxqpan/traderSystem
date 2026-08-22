@@ -250,7 +250,7 @@ def _run_one(
                 update_credibility(conn, src_name, True)
                 source_results.append({
                     "source": src_name,
-                    "rows": int(len(df)),
+                    "rows": len(df),
                     "written": int(written),
                 })
                 primary_df = df

@@ -75,7 +75,7 @@ def test_evaluate_grid():
             pass
     init_db(p)
     conn = connect(p)
-    from invest.discipline import pool, plans, records
+    from invest.discipline import plans, pool, records
     pool.add_to_pool(conn, "X1", level="core")
     plan = plans.create_plan(conn, "X1", stop_loss=9.0, buy_range="10.0,10.5")
     pid = plan["plan_id"]

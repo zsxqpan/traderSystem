@@ -77,8 +77,8 @@ def collect(db_path: str, tasks=None) -> list[dict]:
 def quant(db_path: str) -> dict:
     """计算并写入全部定量表，返回行数统计。"""
     from invest.quant.capital import compute_capital
-    from invest.quant.indicators import get_params
     from invest.quant.crowding import compute_crowding
+    from invest.quant.indicators import get_params
     from invest.quant.linkage import compute_linkage
     from invest.quant.macro_liquidity import compute_macro_liquidity
     from invest.quant.rotation import compute_rotation
@@ -146,7 +146,7 @@ def quant(db_path: str) -> dict:
             stock_hist = stock_hist.sort_values(["symbol", "date"])
             fdf, fnames = compute_alpha158(stock_hist, idx)
             stock_results["alpha158"] = {"n_factors": len(fnames), "shape": list(fdf.shape)}
-        except Exception:  # noqa: BLE001
+        except Exception:
             stock_results["alpha158"] = {"n_factors": 0, "error": "alpha158 计算失败"}
     if len(stock_closes.columns) >= 3:
         stock_results["stock_linkage"] = compute_linkage(stock_returns, **get_params("linkage"))
@@ -179,7 +179,7 @@ def quant(db_path: str) -> dict:
             })
         if rows:
             index_results["index_strength_df"] = pd.DataFrame(rows)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("指数风格计算失败", exc_info=True)
 
     results = {
@@ -193,8 +193,8 @@ def quant(db_path: str) -> dict:
         "macro": compute_macro_liquidity(macro),
     }
     from invest.quant.valuation import (
-        compute_pe_percentile,
         compute_pb_percentile,
+        compute_pe_percentile,
         merge_valuation,
     )
     if not results["crowding"].empty and not valuation_hist.empty:
@@ -211,7 +211,7 @@ def quant(db_path: str) -> dict:
             states = state_matrix(results["crowding"], amounts)
             state_map = dict(zip(states["obj"], states["state"]))
             results["crowding"]["crowding_state"] = results["crowding"]["obj"].map(state_map)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("拥挤度状态机计算失败", exc_info=True)
 
     conn = connect(db_path)
@@ -269,7 +269,7 @@ def arbitrate_all(db_path: str) -> int:
         for a, b in pairs:
             try:
                 arbitrate(conn, a, b)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("仲裁 %s/%s 失败: %s", a, b, exc)
         return len(pairs)
     finally:
@@ -332,7 +332,7 @@ def _movers(conn) -> list[dict]:
 def _mover_tag(industry: str, rs_map: dict, trend_map: dict, prev_top: set) -> str:
     """涨幅榜性质标签：趋势强 / 超跌反弹 / 新启动 / 新晋。"""
     tags = []
-    rs5, rs10, rs20 = rs_map.get(industry, (None, None, None))
+    rs5, _rs10, rs20 = rs_map.get(industry, (None, None, None))
     stage = trend_map.get(industry)
     if rs20 is not None and pd.notna(rs20):
         if rs20 > 0:
@@ -418,7 +418,7 @@ def _freshness(conn) -> str:
         except ValueError:
             try:
                 dd = dt.date.fromisoformat(f"{d[:4]}-{d[4:6]}-{d[6:]}")
-            except Exception:  # noqa: BLE001
+            except Exception:
                 return str(d)
         days = (dt.date.today() - dd).days
         return f"{d}({'今日' if days <= 0 else f'滞后{days}天'})"
@@ -527,3 +527,109 @@ def notify_p2_brief(db_path: str, agent_text: str = "") -> bool:
         conn.close()
     from invest.notifier import Notifier
     return Notifier().send_text(msg, key="p2_brief", min_interval=600)
+
+
+# ---------- 收盘快照（2026-08-20 方案3：16:10 实时源直接落当日收盘价） ----------
+
+# 腾讯指数快照代码：index_code -> qt.gtimg.cn 代码
+INDEX_TENCENT_CODES = {
+    "000300": "s_sh000300",  # 沪深300
+    "000001": "s_sh000001",  # 上证指数
+    "000016": "s_sh000016",  # 上证50
+    "000905": "s_sh000905",  # 中证500
+    "000852": "s_sh000852",  # 中证1000
+    "000688": "s_sh000688",  # 科创50
+    "399001": "s_sz399001",  # 深证成指
+    "399006": "s_sz399006",  # 创业板指
+    "899050": "s_bj899050",  # 北证50
+}
+
+
+def _fetch_index_closes(today) -> list[dict]:
+    """腾讯指数快照（GBK，~分割，[2]=代码 [3]=现价）→ index_bars 行。失败返回空列表。"""
+    import urllib.request
+
+    codes = ",".join(INDEX_TENCENT_CODES.values())
+    url = f"https://qt.gtimg.cn/q={codes}"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/",
+        })
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 绕系统代理
+        with opener.open(req, timeout=10) as resp:
+            raw = resp.read().decode("gbk", errors="ignore")
+        rows = []
+        for line in raw.split(";"):
+            line = line.strip()
+            if "=" not in line:
+                continue
+            val = line.split("=", 1)[1].strip().strip('"')
+            parts = val.split("~")
+            if len(parts) < 4:
+                continue
+            try:
+                price = float(parts[3])
+            except (TypeError, ValueError):
+                continue
+            code = parts[2]
+            if code in INDEX_TENCENT_CODES and price > 0:
+                rows.append({"index_code": code, "date": today.isoformat(),
+                             "close": price, "src": "snapshot"})
+        return rows
+    except Exception as exc:
+        logger.warning("指数收盘快照失败: %s", exc)
+        return []
+
+
+def snapshot_close(db_path: str) -> dict:
+    """收盘快照落库（2026-08-20）：交易日 16:10 用实时快照源直接写当日收盘价，
+    不必等 akshare 日线晚间（约 21 点）才发布。
+
+    - 核心池（core/track）个股 → daily_bars（src='snapshot'）；
+    - 指数（腾讯快照）→ index_bars（src='snapshot'）；
+    返回 {stock: 写入数, index: 写入数, skipped?: 原因}。
+    """
+    import datetime as dt
+
+    from invest.data.calendar import is_trading_day
+
+    today = dt.date.today()
+    if not is_trading_day(today):
+        return {"skipped": "非交易日"}
+    from invest.data.storage import upsert_df
+    from invest.intraday import _bare_symbol
+
+    conn = connect(db_path)
+    try:
+        # 1) 核心池个股收盘（实时快照源，15:00 后即当日收盘价）
+        core = [r["symbol"] for r in conn.execute(
+            "SELECT symbol FROM candidate_pool WHERE level IN ('core','track') AND out_date IS NULL"
+        ).fetchall()]
+        stock_rows: list[dict] = []
+        if core:
+            try:
+                from invest.data.realtime import RealtimeQuoter
+
+                with RealtimeQuoter() as q:
+                    quotes = q.fetch(core)
+                for msym, qq in quotes.items():
+                    if qq.price is None:
+                        continue
+                    stock_rows.append({
+                        "symbol": _bare_symbol(msym), "date": today.isoformat(),
+                        "close": float(qq.price), "src": "snapshot",
+                    })
+            except Exception as exc:
+                logger.warning("核心池收盘快照失败: %s", exc)
+        n_stock = len(stock_rows)
+        if stock_rows:
+            upsert_df(conn, "daily_bars", pd.DataFrame(stock_rows))
+
+        # 2) 指数收盘（腾讯快照）
+        idx_rows = _fetch_index_closes(today)
+        n_idx = len(idx_rows)
+        if idx_rows:
+            upsert_df(conn, "index_bars", pd.DataFrame(idx_rows))
+        return {"stock": n_stock, "index": n_idx}
+    finally:
+        conn.close()

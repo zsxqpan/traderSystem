@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -72,7 +71,7 @@ def test_known_factor_values():
     """单标的验证已知因子的数值合理性。"""
     daily = _make_daily(n=120, n_syms=1)
     idx = _make_index(n=120)
-    fdf, names = compute_alpha158(daily, idx)
+    fdf, _names = compute_alpha158(daily, idx)
     # ROC_5：close 的 5 日收益率，应大致在 ±10% 内
     roc = fdf.xs("ROC_5", axis=1, level=0).dropna(how="all")
     if not roc.empty:

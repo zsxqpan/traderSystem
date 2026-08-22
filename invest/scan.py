@@ -15,7 +15,6 @@ import datetime as dt
 import json
 from pathlib import Path
 
-from invest.config import get_settings
 from invest.db import connect
 from invest.notifier import Notifier
 

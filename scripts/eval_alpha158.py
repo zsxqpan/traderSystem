@@ -14,7 +14,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import numpy as np
 import pandas as pd
 
 from invest.db import connect
@@ -68,7 +67,7 @@ def main() -> None:
                     "mono": rep.get("groups", pd.DataFrame()).get("monotonic_hint", "").iloc[-1]
                     if not rep.get("groups", pd.DataFrame()).empty else "",
                 })
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: S112
             continue
     if not results:
         print("无有效因子结果（样本不足或前向收益缺失）")

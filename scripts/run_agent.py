@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from invest.agent.agents import run_research, run_trade
-from invest.agent.arbiter import find_conflicts, arbitrate
+from invest.agent.arbiter import arbitrate, find_conflicts
 from invest.db import connect, init_db
 
 

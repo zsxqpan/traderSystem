@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """微信(个人微信 iLink Bot API)推送通道。
 
 API 契约按 iLink Bot 协议实现（早期参考 Hermes 源码 gateway/platforms/weixin.py
@@ -68,7 +67,7 @@ def migrate_context_tokens() -> None:
         CTX_FILE.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(legacy, CTX_FILE)
         logger.warning("已把微信 context-tokens 从 Hermes 目录迁移到项目本地: %s", CTX_FILE)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("微信 context-tokens 迁移失败: %s", exc)
 
 
@@ -86,7 +85,7 @@ def _load_context_token(to_user_id: str) -> str | None:
         with open(_context_token_path(), "r", encoding="utf-8") as fp:
             ctx = json.load(fp)
         return ctx.get(to_user_id)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -152,6 +151,6 @@ def send_text(text: str, key: str = "", min_interval: float = 0.0,
             return True
         logger.warning("微信推送被拒: %s", data)
         return False
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("微信推送异常: %s", exc)
         return False

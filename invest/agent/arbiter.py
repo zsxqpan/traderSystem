@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import sqlite3
 
-from .llm import LLMClient
 from invest.viewpoints.store import create_viewpoint
+
+from .llm import LLMClient
 
 _BULL = ("看多", "向上", "乐观", "超配", "加仓", "走强", "上行")
 _BEAR = ("看空", "向下", "悲观", "低配", "减仓", "走弱", "下行")

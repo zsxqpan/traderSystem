@@ -2,8 +2,10 @@
 用法: python scripts/probe_realtime_sources.py [--symbols 600519,000001] [--rounds 5] [--no-proxy]
 """
 from __future__ import annotations
+
 import argparse
 import time
+
 import requests
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -47,7 +49,7 @@ def probe(name: str, url: str, headers: dict, parse, no_proxy: bool) -> tuple[bo
         r.encoding = "gbk"
         ok, note = parse(r.text)
         return ok, el, f"{len(r.content)}B {note}"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return False, (time.time() - t0) * 1000, f"{type(exc).__name__}: {exc}"
 
 
@@ -81,7 +83,7 @@ def main() -> None:
                 return False, "no diff"
             items = diff if isinstance(diff, list) else list(diff.values())
             return len(items) > 0, f"n={len(items)}"
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return False, f"json: {exc}"
 
     targets = {

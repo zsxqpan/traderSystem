@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """启动常驻调度服务。用法: myenv\\Scripts\\python.exe scripts/run_service.py
 
 单实例互斥（2026-08-17 修复 v2）：
@@ -20,8 +19,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from invest.config import get_settings  # noqa: E402
-from invest.scheduler import build_scheduler, log_service_started  # noqa: E402
+from invest.config import get_settings
+from invest.scheduler import build_scheduler, log_service_started
 
 LOCK_FILE = ROOT / "data" / "service.lock"
 
@@ -31,7 +30,7 @@ def acquire_singleton_lock() -> None:
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not LOCK_FILE.exists():
         LOCK_FILE.write_text("", encoding="utf-8")  # 仅首次创建，不覆盖已有内容
-    fd = open(LOCK_FILE, "a+")  # 追加模式：绝不截断已有锁内容
+    fd = open(LOCK_FILE, "a+")  # noqa: SIM115 —— 追加模式：绝不截断已有锁内容（fd 需保持打开持锁）
     try:
         msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
@@ -49,7 +48,7 @@ def _crash_log(exc_text: str) -> None:
         try:
             with open(p, "a", encoding="utf-8") as f:
                 f.write(f"\n===== {ts} 服务异常退出 =====\n{exc_text}\n")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
 
@@ -60,7 +59,7 @@ def _feishu_ws_worker() -> None:
     while True:
         try:
             started = feishu_ws.run()  # 阻塞；False=未配置
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             _crash_log(f"feishu_ws 异常退出: {exc}\n{traceback.format_exc()}")
             print(f"[service] feishu_ws 异常退出: {exc}，30s 后重启")
             time.sleep(30)
@@ -105,7 +104,7 @@ def main() -> None:
             time.sleep(3600)
     except KeyboardInterrupt:
         sched.shutdown(wait=False)
-    except Exception:  # noqa: BLE001
+    except Exception:
         # 主循环异常：落盘 traceback 后重抛，便于定位（2026-08-18 加固）
         _crash_log(traceback.format_exc())
         sched.shutdown(wait=False)

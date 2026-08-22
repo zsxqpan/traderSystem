@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import functools
 import sqlite3
+import threading
 import time
 
 from invest.agent import tickets as ticket_mod
@@ -92,7 +93,7 @@ def query_stock_daily(conn: sqlite3.Connection, symbol: str, days: int = 60) -> 
                                      start_date=start, end_date=end, adjust="qfq")
             if _df is not None and not _df.empty and "收盘" in _df.columns:
                 df = _df
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             em_exc = exc
         if df is None:
             try:
@@ -103,10 +104,10 @@ def query_stock_daily(conn: sqlite3.Connection, symbol: str, days: int = 60) -> 
                     _dates = _df["date"].astype(str).str[:10].str.replace("-", "")
                     _df = _df[_dates >= start]
                     df = _df
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 sina_exc = exc
         if df is None or df.empty:
-            err = f"未查到日线数据（代码可能错误或新股）"
+            err = "未查到日线数据（代码可能错误或新股）"
             if em_exc or sina_exc:
                 err += f"；东财: {type(em_exc).__name__ if em_exc else '-'}；新浪: {type(sina_exc).__name__ if sina_exc else '-'}"
             out = {"symbol": sym, "source": "akshare", "error": err}
@@ -119,7 +120,7 @@ def query_stock_daily(conn: sqlite3.Connection, symbol: str, days: int = 60) -> 
             out = _daily_stats(sym, "akshare", rows2)
         _stock_daily_cache[sym] = (now, out)
         return out
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return {"symbol": sym, "source": "akshare", "error": f"日线获取失败: {type(exc).__name__}: {exc}"}
 
 
@@ -203,6 +204,106 @@ def query_realtime_health(conn) -> dict:
     return realtime_health(get_settings().db_path)
 
 
+def query_data_freshness(conn) -> dict:
+    """数据新鲜度总览（2026-08-20）：daily_bars/index_bars/quant 最新时点 vs 最近交易日。
+
+    回复涉及具体行情/板块/个股数据前先调用：fresh=False 时数据滞后，
+    应说明"数据截至 XX"再回答，不要假装是当天最新。
+    """
+    import datetime as dt
+
+    from invest.data.calendar import latest_trading_day
+
+    exp = latest_trading_day(dt.date.today()).isoformat()
+    latest_bars = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()[0] or ""
+    latest_idx = conn.execute("SELECT MAX(date) FROM index_bars").fetchone()[0] or ""
+    latest_q = conn.execute("SELECT MAX(run_date) FROM quant_strength").fetchone()[0] or ""
+    stale = [k for k, v in (("daily_bars", latest_bars), ("index_bars", latest_idx), ("quant", latest_q)) if v < exp]
+    latest_all = max(latest_bars, latest_idx, latest_q) or "无"
+    return {
+        "expected_trading_day": exp,
+        "daily_bars_latest": latest_bars or "无",
+        "index_bars_latest": latest_idx or "无",
+        "quant_latest": latest_q or "无",
+        "fresh": not stale,
+        "stale_parts": stale,
+        "note": "数据已是最新" if not stale
+                else f"数据滞后：{','.join(stale)}（最新到 {latest_all}）；当日日线/板块数据源通常晚间才发布",
+    }
+
+
+def web_search(query: str, n: int = 5) -> list[dict] | dict:
+    """联网搜索（2026-08-21）：必应检索最新资讯/财报/新闻。返回 [{title,url,snippet}]。"""
+    from invest.agent.web_tools import web_search as _ws
+
+    return _ws(query, n=n)
+
+
+def web_fetch(url: str) -> dict:
+    """抓取网页正文（2026-08-21）。返回 {url, text}。"""
+    from invest.agent.web_tools import web_fetch as _wf
+
+    return _wf(url)
+
+
+def run_skill(symbol: str, depth: str = "lite") -> dict:
+    """跑 UZI 深度分析流水线（2026-08-21）：多维数据→LLM 多轮→HTML 报告。
+    返回 {ok, report_path, summary}；depth: lite(快)/medium/deep。
+
+    2026-08-21 异步化：注册了 run_skill sink（飞书场景）时，改为后台线程执行，
+    立即返回"已启动"提示（不阻塞对话线程），完成后由 sink 把结果发回原会话；
+    未注册 sink（脚本/测试）时保持同步原逻辑。
+    """
+    if _run_skill_sink is None:
+        from invest.agent.skill_runner import run_skill as _rs
+
+        return _rs(symbol, depth=depth)
+    # 异步：后台线程执行，完成后回调 sink(结果, chat_id)
+    import threading
+
+    chat_id = getattr(_thread_chat, "chat_id", "")
+    depth = depth if depth in ("lite", "medium", "deep") else "lite"
+    est = {"lite": "约5-10分钟", "medium": "约10-15分钟", "deep": "约15-20分钟"}[depth]
+
+    def _worker() -> None:
+        from invest.agent.skill_runner import run_skill as _rs
+
+        try:
+            result = _rs(symbol, depth=depth)
+        except Exception as exc:
+            result = {"ok": False, "error": f"深度分析异常: {type(exc).__name__}: {exc}"}
+        try:
+            _run_skill_sink(result, chat_id)
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).warning("run_skill 结果回调失败: %s", exc)
+
+    threading.Thread(target=_worker, daemon=True, name="run-skill").start()
+    return {
+        "ok": True,
+        "async": True,
+        "note": f"深度分析已启动（{depth} 档，{est}），完成后会自动把报告摘要与路径发给你。",
+    }
+
+
+# ---- run_skill 异步 sink（飞书场景注册，见 invest/push/feishu_ws.py） ----
+
+_run_skill_sink = None  # callable(result: dict, chat_id: str) -> None
+_thread_chat = threading.local()
+
+
+def set_run_skill_sink(fn) -> None:
+    """注册 run_skill 异步完成回调（feishu_ws 启动时调用）。fn(result, chat_id)。"""
+    global _run_skill_sink
+    _run_skill_sink = fn
+
+
+def set_current_chat(chat_id: str) -> None:
+    """记录当前处理消息的会话 id（feishu_ws 事件线程内调用，thread-local）。"""
+    _thread_chat.chat_id = chat_id
+
+
 def cross_validate(conn, obj: str, obj_type: str = "industry") -> dict:
     """多源交叉验证（A-Stock-Skills 多源校验思想，2026-08-16）。
 
@@ -226,7 +327,7 @@ def cross_validate(conn, obj: str, obj_type: str = "industry") -> dict:
                 (obj, obj),
             )
             out["strength"] = rows[0] if rows else None
-        except Exception:  # noqa: BLE001
+        except Exception:
             out["strength"] = None
         try:
             rows = _query(
@@ -238,7 +339,7 @@ def cross_validate(conn, obj: str, obj_type: str = "industry") -> dict:
                 (obj, obj),
             )
             out["capital"] = rows[0] if rows else None
-        except Exception:  # noqa: BLE001
+        except Exception:
             out["capital"] = None
         # 个股→行业（手工映射）→ 行业维度放进 industry 子键，不覆盖个股维度
         try:
@@ -246,7 +347,7 @@ def cross_validate(conn, obj: str, obj_type: str = "industry") -> dict:
             ind = industry_of(conn, obj)
             if ind:
                 out["industry"] = {"name": ind, **_industry_dimensions(conn, ind)}
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     else:
         out.update(_industry_dimensions(conn, obj))
@@ -267,7 +368,7 @@ def _industry_dimensions(conn, industry: str) -> dict:
             (industry,),
         )
         res["strength"] = rows[0] if rows else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         res["strength"] = None
     try:
         rows = _query(
@@ -279,7 +380,7 @@ def _industry_dimensions(conn, industry: str) -> dict:
             (industry, industry),
         )
         res["capital"] = rows[0] if rows else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         res["capital"] = None
     try:
         rows = _query(
@@ -290,7 +391,7 @@ def _industry_dimensions(conn, industry: str) -> dict:
             (industry, industry),
         )
         res["linkage"] = rows
-    except Exception:  # noqa: BLE001
+    except Exception:
         res["linkage"] = []
     try:
         rows = _query(
@@ -301,7 +402,7 @@ def _industry_dimensions(conn, industry: str) -> dict:
             (industry, industry),
         )
         res["valuation"] = rows[0] if rows else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         res["valuation"] = None
     return res
 
@@ -336,6 +437,10 @@ TOOL_SCHEMAS = [
     {"type": "function", "function": {"name": "request_attribution", "description": "交易→投研：归因请求单", "parameters": {"type": "object", "properties": {"obj": {"type": "string"}, "reason": {"type": "string"}}, "required": ["obj", "reason"]}}},
     {"type": "function", "function": {"name": "cross_validate", "description": "多源交叉验证：对某行业或个股汇总四维度最新信号（强度RS/趋势 / 资金风格 / 高相关联动 / 估值PE/PB分位与拥挤度），用于确认方向是否多维度共振", "parameters": {"type": "object", "properties": {"obj": {"type": "string"}, "obj_type": {"type": "string", "enum": ["industry", "stock"], "description": "默认 industry"}}, "required": ["obj"]}}},
     {"type": "function", "function": {"name": "query_stock_daily", "description": "查询任意个股日线数据（最近收盘价/1/5/20日涨跌幅/窗口内高低/最近5条K线）。本地无该股数据时会按需联网拉取（akshare 东财→新浪）。周期决定 days：短线/游资视角=60；中线=250；长线=500。分析个股时优先用这个工具拿收盘数据，再配 cross_validate 看多维度", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "6位股票代码，如 600519"}, "days": {"type": "integer", "description": "交易日数：短线60/中线250/长线500，默认60"}}, "required": ["symbol"]}}},
+    {"type": "function", "function": {"name": "query_data_freshness", "description": "数据新鲜度总览：daily_bars/index_bars/quant 最新时点 vs 最近交易日。回答涉及具体行情/板块/个股数据的问题前必须先调用；fresh=false 时说明数据截至时间再回答", "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {"name": "web_search", "description": "联网搜索（必应）：查最新资讯/财报/公告/新闻/政策。系统本地数据查不到的最新信息用这个", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "搜索关键词"}, "n": {"type": "integer", "description": "结果条数，默认5"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "web_fetch", "description": "抓取指定网页正文（用于看搜索到的链接详情）", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
+    {"type": "function", "function": {"name": "run_skill", "description": "跑 UZI 深度分析流水线（多维数据→LLM 多轮→HTML 报告）。用户要求'深度分析/完整报告/UZI'时用；depth=lite 快（约1分钟）", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "6位股票代码或名称"}, "depth": {"type": "string", "enum": ["lite", "medium", "deep"]}}, "required": ["symbol"]}}},
 ]
 
 _IMPLEMENTATIONS = {
@@ -352,6 +457,10 @@ _IMPLEMENTATIONS = {
     "query_realtime_health": query_realtime_health,
     "cross_validate": cross_validate,
     "query_stock_daily": query_stock_daily,
+    "query_data_freshness": query_data_freshness,
+    "web_search": web_search,
+    "web_fetch": web_fetch,
+    "run_skill": run_skill,
 }
 
 
@@ -360,7 +469,12 @@ def build_dispatch(conn: sqlite3.Connection, source: str = "research") -> dict:
 
     LLM 即使传 source 参数也会被覆盖，避免观点来源绕过仲裁与准确率统计。
     """
-    out = {name: functools.partial(fn, conn) for name, fn in _IMPLEMENTATIONS.items()}
+    # 非 DB 工具（联网/技能）第一个参数不是 conn，不能 partial(conn)
+    no_conn = {"web_search", "web_fetch", "run_skill"}
+    out = {
+        name: (functools.partial(fn, conn) if name not in no_conn else fn)
+        for name, fn in _IMPLEMENTATIONS.items()
+    }
 
     def _write(**kwargs):
         kwargs.pop("source", None)

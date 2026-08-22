@@ -1,13 +1,11 @@
 """FastAPI 应用：读接口复用仪表盘查询层，写接口复用执行纪律模块。"""
 from __future__ import annotations
 
-from typing import Optional
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from invest.config import get_settings
-from invest.db import connect, init_db
+from invest.db import connect
 
 
 class PoolBody(BaseModel):
@@ -25,8 +23,8 @@ class RatingBody(BaseModel):
 
 class PlanBody(BaseModel):
     symbol: str
-    stop_loss: Optional[float] = None
-    target_position: Optional[float] = None
+    stop_loss: float | None = None
+    target_position: float | None = None
     buy_range: str = ""
     take_profit: str = ""
 

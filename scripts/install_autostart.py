@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import winreg
 from pathlib import Path
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """feishu_ws 网关行为回归（2026-08-18 加固：@提及识别/双保险意图/ack/限频/权限提示）。
 
 全部走 mock，不发真实消息、不连真实网络。
@@ -52,7 +51,7 @@ def _event(sender_id: str, text: str, mentions=(), sender_type="user", chat_type
     )
 
 
-# ---------- 意图判定：关键词规则 + LLM 双保险 ----------
+# ---------- 意图判定：关键词快速判定 + LLM 兜底（2026-08-21 两级） ----------
 
 def _patch_llm(monkeypatch, answer="no", exc: Exception | None = None):
     class FakeLLM:
@@ -67,8 +66,26 @@ def _patch_llm(monkeypatch, answer="no", exc: Exception | None = None):
     monkeypatch.setattr("invest.agent.llm.LLMClient", FakeLLM)
 
 
-def test_intent_keyword_goes_to_llm(monkeypatch):
-    """2026-08-18：去掉关键词触发——含关键词也必须走 LLM 语义判定。"""
+def test_intent_keyword_shortcuts_llm(monkeypatch):
+    """2026-08-21：关键词快速判定优先——命中直接短路，零 LLM 调用（原 08-18 纯语义决策回退）。"""
+    called = {"n": 0}
+
+    class FakeLLM:
+        def __init__(self, *a, **k):
+            called["n"] += 1
+
+        def run(self, **k):
+            return "no"
+
+    monkeypatch.setattr("invest.agent.llm.LLMClient", FakeLLM)
+    assert feishu_ws._is_report_request("来一份盘中报告") is True
+    assert feishu_ws._is_report_request("现在行情怎么样") is True
+    assert feishu_ws._is_report_request("盘中报告") is True
+    assert called["n"] == 0  # 关键词命中不调 LLM
+
+
+def test_intent_negative_keyword_skips_llm(monkeypatch):
+    """负向词（历史/周报/新闻等明确非"当前实时报告"）→ 直接 False，零 LLM。"""
     called = {"n": 0}
 
     class FakeLLM:
@@ -79,24 +96,39 @@ def test_intent_keyword_goes_to_llm(monkeypatch):
             return "yes"
 
     monkeypatch.setattr("invest.agent.llm.LLMClient", FakeLLM)
-    assert feishu_ws._is_report_request("来一份盘中报告") is True
-    assert called["n"] == 1  # 关键词不再直接短路，LLM 被调用
-    # LLM 说 no → 即使含关键词也不触发
+    assert feishu_ws._is_report_request("上周行情怎么样") is False
+    assert feishu_ws._is_report_request("来一份周报") is False
+    assert feishu_ws._is_report_request("今天有什么政策新闻") is False
+    assert called["n"] == 0
+
+
+def test_intent_stock_code_goes_to_llm(monkeypatch):
+    """含 6 位代码且无"报告"的个股查询（600519 现在行情）→ 不误判为报告，交 LLM。"""
     _patch_llm(monkeypatch, answer="no")
-    assert feishu_ws._is_report_request("盘中报告") is False
+    assert feishu_ws._is_report_request("600519 现在行情怎么样") is False
+    _patch_llm(monkeypatch, answer="yes")
+    assert feishu_ws._is_report_request("600519 现在行情怎么样") is True
+
+
+def test_intent_unresolved_goes_to_llm(monkeypatch):
+    """未决消息（关键词未命中）→ LLM 语义判定。"""
+    _patch_llm(monkeypatch, answer="no")
+    assert feishu_ws._is_report_request("晚上一起吃个饭") is False
+    _patch_llm(monkeypatch, answer="yes")
+    assert feishu_ws._is_report_request("看看今天市场怎么样") is True
 
 
 def test_intent_llm_no(monkeypatch):
-    """LLM 语义说 no → 不触发（无关键词兜底）。"""
+    """LLM 语义说 no → 不触发（未决消息）。"""
     _patch_llm(monkeypatch, answer="no")
     assert feishu_ws._is_report_request("晚上一起吃个饭") is False
 
 
 def test_intent_llm_failure_returns_false(monkeypatch):
-    """LLM 抛异常 → 返回 False（不再回落关键词，纯语义）。"""
+    """LLM 抛异常 → 未决消息返回 False；关键词命中的仍直接 True，不依赖 LLM。"""
     _patch_llm(monkeypatch, exc=RuntimeError("timeout"))
-    assert feishu_ws._is_report_request("盘面怎么样") is False
     assert feishu_ws._is_report_request("随便聊聊") is False
+    assert feishu_ws._is_report_request("盘面怎么样") is True
 
 
 # ---------- @ 提及识别 ----------
@@ -170,7 +202,7 @@ def test_owner_mentioned_agent_chat(monkeypatch):
 
 
 def test_owner_semantic_without_mention(monkeypatch):
-    """管理员不 @：语义识别为报告请求 → 触发报告；语义非报告 → 不回复。"""
+    """管理员不 @：识别为报告请求 → 触发报告；未决消息 LLM 说 no → 不回复。"""
     sent = []
     monkeypatch.setattr("invest.push.feishu_push.send_message",
         lambda cid, ctype, text: sent.append(text) or True,
@@ -181,7 +213,7 @@ def test_owner_semantic_without_mention(monkeypatch):
     assert len(sent) == 2
     sent.clear()
     _patch_llm(monkeypatch, answer="no")
-    feishu_ws._handle_event(_event("ou_owner", "盘中报告"))  # 含关键词但语义 no → 不触发
+    feishu_ws._handle_event(_event("ou_owner", "今天半导体怎么样"))  # 未决 → LLM no → 不触发
     assert sent == []
 
 
@@ -285,6 +317,14 @@ def test_agent_chat_skill_self_annotated(monkeypatch):
     assert sent and "已使用 Skill：youzi" in sent[0]
 
 
+def test_should_react_only_mention_or_dm():
+    """2026-08-20：只有艾特机器人的群消息/私聊才回 ❤️，普通群消息不回。"""
+    assert feishu_ws._should_react(_msg("hi", mentions=["ou_bot"])) is True     # 群内艾特
+    assert feishu_ws._should_react(_msg("hi", mentions=[])) is False            # 群内未艾特
+    assert feishu_ws._should_react(_msg("hi", mentions=["ou_other"])) is False  # 艾特别人
+    assert feishu_ws._should_react(_msg("hi", chat_type="p2p")) is True         # 私聊
+
+
 def test_dm_owner_report(monkeypatch):
     """私聊：管理员要报告 → 完整报告（含持仓警戒）。"""
     sent = []
@@ -324,3 +364,40 @@ def test_dm_non_owner_public_report(monkeypatch):
     feishu_ws._handle_event(_event("ou_other", "来一份盘中报告", chat_type="p2p"))
     assert calls["public"] is True
     assert "【公开版】" in sent[1]
+
+
+# ---------- 2026-08-21：关键词仅用于群聊，私聊始终 LLM 语义判定 ----------
+
+def test_is_report_request_keyword_flag(monkeypatch):
+    """keyword=False（私聊）跳过关键词短路，始终 LLM 语义判定；群聊默认仍关键词优先。"""
+    _patch_llm(monkeypatch, answer="no")
+    assert feishu_ws._is_report_request("来一份盘中报告") is True       # 群聊默认：关键词短路
+    assert feishu_ws._is_report_request("来一份盘中报告", keyword=False) is False  # 私聊：LLM no
+    _patch_llm(monkeypatch, answer="yes")
+    assert feishu_ws._is_report_request("来一份盘中报告", keyword=False) is True   # 私聊：LLM yes
+
+
+def test_group_mention_report_keyword_shortcut(monkeypatch):
+    """群内@：关键词命中直接触发报告，即使 LLM 说 no（零 token）。"""
+    sent = []
+    monkeypatch.setattr("invest.push.feishu_push.send_message",
+        lambda cid, ctype, text: sent.append(text) or True,
+    )
+    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: "R")
+    _patch_llm(monkeypatch, answer="no")
+    feishu_ws._handle_event(_event("ou_owner", "来一份盘中报告", mentions=["ou_bot"]))
+    assert len(sent) == 2 and "R" in sent[1]
+
+
+def test_dm_report_needs_llm_yes(monkeypatch):
+    """私聊：含关键词但 LLM 说 no → 不触发报告，交会话 Agent（不走关键词短路）。"""
+    sent = []
+    monkeypatch.setattr("invest.push.feishu_push.send_message",
+        lambda cid, ctype, text: sent.append(text) or True,
+    )
+    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: "R")
+    monkeypatch.setattr("invest.agent.agents.run_chat",
+        lambda conn, text, job="feishu_chat", skill="": "（会话回答，不触发报告）")
+    _patch_llm(monkeypatch, answer="no")
+    feishu_ws._handle_event(_event("ou_owner", "来一份盘中报告", chat_type="p2p"))
+    assert len(sent) == 1 and "R" not in sent[0]  # 只发会话回答，不发报告

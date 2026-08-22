@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """MCP stdio 握手冒烟测试：启动三个 server，走 initialize + tools/list JSON-RPC。
 
 不依赖 mcp 库（纯 stdlib），可用 myenv 的 pytest 直接跑。

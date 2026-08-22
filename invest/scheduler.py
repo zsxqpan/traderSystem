@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -31,7 +32,7 @@ def _log_run(conn, job: str, status: str, detail: str = "") -> None:
         )
 
 
-def _wrap(job_name: str, fn) -> callable:
+def _wrap(job_name: str, fn) -> Callable:
     def run() -> None:
         db = str(ROOT / "data" / "invest.db")
         conn = None
@@ -42,13 +43,13 @@ def _wrap(job_name: str, fn) -> callable:
             result = fn(db, conn)
             detail = str(result) if result else ""
             _log_run(conn, job_name, "ok", detail)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("%s 失败", job_name)
             if conn is not None:
                 _log_run(conn, job_name, "failed", str(exc))
             try:
                 Notifier().send_text(f"任务 {job_name} 失败: {exc}", key=job_name)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning("失败告警推送异常: %s", exc)
         finally:
             if conn is not None:
@@ -72,14 +73,14 @@ def log_service_started() -> None:
                         detail += " | webhook=http200"
                         break
                     last_err = f"http{r.status_code}"
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     last_err = f"{type(exc).__name__}"
                     time.sleep(3)
             else:
                 detail += f" | webhook=unreachable({last_err})"
         else:
             detail += " | webhook=not_configured"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         detail += f" | webhook=check_failed({type(exc).__name__})"
     try:
         init_db(db)
@@ -88,7 +89,7 @@ def log_service_started() -> None:
             _log_run(conn, "scheduler", "running", detail)
         finally:
             conn.close()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("服务启动日志写入失败")
 
 
@@ -106,7 +107,7 @@ def _premarket(db: str, conn) -> None:
             Notifier().send_text(text, key="env_retrigger", min_interval=43200)
         else:
             _log_run(conn, "env_retrigger", "ok", "无触发")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("环境重评检查失败: %s", exc)
     text = pl.agent_premarket(db)
     pl.notify_premarket(db, text)
@@ -126,7 +127,7 @@ def _after_close(db: str, conn) -> None:
     try:
         pl.agent_after_close(db)
         pl.arbitrate_all(db)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("盘后 Agent 复盘/仲裁失败: %s", exc)
     # 收盘扫描：因子快照 + 变化检测 + P1 推送（新入池/等级/评级变化）
     try:
@@ -134,7 +135,7 @@ def _after_close(db: str, conn) -> None:
         changes = run_scan_and_notify(db)
         if changes:
             _log_run(conn, "scan", "ok", f"P1 变化 {len(changes)} 条")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("收盘扫描失败: %s", exc)
     # 历史行业归属/ST 状态快照（[A]10）：每日收盘落库，供历史时点回溯
     try:
@@ -142,7 +143,7 @@ def _after_close(db: str, conn) -> None:
         n_uni = record_universe_snapshot(conn)
         if n_uni:
             _log_run(conn, "universe", "ok", f"快照 {n_uni} 个标的")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("历史快照失败: %s", exc)
 
 
@@ -192,6 +193,40 @@ def _yearly(db: str, conn) -> None:
     Notifier().send_text(f"年度复盘已生成: {len(content['backtest_summary'])} 组回测结论待检视", key="yearly")
 
 
+_last_pool_fetch = 0.0
+_POOL_FETCH_INTERVAL = 300.0  # 涨停池/板块资金盘中每 5 分钟拉一次落库（10s ticker 内节流）
+
+
+def _tick_collect_pools(db: str) -> None:
+    """盘中顺带拉取涨停池个股明细 + 行业板块主力资金落库（2026-08-20）。
+
+    每 5 分钟一次（由 _last_pool_fetch 节流）；失败只留痕不抛错（ticker 继续）。
+    """
+    global _last_pool_fetch
+    now = time.time()
+    if now - _last_pool_fetch < _POOL_FETCH_INTERVAL:
+        return
+    _last_pool_fetch = now
+    conn = None
+    try:
+        from invest.data.emotion import fetch_limit_up_pool, today_str
+        from invest.data.fund_flow import fetch_sector_fund_flow
+        from invest.data.storage import upsert_df
+
+        conn = connect(db)
+        lup = fetch_limit_up_pool(today_str())
+        n1 = upsert_df(conn, "limit_up_pool", lup) if not lup.empty else 0
+        sff = fetch_sector_fund_flow()
+        n2 = upsert_df(conn, "sector_fund_flow", sff) if not sff.empty else 0
+        if n1 or n2:
+            _log_run(conn, "pool_snapshot", "ok", f"涨停池 {n1} | 板块资金 {n2}")
+    except Exception as exc:
+        logger.warning("涨停池/板块资金采集失败: %s", exc)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _intraday_tick_job() -> None:
     """盘中 10 秒轮询 job 入口（无参，适配 APScheduler；2026-08-18 由 4s 降频到 10s）。
 
@@ -204,19 +239,24 @@ def _intraday_tick_job() -> None:
     db = str(ROOT / "data" / "invest.db")
     if not intr._in_trading_window():
         return
+    # 盘中涨停池/板块资金采集（5 分钟节流，2026-08-20）
+    try:
+        _tick_collect_pools(db)
+    except Exception as exc:
+        logger.warning("盘中池/资金采集异常: %s", exc)
     # P0 监控（仅交易时段：休市行情旧属正常，非交易时段不检查数据冲突）
     try:
         from invest.monitor import run_p0_monitor
         run_p0_monitor(db)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("P0 监控失败: %s", exc)
     conn = connect(db)
     try:
         alerts = intr.check_core_moves(db)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         try:
             _log_run(conn, "intraday", "failed", str(exc))
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         logger.warning("盘中轮询失败: %s", exc)
         return
@@ -278,6 +318,12 @@ def _data_lag_reason(conn) -> str:
     return "；".join(parts)
 
 
+def _snapshot_close(db: str, conn) -> None:
+    """16:10 收盘快照落库（2026-08-20）：实时源直接写当日收盘价，不必等晚间日线发布。"""
+    import invest.pipeline as pl
+    pl.snapshot_close(db)
+
+
 def _evening_report(db: str, conn) -> None:
     """22:00 晚间盘后报告（合并原 16:00 盘后日报 / 21:35 P2 简报 / 22:00 每日复盘，只发一份）。
 
@@ -313,7 +359,7 @@ def _evening_report(db: str, conn) -> None:
         bad = {t: st for t, (st, _info) in report.items() if st != "valid"}
         if bad:
             msg += "\n数据质量: " + ", ".join(f"{t}={st}" for t, st in list(bad.items())[:8])
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("数据质量报告失败: %s", exc)
     ok = Notifier().send_text(msg, key="evening_report", min_interval=600)
     if not ok:
@@ -326,10 +372,11 @@ def _evening_report(db: str, conn) -> None:
 
 
 # 单任务执行入口（供操作系统计划任务调用，见 scripts/run_job.py 与 install_os_tasks.ps1）
-JOB_FUNCS: dict[str, callable] = {
+JOB_FUNCS: dict[str, Callable] = {
     "premarket": _premarket,
     "morning_brief": _morning_brief,
     "after_close": _after_close,
+    "snapshot_close": _snapshot_close,
     "weekend": _weekend,
     "monthly": _monthly,
     "yearly": _yearly,
@@ -367,6 +414,8 @@ def build_scheduler(ticker_only: bool = False) -> BackgroundScheduler:
     # 盘前信息早报（2026-08-16）：8:30 采集+quant 后，8:40 发关键信息早报
     sched.add_job(_wrap("morning_brief", _morning_brief), CronTrigger(day_of_week="mon-fri", hour=8, minute=40), id="morning_brief", misfire_grace_time=21600)
     sched.add_job(_wrap("after_close", _after_close), CronTrigger(day_of_week="mon-fri", hour=16, minute=0), id="after_close", misfire_grace_time=21600)
+    # 收盘快照（2026-08-20）：16:10 实时源直接落当日收盘价，不必等晚间日线
+    sched.add_job(_wrap("snapshot_close", _snapshot_close), CronTrigger(day_of_week="mon-fri", hour=16, minute=10), id="snapshot_close", misfire_grace_time=7200)
     # 周末周报（2026-08-18 改）：周日 20:00（原周六 09:00）——晚间数据齐备后发，
     # 内容含消息面（财联社电报近7日）+ 周度复盘（纪律/周期漂移/持仓卡片复评）
     sched.add_job(_wrap("weekend", _weekend), CronTrigger(day_of_week="sun", hour=20, minute=0), id="weekend", misfire_grace_time=21600)

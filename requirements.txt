@@ -25,3 +25,11 @@ vectorbt>=0.26
 
 # 测试
 pytest>=8.0
+# 静态检查（2026-08-21）
+ruff>=0.16
+mypy>=2.0
+
+# UZI 深度分析流水线依赖（2026-08-21，run_skill 使用）
+yfinance>=0.2.40
+baostock>=0.8.9
+ddgs>=9.0.0

@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 
+from invest.data.storage import upsert_df
 from invest.db import connect, init_db
 from invest.discipline.spread import (
     factor_score,
@@ -20,7 +21,6 @@ from invest.discipline.spread import (
     suggest_reference,
     z_score_mad,
 )
-from invest.data.storage import upsert_df
 
 
 def _tmp_db():

@@ -51,7 +51,7 @@ def level_monotonicity(conn: sqlite3.Connection) -> dict:
 
 def kelly_calibration(conn: sqlite3.Connection) -> dict:
     """凯利参数校准：按实际成交统计胜率/赔率，与 kelly.py 默认对比。"""
-    from invest.discipline.kelly import kelly_decision, wilson_lower
+    from invest.discipline.kelly import kelly_decision
     rows = conn.execute(
         "SELECT pnl FROM trade_records WHERE pnl IS NOT NULL"
     ).fetchall()
@@ -116,7 +116,7 @@ def yearly_review(conn: sqlite3.Connection) -> dict:
     try:
         from .error_classify import error_report
         errors = error_report(conn)
-    except Exception:  # noqa: BLE001
+    except Exception:
         errors = {"ok": False, "note": "错误分类不可用"}
     # 兼容旧接口：backtest_summary（回测运行记录摘要）
     bt_rows = conn.execute(

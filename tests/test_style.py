@@ -9,7 +9,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from invest.quant.style import compute_style, style_to_text  # noqa: E402
+from invest.quant.style import compute_style, style_to_text
 
 
 def _make_closes(n=120):

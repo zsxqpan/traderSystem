@@ -26,7 +26,8 @@ def create_ticket(
         (type_, direction, from_agent, to_agent, json.dumps(payload or {}, ensure_ascii=False), deadline),
     )
     conn.commit()
-    return int(cur.lastrowid)
+    lastrowid = cur.lastrowid
+    return int(lastrowid) if lastrowid is not None else 0
 
 
 def list_tickets(

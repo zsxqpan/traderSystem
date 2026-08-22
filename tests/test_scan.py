@@ -1,7 +1,6 @@
 """收盘扫描（快照/变化检测/P1）单元测试。用法: python tests/test_scan.py"""
 from __future__ import annotations
 
-import datetime as dt
 import os
 import sys
 import tempfile
@@ -14,7 +13,6 @@ from pathlib import Path
 from invest.db import connect, init_db
 from invest.discipline import pool, rating
 from invest.scan import (
-    SNAPSHOT_DIR,
     detect_changes,
     run_scan_and_notify,
     snapshot_exists,

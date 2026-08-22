@@ -7,8 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 
-from invest.db import connect, init_db
 from invest.data.storage import upsert_df
+from invest.db import connect, init_db
 
 p = os.path.join(tempfile.gettempdir(), "invest_e2e_realtime.db")
 for s in ("", "-wal", "-shm"):
@@ -30,11 +30,11 @@ upsert_df(conn, "daily_bars", pd.DataFrame([
 ]))
 conn.close()
 
-import invest.intraday as intr
-import invest.data.realtime as rt
-
 import time
 import traceback
+
+import invest.data.realtime as rt
+import invest.intraday as intr
 
 # 1) 三源逐源 HTTP 延迟对比（各 3 次）
 syms = ["600519", "000001", "300750"]

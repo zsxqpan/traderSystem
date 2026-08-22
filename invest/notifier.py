@@ -66,7 +66,7 @@ class Notifier:
             if not ok:
                 logger.warning("企业微信推送失败: HTTP %s", resp.status_code)
             return ok
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("企业微信推送失败: %s", exc)
             return False
 
@@ -75,7 +75,7 @@ class Notifier:
             from invest.push.feishu_push import send_text as fs_send
 
             return fs_send(content, key=key)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("飞书群推送失败: %s", exc)
             return False
 
@@ -84,6 +84,6 @@ class Notifier:
             from invest.push.weixin_push import send_text as wx_send
 
             return wx_send(content, key=key)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("微信推送失败: %s", exc)
             return False

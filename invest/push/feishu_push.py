@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """飞书群推送通道(开放平台 API 直连，零 Hermes 依赖)。
 
 依赖:requests。直连 open.feishu.cn(2026-08-16 实测直连可用,
@@ -60,7 +59,7 @@ def _tenant_token(force: bool = False) -> str | None:
         token = d["tenant_access_token"]
         _TOKEN_CACHE[token] = now + _TOKEN_TTL
         return token
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("飞书 token 获取异常: %s", exc)
         return None
 
@@ -77,7 +76,7 @@ def _post_message(token: str, receive_id: str, receive_id_type: str, body: dict)
             timeout=10,
         )
         return r.json()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("飞书推送异常: %s", exc)
         return None
 
@@ -189,6 +188,6 @@ def add_reaction(message_id: str, emoji: str = "HEART") -> bool:
             logger.warning("飞书表情回应失败: code=%s msg=%s", d.get("code"), d.get("msg"))
             return False
         return True
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("飞书表情回应异常: %s", exc)
         return False

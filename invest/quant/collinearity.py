@@ -1,4 +1,4 @@
-﻿"""因子共线性控制（TODO 2.2，2026-08-15）。
+"""因子共线性控制（TODO 2.2，2026-08-15）。
 
 月度因子相关矩阵，|ρ| > 0.60 的因子对不得以完整权重同入组合（v3 8.3）。
 - corr_matrix(): 因子截面相关矩阵（按日期对齐）；
@@ -89,8 +89,6 @@ def weight_adjustment(
             break
         for p in pairs:
             a, b = p["a"], p["b"]
-            # 保留绝对值相关性更高者的完整权重，另一者砍半
-            keep, cut = (a, b) if abs(p["corr"]) >= 0 else (a, b)
             # 简化：两因子都在权重表里时，二者都减半（保守）
             if a in adj and b in adj:
                 adj[a] = round(adj[a] / 2, 4)

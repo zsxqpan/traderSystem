@@ -1,7 +1,6 @@
 """盘前信息早报单元测试。用法: python tests/test_morning_brief.py"""
 from __future__ import annotations
 
-import datetime as dt
 import os
 import sys
 import tempfile
@@ -10,8 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 
-from invest.db import connect, init_db
 from invest.data.storage import upsert_df
+from invest.db import connect, init_db
 from invest.report import morning_brief_report
 
 
@@ -108,7 +107,6 @@ def test_scheduler_has_morning_brief():
     sched = build_scheduler()
     job = sched.get_job("morning_brief")
     assert job is not None
-    from apscheduler.triggers.cron import CronTrigger
     trig = job.trigger
     # hour=8 minute=40（通过表达式字符串验证，避免字段 API 差异）
     expr = str(trig)
@@ -120,6 +118,7 @@ def test_scheduler_has_morning_brief():
 def test_notify_morning_brief():
     """通知入口可用：仅走飞书通道（用户指定，其他渠道不发送）。"""
     from unittest import mock
+
     from invest.pipeline import notify_morning_brief
     p = _tmp_db()
     conn = connect(p)

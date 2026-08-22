@@ -8,21 +8,20 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from invest.db import connect, init_db
+import pandas as pd
+
 from invest.data.pit import (
     CONFLICT,
     DELAYED,
     STALE,
     VALID,
     list_decisions,
-    quality_report,
     quality_status,
     record_decision,
     record_provenance,
 )
 from invest.data.storage import upsert_df
-
-import pandas as pd
+from invest.db import connect, init_db
 
 
 def _tmp_db():
@@ -47,7 +46,7 @@ def test_quality_status():
     upsert_df(conn, "daily_bars", pd.DataFrame([
         {"symbol": "600519", "date": today, "close": 10.0, "src": "akshare"},
     ]))
-    status, info = quality_status(conn, "daily_bars")
+    status, _info = quality_status(conn, "daily_bars")
     assert status == VALID
     # 5 天前（> 阈值 7*0.5=3.5）-> delayed
     old = (dt.date.today() - dt.timedelta(days=5)).isoformat()
@@ -88,7 +87,7 @@ def test_quality_conflict():
         """INSERT INTO job_runs(job, status, started_at, finished_at, detail)
            VALUES('market_emotion','failed',datetime('now','localtime'),datetime('now','localtime'),'x')"""
     )
-    status, info = quality_status(conn, "market_emotion")
+    status, _info = quality_status(conn, "market_emotion")
     assert status == CONFLICT
     conn.close()
     print("test_quality_conflict OK")
@@ -138,8 +137,9 @@ def test_pool_auto_decision():
 
 
 def test_monthly_date_format():
-    from invest.data.pit import _parse_latest_date
     import datetime as _dt
+
+    from invest.data.pit import _parse_latest_date
     assert _parse_latest_date("2026年07月份") == _dt.date(2026, 7, 1)
     assert _parse_latest_date("2026年7月") == _dt.date(2026, 7, 1)
     assert _parse_latest_date("2026-07") == _dt.date(2026, 7, 1)
