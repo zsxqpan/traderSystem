@@ -244,10 +244,16 @@ def quant(db_path: str) -> dict:
 
 
 def agent_premarket(db_path: str) -> str:
+    """盘前关注方向（2026-08-22 精简：供 8:40 盘前报告 a0 的「今日关注」节，仅结论）。"""
     from invest.agent.agents import run_research
     conn = connect(db_path)
     try:
-        return run_research(conn, "基于当前宏观流动性、市场温度与候选池，生成今日关注清单（最多5条方向，含周期与失效条件）")
+        return run_research(
+            conn,
+            "基于当前宏观流动性、市场温度与候选池，生成今日关注清单（最多5条方向）。"
+            "本次输出用于盘前简报：每条方向只输出一行纯结论（不超过25字），"
+            "不要依据、失效条件、宏观背景、周期标签——这些放复盘日报或个股分析。",
+        )
     finally:
         conn.close()
 
@@ -467,24 +473,31 @@ def _agent_viewpoints(conn, n: int = 5) -> str:
     return "\n".join(lines)
 
 
-def notify_premarket(db_path: str, agent_text: str = "") -> bool:
-    """盘前清单推送（2026-08-22：经 Skill Runner 调 a1_premarket，输出逐字节一致）。"""
-    from invest.skills.runner import run as run_skill
-    msg = run_skill("a1_premarket", db_path=db_path, agent_text=agent_text)
-    from invest.notifier import Notifier
-    return Notifier().send_text(msg, key="premarket", min_interval=600)
-
-
 def notify_morning_brief(db_path: str) -> bool:
-    """盘前信息早报（2026-08-16）：交易日 8:40，关键信息简明扼要。
+    """盘前报告推送（2026-08-22：A1+A2 合并版 a0_premarket）。
 
-    仅发送到飞书群（用户指定，其他渠道不发送）。
-    2026-08-22：经 Skill Runner 调 a2_morning_brief。
+    - 飞书：interactive 卡片（表格/加粗，render_feishu），失败回退纯文本；
+    - 企微/微信：纯文本（render_plain，表格转紧凑行）。
     """
-    from invest.skills.runner import run as run_skill
-    msg = run_skill("a2_morning_brief", db_path=db_path)
-    from invest.push.feishu_push import send_text
-    return send_text(msg, key="morning_brief", min_interval=600)
+    from invest.push.feishu_push import send_card, send_text
+    from invest.push.render import render_feishu, render_plain
+    from invest.skills.runner import run_structured
+
+    struct = run_structured("a0_premarket", db_path=db_path)
+    plain = render_plain(struct)
+    ok = False
+    # 飞书卡片（表格/加粗）；失败回退 text
+    card = render_feishu(struct)
+    from invest.config import get_settings
+
+    settings = get_settings()
+    chat_id = getattr(settings, "feishu_chat_id", "") or ""
+    if chat_id:
+        ok = send_card(chat_id, "chat_id", card) or send_text(plain, key="morning_brief", min_interval=600)
+    # 企微/微信（纯文本，跳过飞书避免重复）
+    from invest.notifier import Notifier
+    ok = Notifier().send_text(plain, key="morning_brief", min_interval=600, feishu=False) or ok
+    return ok
 
 
 def notify_after_close(db_path: str, agent_text: str = "") -> bool:

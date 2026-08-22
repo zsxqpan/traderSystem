@@ -86,12 +86,12 @@ def _fresh_db():
 def test_registry_complete():
     """30 个 skill 全注册：7 报告 + 23 小节；元数据与 uses 引用全合法。"""
     ids = registry.list_skills()
-    assert len(ids) == 30, f"期望 30 个 skill，实际 {len(ids)}"
+    assert len(ids) == 33, f"期望 33 个 skill，实际 {len(ids)}"
     reports = registry.list_skills("report")
     sections = registry.list_skills("section")
-    assert len(reports) == 7
-    assert len(sections) == 23
-    assert set(reports) == {"a1_premarket", "a2_morning_brief", "a3_daily", "a4_weekly",
+    assert len(reports) == 6
+    assert len(sections) == 27
+    assert set(reports) == {"a0_premarket", "a3_daily", "a4_weekly",
                             "a5_monthly", "a6_yearly", "b1_intraday"}
     assert registry.validate_all() == []  # 元数据合法 + uses 引用存在
 
@@ -104,7 +104,7 @@ def test_runner_byte_identical_reports():
     a3/a4 内含 LLM 消息面提炼（_news_block 调真实 LLM，输出非确定），
     因此比对时 mock 掉 LLMClient 保证确定性。
     """
-    from invest.report import daily_report, intraday_report, morning_brief_report, premarket_report, weekly_report
+    from invest.report import daily_report, intraday_report, weekly_report
 
     class _FakeLLM:
         def __init__(self, *a, **k):
@@ -114,8 +114,6 @@ def test_runner_byte_identical_reports():
             return "LLM固定输出（测试用）"
 
     p = _fresh_db()
-    assert run_skill("a1_premarket", db_path=p, agent_text="关注方向测试") == premarket_report(p, "关注方向测试")
-    assert run_skill("a2_morning_brief", db_path=p) == morning_brief_report(p)
     with mock.patch("invest.agent.llm.LLMClient", _FakeLLM):
         assert run_skill("a3_daily", db_path=p, agent_text="") == daily_report(p, "")
         assert run_skill("a4_weekly", db_path=p, agent_text="") == weekly_report(p, "")
@@ -174,6 +172,6 @@ def test_runner_errors():
     with pytest.raises(KeyError):
         run_skill("no_such_skill", db_path="x")
     with pytest.raises(TypeError):
-        run_skill("a1_premarket")  # 缺 db_path
+        run_skill("a3_daily")  # 缺 db_path
     with pytest.raises(TypeError):
-        run_skill("a1_premarket", db_path="x", bogus_param=1)  # 未声明参数
+        run_skill("a3_daily", db_path="x", bogus_param=1)  # 未声明参数

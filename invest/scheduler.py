@@ -110,7 +110,11 @@ def _premarket(db: str, conn) -> None:
     except Exception as exc:
         logger.warning("环境重评检查失败: %s", exc)
     text = pl.agent_premarket(db)
-    pl.notify_premarket(db, text)
+    # 2026-08-22：不再直接推送 A1；Agent 关注方向落盘，供 8:40 盘前报告(a0)「今日关注」节
+    try:
+        (ROOT / "data" / "premarket_agent.txt").write_text(text or "", encoding="utf-8")
+    except Exception as exc:
+        logger.warning("盘前 Agent 关注方向落盘失败: %s", exc)
 
 
 def _morning_brief(db: str, conn) -> None:

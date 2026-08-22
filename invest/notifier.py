@@ -25,9 +25,12 @@ class Notifier:
     def enabled(self) -> bool:
         return bool(self.webhook)
 
-    def send_text(self, content: str, key: str = "", min_interval: float = 0.0) -> bool:
+    def send_text(self, content: str, key: str = "", min_interval: float = 0.0,
+                  feishu: bool = True) -> bool:
         """发送文本消息到所有已配置通道；key 相同且未到间隔则跳过。
 
+        feishu=False（2026-08-22）：跳过飞书通道（盘前报告走卡片时用，
+        避免 text 与卡片重复推送）。
         返回 True 表示至少一个通道成功；全部失败或全部未配置时返回 False。
         """
         if not content or not content.strip():
@@ -41,7 +44,8 @@ class Notifier:
 
         results: list[bool] = []
         results.append(self._send_wecom(content))
-        results.append(self._send_feishu(content, key=key))
+        if feishu:
+            results.append(self._send_feishu(content, key=key))
         results.append(self._send_weixin(content, key=key))
 
         ok = any(results)

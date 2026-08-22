@@ -1,9 +1,10 @@
-"""小节 skill（23 个）：D1-D23，薄包装 invest.report / invest.pipeline 的现有小节函数。
+"""小节 skill（27 个）：D1-D23 + D24-D27（2026-08-22 盘前报告新增）。
 
 render 输出规则：
 - 返回 str 的小节：原样返回（逐字节一致）；
 - 返回 list[str] 的小节（d16/d19/d20）："\n".join 为多行文本；
-- 返回 list[dict] 的小节（d18）：按报告常用格式逐项格式化。
+- 返回 list[dict] 的小节（d18）：按报告常用格式逐项格式化；
+- d24-d27（盘前）：文本视图；表格结构由 a0_premarket 组装（直接调底层函数）。
 
 import 本包即完成注册（invest.skills 顶层已触发）。
 """
@@ -35,6 +36,10 @@ from . import (
     d21_freshness,
     d22_ratings,
     d23_breadth,
+    d24_global_snapshot,
+    d25_overnight_analysis,
+    d26_market_watch,
+    d27_news_digest,
 )
 
 _SECTION_MODULES = (
@@ -43,6 +48,7 @@ _SECTION_MODULES = (
     d12_limit_up_ladder, d13_fund_line, d14_sector_moves, d15_capital_leaders,
     d16_card_alerts, d17_pool_delta, d18_abnormal_moves, d19_t_trade_hints,
     d20_entry_timing, d21_freshness, d22_ratings, d23_breadth,
+    d24_global_snapshot, d25_overnight_analysis, d26_market_watch, d27_news_digest,
 )
 
 for _mod in _SECTION_MODULES:

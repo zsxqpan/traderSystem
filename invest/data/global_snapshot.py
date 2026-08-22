@@ -5,11 +5,14 @@ r"""隔夜外围快照（2026-08-21，a-share-market-data 流程落地，进盘�
 - 富时A50：新浪 hf_CHA50CFD（0现价 / 7昨收）
 - 商品：新浪 hf_CL(原油)/hf_OIL(燃油?)/hf_GC(黄金)/hf_SI(白银)
 - 汇率：腾讯 qt.gtimg.cn whUSDCNY（美元人民币）/ whDINIW（美元指数?）
+- 日经225/韩国KOSPI（2026-08-22 新增）：东财 push2delay ulist
+  （secid 100.N225 / 100.KS11，当日实测可用；日韩提前于 A 股开盘）
 
 所有源失败仅记录，不抛异常（早报不阻断）。
 """
 from __future__ import annotations
 
+import json
 import logging
 import urllib.request
 
@@ -29,6 +32,12 @@ _SINA_CODES = ",".join(_SINA_GLOBAL.values())
 
 # 腾讯汇率：whUSDCNY（美元/人民币）
 _TENCENT_CODES = "whUSDCNY"
+
+# 东财 push2delay 国际指数（2026-08-22 新增，日韩提前开盘，8:40 盘前可拿当日行情）
+_EM_INTL = {
+    "jp_nikkei": ("100.N225", "日经225"),
+    "kr_kospi": ("100.KS11", "韩国KOSPI"),
+}
 
 
 def _get(url: str) -> str:
@@ -55,9 +64,38 @@ def _parse_sina_value(code: str, text: str) -> float | None:
         return None
 
 
+def _fetch_em_intl() -> dict:
+    """东财 push2delay 国际指数（日经225/韩国KOSPI）：{key: 涨跌幅%}。失败项为 None。"""
+    out: dict = {k: None for k in _EM_INTL}
+    try:
+        secids = ",".join(v[0] for v in _EM_INTL.values())
+        url = ("https://push2delay.eastmoney.com/api/qt/ulist.np/get"
+               f"?secids={secids}&fields=f2,f3,f4,f12,f14&fltt=2&invt=2")
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/",
+        })
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 绕系统代理
+        with opener.open(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw)
+        diff = (data.get("data") or {}).get("diff") or []
+        for item in diff:
+            code = item.get("f12") or ""
+            for key, (secid, _name) in _EM_INTL.items():
+                if secid.endswith(code):
+                    try:
+                        out[key] = float(item["f3"])  # 涨跌幅%
+                    except (TypeError, KeyError, ValueError):
+                        out[key] = None
+                    break
+    except Exception as exc:
+        logger.warning("外围(东财国际指数)快照失败: %s", exc)
+    return out
+
+
 def fetch_global_snapshot() -> dict:
-    """隔夜外围快照：{us_dji/us_ixic/us_inx/a50/oil/gold/silver: 涨跌幅%, usdcny: 汇率值}。失败项为 None。"""
-    out: dict = {k: None for k in _SINA_GLOBAL} | {"usdcny": None}
+    """隔夜外围快照：{us_dji/us_ixic/us_inx/a50/oil/gold/silver/jp_nikkei/kr_kospi: 涨跌幅%, usdcny: 汇率值}。失败项为 None。"""
+    out: dict = {k: None for k in _SINA_GLOBAL} | {"usdcny": None, "jp_nikkei": None, "kr_kospi": None}
     try:
         raw = _get(f"https://hq.sinajs.cn/list={_SINA_CODES}")
         for line in raw.split(";"):
@@ -91,6 +129,8 @@ def fetch_global_snapshot() -> dict:
                     continue
     except Exception as exc:
         logger.warning("外围(腾讯汇率)快照失败: %s", exc)
+    # 东财日韩（提前开盘，2026-08-22）
+    out.update(_fetch_em_intl())
     return out
 
 
@@ -111,3 +151,19 @@ def global_snapshot_text() -> str:
     if snap.get("usdcny"):
         parts.append(f"USDCNY {snap['usdcny']:.4f}")
     return " ".join(parts) if parts else ""
+
+
+def global_snapshot_rows() -> list[dict]:
+    """外围表格行（2026-08-22，盘前报告表格用）：[{name, pct}，含日韩]，失败项省略。"""
+    snap = fetch_global_snapshot()
+    order = ("us_dji", "us_ixic", "us_inx", "a50", "jp_nikkei", "kr_kospi",
+             "oil", "gold", "silver")
+    rows: list[dict] = []
+    for k in order:
+        name = _GLOBAL_NAMES.get(k) or _EM_INTL.get(k, ("", ""))[1]
+        v = snap.get(k)
+        if v is not None:
+            rows.append({"name": name, "pct": v})
+    if snap.get("usdcny"):
+        rows.append({"name": "USDCNY", "pct": None, "value": snap["usdcny"]})
+    return rows

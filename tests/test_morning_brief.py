@@ -116,7 +116,7 @@ def test_scheduler_has_morning_brief():
 
 
 def test_notify_morning_brief():
-    """通知入口可用：仅走飞书通道（用户指定，其他渠道不发送）。"""
+    """盘前报告通知入口（2026-08-22 合并版）：飞书走卡片、企微/微信走纯文本(feishu=False)。"""
     from unittest import mock
 
     from invest.pipeline import notify_morning_brief
@@ -124,16 +124,26 @@ def test_notify_morning_brief():
     conn = connect(p)
     _seed(conn)
     conn.close()
-    with mock.patch("invest.push.feishu_push.send_text") as m:
-        m.return_value = True
+
+    class _S:
+        feishu_chat_id = "oc_test"
+
+    with mock.patch("invest.config.get_settings", return_value=_S()), \
+         mock.patch("invest.push.feishu_push.send_card") as m_card, \
+         mock.patch("invest.notifier.Notifier") as m_notif, \
+         mock.patch("invest.data.global_snapshot.global_snapshot_rows", return_value=[]), \
+         mock.patch("invest.skills.sections._digest.overnight_analysis", return_value=""), \
+         mock.patch("invest.skills.sections._digest.digest", return_value={"ok": False}), \
+         mock.patch("invest.data.halt.fetch_halt_list", return_value=[]):
+        m_card.return_value = True
+        m_notif.return_value.send_text.return_value = True
         assert notify_morning_brief(p) is True
-        text = m.call_args.args[0]
-        assert "盘前信息早报" in text
-        assert m.call_args.kwargs.get("key") == "morning_brief"
-    # 验证只走飞书：feishu send_text 被调用即证明不走 Notifier 多通道
-    with mock.patch("invest.push.feishu_push.send_text", return_value=True) as m2:
-        notify_morning_brief(p)
-        assert m2.call_count == 1
+        # 飞书走卡片（interactive），卡片为 schema 2.0
+        assert m_card.call_count == 1
+        card = m_card.call_args.args[2]
+        assert card.get("schema") == "2.0"
+        # 企微/微信纯文本：feishu=False 防与卡片重复
+        assert m_notif.return_value.send_text.call_args.kwargs.get("feishu") is False
     print("test_notify_morning_brief OK")
 
 

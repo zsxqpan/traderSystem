@@ -164,6 +164,26 @@ def send_post(receive_id: str, receive_id_type: str, segments: list[dict]) -> bo
     return False
 
 
+def send_card(receive_id: str, receive_id_type: str, card: dict) -> bool:
+    """发送 interactive 卡片消息（2026-08-22，盘前报告表格/加粗用）。
+
+    card: 卡片 JSON 2.0 结构（schema=2.0，body.elements 含 div/lark_md、table 组件）。
+    发送失败返回 False（调用方可回退 text/post）。
+    """
+    if not card:
+        return False
+    token = _tenant_token()
+    if not token:
+        return False
+    body = {"receive_id": receive_id, "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False)}
+    d = _post_message(token, receive_id, receive_id_type, body)
+    if d is not None and d.get("code") == 0:
+        return True
+    logger.warning("飞书卡片消息失败(code=%s)", (d or {}).get("code"))
+    return False
+
+
 def add_reaction(message_id: str, emoji: str = "HEART") -> bool:
     """给消息添加表情回应（2026-08-18：收到消息先回 ❤️，告知已收到）。
 

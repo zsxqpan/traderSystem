@@ -226,15 +226,24 @@ def test_pipeline_quant():
 
 
 def test_notify_messages_no_crash():
-    from invest.pipeline import notify_after_close, notify_premarket, notify_weekend
+    from invest.pipeline import notify_after_close, notify_morning_brief, notify_weekend
     p = _tmp_db()
     with mock.patch("invest.notifier.Notifier") as m:
         m.return_value.send_text.return_value = True
-        assert notify_premarket(p, "test") is True
         assert notify_after_close(p, "test") is True
         assert notify_weekend(p, "test") is True
         texts = [c.args[0] for c in m.return_value.send_text.call_args_list]
         assert all("数据截至" in t for t in texts)
+    # 盘前报告（a0 合并版）：mock 外围/LLM/停牌避免联网；企微/微信走 feishu=False
+    with mock.patch("invest.notifier.Notifier") as m2, \
+         mock.patch("invest.push.feishu_push.send_card", return_value=True), \
+         mock.patch("invest.data.global_snapshot.global_snapshot_rows", return_value=[]), \
+         mock.patch("invest.skills.sections._digest.overnight_analysis", return_value=""), \
+         mock.patch("invest.skills.sections._digest.digest", return_value={"ok": False}), \
+         mock.patch("invest.data.halt.fetch_halt_list", return_value=[]):
+        m2.return_value.send_text.return_value = True
+        assert notify_morning_brief(p) is True
+        assert m2.return_value.send_text.call_args.kwargs.get("feishu") is False
     print("test_notify_messages_no_crash OK")
 
 
