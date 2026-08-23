@@ -119,6 +119,35 @@ def auction_llm(db_path: str, ctx: dict) -> dict:
         return {}
 
 
+def section_analysis_llm(db_path: str, ctx: dict) -> dict:
+    """竞价各模块解析（2026-08-22，a7 用，job='auction'）：指数/榜单/连板/关键股/核心关注
+    每模块一句解析；该模块竞价无特别消息写"无"，不强行解析。一次调用省 token。"""
+    try:
+        from invest.db import connect
+
+        conn = connect(db_path)
+        try:
+            out = _llm(conn, _YOUZI_SYSTEM,
+                       "以下是今日 9:25 集合竞价各模块数据：\n"
+                       f"指数竞价:\n{ctx.get('index_text') or '暂无'}\n"
+                       f"高开放量榜:\n{ctx.get('boards_text') or '暂无'}\n"
+                       f"昨日连板竞价:\n{ctx.get('ladder_text') or '暂无'}\n"
+                       f"市场关键股票竞价:\n{ctx.get('key_text') or '暂无'}\n"
+                       f"核心关注竞价:\n{ctx.get('core_text') or '暂无'}\n\n"
+                       "请对每个模块给一句简要竞价解析（原因/影响，30字内；该模块竞价无特别消息写'无'，"
+                       "不要强行解析），输出 JSON：\n"
+                       '{"index": "指数竞价解析", "boards": "高开放量榜解析", "ladder": "连板竞价解析",'
+                       '"key_stocks": "关键股票竞价解析", "core": "核心关注竞价解析"}\n'
+                       "只许基于给定数据推理，禁止编造个股与数字。",
+                       max_tokens=700)
+            return _parse_json(out) or {}
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("竞价模块解析 LLM 失败: %s", exc)
+        return {}
+
+
 def key_stock_llm(db_path: str, ctx: dict) -> dict:
     """关键股票竞价解析（2026-08-22，a7 竞价报告用，job='auction'）。
 

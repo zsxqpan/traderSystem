@@ -513,7 +513,40 @@ def notify_auction(db_path: str) -> bool:
     from invest.skills.runner import run_structured
 
     struct = run_structured("a7_auction", db_path=db_path)
+    # 2026-08-22：竞价情绪预判/模块解析落库（source='auction_report'），供盘后日报点2 复盘
+    _persist_auction_views(struct.get("views") or {})
     return _send_structured(struct, key="auction")
+
+
+def _persist_auction_views(views: dict) -> None:
+    """竞价报告观点/解析落库（2026-08-22）：viewpoints source='auction_report'。失败静默。"""
+    if not views:
+        return
+    try:
+        import json as _json
+
+        from invest.db import connect as _connect
+
+        conn = _connect(str(Path(__file__).resolve().parents[1] / "data" / "invest.db"))
+        try:
+            for kind in ("mood", "analysis"):
+                content = views.get(kind)
+                if not content:
+                    continue
+                conn.execute(
+                    """INSERT INTO viewpoints(source, conclusion, period_tag, confidence,
+                       evidence_json, invalid_condition, status, created_at, obj_type, obj)
+                       VALUES('auction_report', ?, 'micro', 0.5, '[]', '当日收盘复盘', 'active',
+                              datetime('now','localtime'), 'market', ?)""",
+                    (_json.dumps(content, ensure_ascii=False)[:2000], kind),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning("竞价观点落库失败", exc_info=True)
 
 
 def _persist_plan(plan_data: dict) -> None:

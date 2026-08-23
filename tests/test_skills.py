@@ -248,6 +248,9 @@ def test_a7_auction_structured(monkeypatch):
         "mood": "竞价情绪偏暖，高开家数多", "style": "小盘占优", "hint": "关注竞价放量方向"}
     _il.key_stock_llm = lambda db, ctx: {
         "blocks": [{"name": "半导体", "analysis": "受消息影响高开，资金情绪高涨"}]}
+    _il.section_analysis_llm = lambda db, ctx: {
+        "index": "指数高开，情绪偏暖", "boards": "无", "ladder": "连板承接强",
+        "key_stocks": "资金涌入核心方向", "core": "无"}
     p = _fresh_db()
     conn = connect(p)
     try:
@@ -292,6 +295,13 @@ def test_a7_auction_structured(monkeypatch):
     assert "竞价情绪预判" in texts and "小盘占优" in texts
     assert "板块竞价解析" in texts and "受消息影响高开" in texts
     assert "浦发银行" in texts  # 低开榜文本
+    # 每模块解析（无特别消息写"（无特别消息）"）
+    for key in ("指数竞价解析", "高开放量榜解析", "连板竞价解析", "关键股票竞价解析", "核心关注竞价解析"):
+        assert key in texts, f"缺少模块解析: {key}"
+    assert "（无特别消息）" in texts  # boards=无 → 不强行解析
+    # views 元数据（情绪预判 + 模块解析，供落库复盘）
+    assert struct.get("views", {}).get("mood", {}).get("mood")
+    assert struct.get("views", {}).get("analysis", {}).get("index")
 
 
 # ---------- 错误路径 ----------

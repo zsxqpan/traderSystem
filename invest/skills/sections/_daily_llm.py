@@ -55,13 +55,13 @@ def intraday_review_llm(db_path: str, ctx: dict) -> dict:
         conn = connect(db_path)
         try:
             out = _llm(conn, _SYSTEM,
-                       f"以下是今日盘中报告给出的观点（预测/操作建议/短线判断）：\n{ctx.get('views_text') or '（今日无盘中报告观点）'}\n\n"
+                       f"以下是今日竞价报告与盘中报告给出的观点（预测/操作建议/短线判断，来源已标注）：\n{ctx.get('views_text') or '（今日无观点）'}\n\n"
                        f"以下是当日实际表现：\n{ctx.get('actual_text') or '暂无'}\n\n"
                        "请输出 JSON：\n"
-                       '{"verdict": "逐条判断观点对错（对/错/部分对，30字内总结）",\n'
+                       '{"verdict": "逐条判断观点对错（对/错/部分对；竞价预判与盘中判断分别点评，50字内）",\n'
                        '"wrong_reasons": ["错误原因（数据/逻辑/突发，每条20字内）"],\n'
                        '"lessons": ["沉淀成经验的一句话（供固化为复盘 skill，每条20字内）"]}\n'
-                       "没有盘中观点则 verdict 写'今日无盘中观点可复盘'，数组为空。",
+                       "没有观点则 verdict 写'今日无观点可复盘'，数组为空。",
                        max_tokens=600)
             return _parse_json(out) or {}
         finally:

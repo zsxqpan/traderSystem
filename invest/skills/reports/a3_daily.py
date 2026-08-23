@@ -81,20 +81,22 @@ def _index_etf_rows() -> list[list[str]]:
 
 
 def _today_views_text(conn) -> str:
-    """今日盘中报告观点（source='intraday_report'）。"""
+    """今日观点（2026-08-22：盘中报告 intraday_report + 竞价报告 auction_report）。"""
     try:
         rows = conn.execute(
-            """SELECT obj, conclusion FROM viewpoints
-               WHERE source='intraday_report' AND date(created_at)=date('now','localtime')
+            """SELECT source, obj, conclusion FROM viewpoints
+               WHERE source IN ('intraday_report','auction_report')
+                 AND date(created_at)=date('now','localtime')
                ORDER BY created_at"""
         ).fetchall()
         lines = []
         for r in rows:
+            tag = {"intraday_report": "盘中", "auction_report": "竞价"}.get(r["source"], r["source"])
             try:
                 d = json.loads(r["conclusion"])
-                lines.append(f"- [{r['obj']}] {json.dumps(d, ensure_ascii=False)[:300]}")
+                lines.append(f"- [{tag}·{r['obj']}] {json.dumps(d, ensure_ascii=False)[:300]}")
             except ValueError:
-                lines.append(f"- [{r['obj']}] {r['conclusion'][:200]}")
+                lines.append(f"- [{tag}·{r['obj']}] {r['conclusion'][:200]}")
         return "\n".join(lines)
     except Exception:
         return ""
