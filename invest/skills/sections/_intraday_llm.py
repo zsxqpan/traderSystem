@@ -92,6 +92,33 @@ def mood_llm(db_path: str, ctx: dict) -> dict:
     return {}
 
 
+def auction_llm(db_path: str, ctx: dict) -> dict:
+    """竞价情绪预判（2026-08-22，a7 竞价报告用，job='auction'）。ctx 含指数/榜单/连板。失败返回 {}。"""
+    try:
+        from invest.db import connect
+
+        conn = connect(db_path)
+        try:
+            out = _llm(conn, _YOUZI_SYSTEM,
+                       "以下是今日 9:25 集合竞价数据：\n"
+                       f"指数竞价:\n{ctx.get('index_text') or '暂无'}\n"
+                       f"竞价高开榜TOP:\n{ctx.get('gainers') or '暂无'}\n"
+                       f"竞价量比榜TOP:\n{ctx.get('vol_ratio') or '暂无'}\n"
+                       f"昨日连板今日竞价:\n{ctx.get('ladder') or '暂无'}\n\n"
+                       "请输出竞价情绪预判 JSON：\n"
+                       '{"mood": "竞价情绪强弱判断（高开家数/连板承接/量比放大，30字内）",\n'
+                       '"style": "风格预判（大小盘/题材方向，25字内）",\n'
+                       '"hint": "操作提示（追涨/低吸/防守，结合竞价异常，30字内）"}\n'
+                       "只许基于给定数据推理，禁止编造个股与数字。",
+                       max_tokens=500)
+            return _parse_json(out) or {}
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("竞价情绪预判 LLM 失败: %s", exc)
+        return {}
+
+
 def mainline_llm(db_path: str, ctx: dict) -> dict:
     """日内主线分析（调用 2）。ctx 含 sector_top/fund_top/ladder/core/etf_sector。失败返回 {}。"""
     now = time.time()

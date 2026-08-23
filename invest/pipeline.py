@@ -508,6 +508,14 @@ def notify_after_close(db_path: str, agent_text: str = "") -> bool:
     return _send_structured(struct, key="after_close")
 
 
+def notify_auction(db_path: str) -> bool:
+    """竞价报告推送（2026-08-22：9:25 集合竞价后 a7_auction，飞书卡片 + 企微/微信纯文本）。"""
+    from invest.skills.runner import run_structured
+
+    struct = run_structured("a7_auction", db_path=db_path)
+    return _send_structured(struct, key="auction")
+
+
 def _persist_plan(plan_data: dict) -> None:
     """明日预案落库（2026-08-22）：viewpoints source='plan'，conclusion=JSON。失败静默。"""
     if not plan_data:

@@ -84,15 +84,15 @@ def _fresh_db():
 # ---------- 注册表完整性 ----------
 
 def test_registry_complete():
-    """30 个 skill 全注册：7 报告 + 23 小节；元数据与 uses 引用全合法。"""
+    """34 个 skill 全注册：7 报告 + 27 小节；元数据与 uses 引用全合法。"""
     ids = registry.list_skills()
-    assert len(ids) == 33, f"期望 33 个 skill，实际 {len(ids)}"
+    assert len(ids) == 34, f"期望 34 个 skill，实际 {len(ids)}"
     reports = registry.list_skills("report")
     sections = registry.list_skills("section")
-    assert len(reports) == 6
+    assert len(reports) == 7
     assert len(sections) == 27
-    assert set(reports) == {"a0_premarket", "a3_daily", "a4_weekly",
-                            "a5_monthly", "a6_yearly", "b1_intraday"}
+    assert set(reports) == {"a0_premarket", "a3_daily", "a4_weekly", "a5_monthly",
+                            "a6_yearly", "a7_auction", "b1_intraday"}
     assert registry.validate_all() == []  # 元数据合法 + uses 引用存在
 
 
@@ -237,6 +237,53 @@ def test_a6_yearly_render():
     p = _fresh_db()
     out = run_skill("a6_yearly", db_path=p, content={"backtest_summary": [1, 2, 3]})
     assert out == "年度复盘已生成: 3 组回测结论待检视"
+
+
+def test_a7_auction_structured(monkeypatch):
+    """a7 竞价报告：指数竞价/高开量比榜/连板竞价/核心竞价/情绪预判（全 mock）。"""
+    import invest.skills.sections._intraday_llm as _il
+    from invest.skills.runner import run_structured
+
+    _il.auction_llm = lambda db, ctx: {
+        "mood": "竞价情绪偏暖，高开家数多", "style": "小盘占优", "hint": "关注竞价放量方向"}
+    p = _fresh_db()
+    # 造昨日连板（limit_up_pool）
+    conn = connect(p)
+    try:
+        conn.execute("INSERT INTO limit_up_pool(date, symbol, name, lianban, zhaban) "
+                     "VALUES('20260821', '600001', '某股A', 3, 0)")
+        conn.execute("INSERT INTO limit_up_pool(date, symbol, name, lianban, zhaban) "
+                     "VALUES('20260821', '600002', '某股B', 2, 0)")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr("invest.data.index_realtime.fetch_index_realtime", lambda: {
+        "000001": {"name": "上证指数", "price": 3905.2, "pct": 0.35}})
+    monkeypatch.setattr("invest.data.auction.fetch_top_gainers",
+                        lambda limit=10: [{"symbol": "600519", "name": "贵州茅台",
+                                           "pct": 1.5, "vol_ratio": 250}])
+    monkeypatch.setattr("invest.data.auction.fetch_top_losers",
+                        lambda limit=3: [{"symbol": "600000", "name": "浦发银行",
+                                          "pct": -2.0, "vol_ratio": 150}])
+    monkeypatch.setattr("invest.data.auction.fetch_vol_top",
+                        lambda limit=10: [{"symbol": "600519", "name": "贵州茅台",
+                                           "pct": 1.5, "vol": 3e6}])
+    monkeypatch.setattr("invest.data.auction.fetch_batch_quotes",
+                        lambda symbols=None: {s: {"name": f"N{s}", "price": 10.0, "pct": 1.2,
+                                                  "vol": 1000} for s in (symbols or [])})
+
+    struct = run_structured("a7_auction", db_path=p)
+    tables = [s for s in struct["sections"] if s.get("type") == "table"]
+    charts = [s for s in struct["sections"] if s.get("type") == "chart"]
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+    assert any(t["title"] == "指数竞价" for t in tables)
+    assert any("高开榜" in t["title"] for t in tables)
+    assert any("放量榜" in t["title"] for t in tables)
+    assert any("昨日连板" in t["title"] for t in tables)
+    assert any("核心关注" in t["title"] for t in tables)
+    assert charts and charts[0]["chart"] == "index_bars"
+    assert "竞价情绪预判" in texts and "小盘占优" in texts
+    assert "浦发银行" in texts  # 低开榜文本
 
 
 # ---------- 错误路径 ----------

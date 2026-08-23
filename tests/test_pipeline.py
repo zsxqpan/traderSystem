@@ -46,10 +46,24 @@ def test_scheduler_jobs():
     sched = build_scheduler()
     ids = {j.id for j in sched.get_jobs()}
     # 2026-08-18 合并盘后报告：nightly/p2_brief → evening_report（数据滞后时跳过并推送原因）
-    assert {"premarket", "morning_brief", "after_close", "snapshot_close", "weekend", "intraday_tick",
-            "monthly", "yearly", "industry_refresh", "daily_refresh", "evening_report"} <= ids
+    assert {"premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend",
+            "intraday_tick", "monthly", "yearly", "industry_refresh", "daily_refresh",
+            "evening_report"} <= ids
     assert "p2_brief" not in ids and "nightly" not in ids
     print("test_scheduler_jobs OK")
+
+
+def test_auction_window():
+    """竞价窗口判定：交易日 9:25:30-9:29:30 内为 True；窗口外/周末为 False。"""
+    import datetime as dt
+
+    from invest.scheduler import _in_auction_window
+
+    assert _in_auction_window(dt.datetime(2026, 8, 24, 9, 26, 0)) is True    # 周一 9:26
+    assert _in_auction_window(dt.datetime(2026, 8, 24, 9, 25, 0)) is False   # 9:25:00 未到
+    assert _in_auction_window(dt.datetime(2026, 8, 24, 9, 30, 0)) is False   # 开盘后
+    assert _in_auction_window(dt.datetime(2026, 8, 23, 9, 26, 0)) is False   # 周日
+    print("test_auction_window OK")
 
 
 def test_ticker_only_and_job_funcs():
@@ -59,8 +73,8 @@ def test_ticker_only_and_job_funcs():
     sched = build_scheduler(ticker_only=True)
     assert {j.id for j in sched.get_jobs()} == {"intraday_tick"}
     assert set(JOB_FUNCS) == {
-        "premarket", "morning_brief", "after_close", "snapshot_close", "weekend", "monthly", "yearly",
-        "industry_refresh", "daily_refresh", "evening_report",
+        "premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend", "monthly",
+        "yearly", "industry_refresh", "daily_refresh", "evening_report",
     }
     print("test_ticker_only_and_job_funcs OK")
 

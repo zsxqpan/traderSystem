@@ -13,6 +13,7 @@ description: traderSystem 自沉淀 skill 集（2026-08-22）：盘前/盘中/�
 | skill | 对应系统模块 | 沉淀要点 |
 |---|---|---|
 | `premarket-report/` | `a0_premarket` | 盘前报告：隔夜外围（含日韩）+ LLM 解读 + 涨停异动监控 + 消息汇总 |
+| `auction-report/` | `a7_auction` | 9:25 竞价报告：竞价数据源可行性 + 指数竞价/高开放量榜/连板竞价/情绪预判 |
 | `intraday-report/` | `b1_intraday` | 盘中报告：盘面总览 + 情绪预测 + 日内主线（ETF+推荐股）+ 核心关注/预案对照 |
 | `evening-report/` | `a3_daily` | 盘后日报（盘中 PLUS）：ETF 验证 + 观点复盘 + 板块总分析 + 预案闭环 |
 | `etf-analysis/` | `invest/data/etf.py` | ETF 三因子强度验证（量比/超大单/主力净流入）≈ 大资金信号 |

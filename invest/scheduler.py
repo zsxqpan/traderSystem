@@ -229,9 +229,45 @@ def _tick_collect_pools(db: str) -> None:
             conn.close()
 
 
+def _in_auction_window(now=None) -> bool:
+    """竞价窗口：交易日 9:25:30-9:29:30（集合竞价结束后、开盘前）。"""
+    import datetime as dt
+
+    now = now or dt.datetime.now()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return dt.time(9, 25, 30) <= t <= dt.time(9, 29, 30)
+
+
+_auction_sent: str = ""  # 当天已发竞价报告的日期 YYYY-MM-DD（防重）
+
+
+def _auction_report(db: str, conn=None) -> bool:
+    """竞价报告（2026-08-22）：9:25 集合竞价结束后推送，当天一次。"""
+    global _auction_sent
+    import datetime as dt
+
+    today = dt.date.today().isoformat()
+    if _auction_sent == today:
+        return False
+    try:
+        from invest.pipeline import notify_auction
+
+        ok = notify_auction(db)
+        _auction_sent = today
+        if conn is not None:
+            _log_run(conn, "auction", "ok", f"push={ok}")
+        return ok
+    except Exception:
+        logger.exception("竞价报告失败")
+        return False
+
+
 def _intraday_tick_job() -> None:
     """盘中 10 秒轮询 job 入口（无参，适配 APScheduler；2026-08-18 由 4s 降频到 10s）。
 
+    - 竞价窗口（9:25:30-9:29:30）：触发竞价报告（当天一次），不跑盘中监控（未开盘）；
     - 非交易时段直接返回（守护，空转开销极小；行情旧属正常，不跑 P0 监控）；
     - 正常轮询不写 job_runs（避免每 10 秒一条噪音；实时健康留痕由
       log_realtime_health 节流承担，异常/stale 立即落库）；
@@ -239,6 +275,13 @@ def _intraday_tick_job() -> None:
     """
     import invest.intraday as intr
     db = str(ROOT / "data" / "invest.db")
+    # 2026-08-22：竞价报告窗口（ticker-only 部署下也触发）
+    if _in_auction_window():
+        try:
+            _auction_report(db)
+        except Exception as exc:
+            logger.warning("竞价报告异常: %s", exc)
+        return
     if not intr._in_trading_window():
         return
     # 盘中涨停池/板块资金采集（5 分钟节流，2026-08-20）
@@ -389,6 +432,7 @@ def _evening_report(db: str, conn) -> None:
 JOB_FUNCS: dict[str, Callable] = {
     "premarket": _premarket,
     "morning_brief": _morning_brief,
+    "auction": _auction_report,  # 2026-08-22：竞价报告（OS 任务重装后 9:26 触发）
     "after_close": _after_close,
     "snapshot_close": _snapshot_close,
     "weekend": _weekend,
@@ -427,6 +471,8 @@ def build_scheduler(ticker_only: bool = False) -> BackgroundScheduler:
     sched.add_job(_wrap("premarket", _premarket), CronTrigger(day_of_week="mon-fri", hour=8, minute=30), id="premarket", misfire_grace_time=21600)
     # 盘前信息早报（2026-08-16）：8:30 采集+quant 后，8:40 发关键信息早报
     sched.add_job(_wrap("morning_brief", _morning_brief), CronTrigger(day_of_week="mon-fri", hour=8, minute=40), id="morning_brief", misfire_grace_time=21600)
+    # 竞价报告（2026-08-22）：9:26（ticker-only 部署由 _intraday_tick_job 竞价窗口触发，这里为 full 模式备选）
+    sched.add_job(_wrap("auction", _auction_report), CronTrigger(day_of_week="mon-fri", hour=9, minute=26), id="auction", misfire_grace_time=300)
     sched.add_job(_wrap("after_close", _after_close), CronTrigger(day_of_week="mon-fri", hour=16, minute=0), id="after_close", misfire_grace_time=21600)
     # 收盘快照（2026-08-20）：16:10 实时源直接落当日收盘价，不必等晚间日线
     sched.add_job(_wrap("snapshot_close", _snapshot_close), CronTrigger(day_of_week="mon-fri", hour=16, minute=10), id="snapshot_close", misfire_grace_time=7200)
