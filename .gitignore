@@ -30,6 +30,12 @@ myenv/
 
 # external vendor repos (independent git repos; keep out of main repo)
 tools/
-.claude/
+
+# .claude/skills：只保留本系统自沉淀 skill（trader-system/），
+# 其余为外部 git 仓库/方法论素材（独立管理，不入主仓库）
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/trader-system/
 =  # 0-byte accidental empty file
 =
