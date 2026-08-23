@@ -119,6 +119,35 @@ def auction_llm(db_path: str, ctx: dict) -> dict:
         return {}
 
 
+def key_stock_llm(db_path: str, ctx: dict) -> dict:
+    """关键股票竞价解析（2026-08-22，a7 竞价报告用，job='auction'）。
+
+    输入前一日热门板块核心股票的竞价表现，每板块给一句竞价解析（原因/影响）。
+    与 auction_llm（情绪预判）独立，互不影响。
+    """
+    if not ctx.get("blocks_text"):
+        return {}
+    try:
+        from invest.db import connect
+
+        conn = connect(db_path)
+        try:
+            out = _llm(conn, _YOUZI_SYSTEM,
+                       "以下是前一日热门板块核心股票今日竞价表现：\n" + ctx["blocks_text"] + "\n\n"
+                       "请对每个板块给一句简要竞价解析（分析高开/低开原因与影响，"
+                       "如'受消息影响高开''体现该方向资金情绪高涨''高开兑现抛压需防'，30字内），"
+                       "输出 JSON：\n"
+                       '{"blocks": [{"name": "板块名", "analysis": "竞价解析一句话"}]}\n'
+                       "只许基于给定数据推理，禁止编造个股与数字。",
+                       max_tokens=500)
+            return _parse_json(out) or {}
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("关键股票竞价解析 LLM 失败: %s", exc)
+        return {}
+
+
 def mainline_llm(db_path: str, ctx: dict) -> dict:
     """日内主线分析（调用 2）。ctx 含 sector_top/fund_top/ladder/core/etf_sector。失败返回 {}。"""
     now = time.time()

@@ -79,6 +79,38 @@ def _yesterday_ladder(conn) -> list[str]:
         return []
 
 
+def _hot_core_stocks(conn) -> list[dict]:
+    """前一日热门板块核心股（2026-08-22）：昨日涨停股按东财行业(f100)聚合 TOP3，每板块取连板最高 1-2 只。
+
+    返回 [{block, count, stocks: [{symbol, name, lianban}]}]。
+    """
+    try:
+        rows = conn.execute(
+            """SELECT symbol, name, lianban FROM limit_up_pool
+               WHERE zhaban=0
+                 AND date=(SELECT MAX(date) FROM limit_up_pool WHERE date < ?)
+               ORDER BY lianban DESC LIMIT 50""",
+            (dt.date.today().strftime("%Y%m%d"),),
+        ).fetchall()
+    except Exception:
+        return []
+    if not rows:
+        return []
+    from invest.data.auction import fetch_industries
+
+    ind_map = fetch_industries([r["symbol"] for r in rows])
+    blocks: dict[str, list] = {}
+    for r in rows:
+        ind = ind_map.get(r["symbol"]) or "其他"
+        blocks.setdefault(ind, []).append(dict(r))
+    top = sorted(blocks.items(), key=lambda kv: -len(kv[1]))[:3]
+    out = []
+    for ind, stocks in top:
+        stocks.sort(key=lambda s: -(s.get("lianban") or 0))
+        out.append({"block": ind, "count": len(stocks), "stocks": stocks[:2]})
+    return out
+
+
 def _core_symbols(db_path: str) -> list[str]:
     """核心关注 + 持仓（cards locked/review）。"""
     conn = connect(db_path)
@@ -165,7 +197,47 @@ def render(db_path: str) -> dict:
         except Exception:
             pass
 
-    # ---- 4) 核心关注/持仓竞价 ----
+    # ---- 4) 市场关键股票竞价（前一日热门板块核心股 + 板块竞价解析） ----
+    conn = connect(db_path)
+    try:
+        hot_blocks = _hot_core_stocks(conn)
+    finally:
+        conn.close()
+    if hot_blocks:
+        try:
+            from invest.data.auction import fetch_batch_quotes
+
+            core_syms = [s["symbol"] for b in hot_blocks for s in b["stocks"]]
+            quotes = fetch_batch_quotes(core_syms)
+            block_rows, block_texts = [], []
+            for b in hot_blocks:
+                for s in b["stocks"]:
+                    q = quotes.get(s["symbol"])
+                    pct_txt = (f"{(q['pct']):+.2f}%" if q and q.get("pct") is not None else "-")
+                    block_rows.append([b["block"], f"{s['name']}({s['symbol']})",
+                                       f"{int(s.get('lianban') or 0)}板", pct_txt])
+                    block_texts.append(f"[{b['block']}] {s['name']} {pct_txt}")
+            if block_rows:
+                sections.append({
+                    "type": "table", "title": "市场关键股票竞价（昨日热门板块核心股）",
+                    "columns": ["板块", "核心股", "昨日", "竞价涨幅"], "rows": block_rows,
+                })
+            # LLM 板块竞价解析（与情绪预判独立，互不影响）
+            ks = _intraday_llm.key_stock_llm(db_path, {"blocks_text": "\n".join(block_texts)})
+            analysis_map = {b.get("name"): b.get("analysis") for b in (ks.get("blocks") or [])}
+            lines = []
+            for b in hot_blocks:
+                a = analysis_map.get(b["block"])
+                if a:
+                    lines.append(f"  · **{b['block']}**（涨停{b['count']}家）: {a}")
+            if lines:
+                sections.append({
+                    "type": "text", "text": "**【板块竞价解析】**\n" + "\n".join(lines),
+                })
+        except Exception:
+            pass
+
+    # ---- 5) 核心关注/持仓竞价 ----
     core = _core_symbols(db_path)
     if core:
         try:

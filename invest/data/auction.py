@@ -98,6 +98,24 @@ def fetch_vol_top(limit: int = 10) -> list[dict]:
         return []
 
 
+def fetch_industries(symbols: list[str]) -> dict[str, str]:
+    """东财批量查个股所属行业（2026-08-22，f100 申万行业）：{symbol: 行业名}。失败返回 {}。"""
+    symbols = [s for s in (symbols or []) if s]
+    if not symbols:
+        return {}
+    out: dict[str, str] = {}
+    try:
+        secids = ",".join(("1." if s.startswith(("6", "9")) else "0.") + s for s in symbols)
+        url = ("https://push2delay.eastmoney.com/api/qt/ulist.np/get"
+               f"?secids={secids}&fields=f12,f100&fltt=2&invt=2")
+        diff = (_em_get(url).get("data") or {}).get("diff") or []
+        for it in diff:
+            out[str(it.get("f12", ""))] = str(it.get("f100", "")) or "其他"
+    except Exception as exc:
+        logger.warning("批量行业查询失败: %s", exc)
+    return out
+
+
 def fetch_batch_quotes(symbols: list[str]) -> dict[str, dict]:
     """腾讯批量个股竞价行情：{symbol: {name, price, pct, vol}}。失败返回 {}。"""
     symbols = [s for s in (symbols or []) if s]

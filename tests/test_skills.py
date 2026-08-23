@@ -240,14 +240,15 @@ def test_a6_yearly_render():
 
 
 def test_a7_auction_structured(monkeypatch):
-    """a7 竞价报告：指数竞价/高开量比榜/连板竞价/核心竞价/情绪预判（全 mock）。"""
+    """a7 竞价报告：指数竞价/高开放量榜/连板竞价/关键股票竞价+解析/核心竞价/情绪预判（全 mock）。"""
     import invest.skills.sections._intraday_llm as _il
     from invest.skills.runner import run_structured
 
     _il.auction_llm = lambda db, ctx: {
         "mood": "竞价情绪偏暖，高开家数多", "style": "小盘占优", "hint": "关注竞价放量方向"}
+    _il.key_stock_llm = lambda db, ctx: {
+        "blocks": [{"name": "半导体", "analysis": "受消息影响高开，资金情绪高涨"}]}
     p = _fresh_db()
-    # 造昨日连板（limit_up_pool）
     conn = connect(p)
     try:
         conn.execute("INSERT INTO limit_up_pool(date, symbol, name, lianban, zhaban) "
@@ -261,16 +262,21 @@ def test_a7_auction_structured(monkeypatch):
         "000001": {"name": "上证指数", "price": 3905.2, "pct": 0.35}})
     monkeypatch.setattr("invest.data.auction.fetch_top_gainers",
                         lambda limit=10: [{"symbol": "600519", "name": "贵州茅台",
-                                           "pct": 1.5, "vol_ratio": 250}])
+                                           "pct": 1.5}])
     monkeypatch.setattr("invest.data.auction.fetch_top_losers",
                         lambda limit=3: [{"symbol": "600000", "name": "浦发银行",
-                                          "pct": -2.0, "vol_ratio": 150}])
+                                          "pct": -2.0}])
     monkeypatch.setattr("invest.data.auction.fetch_vol_top",
                         lambda limit=10: [{"symbol": "600519", "name": "贵州茅台",
                                            "pct": 1.5, "vol": 3e6}])
     monkeypatch.setattr("invest.data.auction.fetch_batch_quotes",
                         lambda symbols=None: {s: {"name": f"N{s}", "price": 10.0, "pct": 1.2,
                                                   "vol": 1000} for s in (symbols or [])})
+    # 关键股票：mock 热门板块核心股（避免依赖 industry_map 数据）
+    monkeypatch.setattr("invest.skills.reports.a7_auction._hot_core_stocks",
+                        lambda conn: [{"block": "半导体", "count": 2,
+                                       "stocks": [{"symbol": "600001", "name": "某股A",
+                                                   "lianban": 3}]}])
 
     struct = run_structured("a7_auction", db_path=p)
     tables = [s for s in struct["sections"] if s.get("type") == "table"]
@@ -280,9 +286,11 @@ def test_a7_auction_structured(monkeypatch):
     assert any("高开榜" in t["title"] for t in tables)
     assert any("放量榜" in t["title"] for t in tables)
     assert any("昨日连板" in t["title"] for t in tables)
+    assert any("市场关键股票竞价" in t["title"] for t in tables)
     assert any("核心关注" in t["title"] for t in tables)
     assert charts and charts[0]["chart"] == "index_bars"
     assert "竞价情绪预判" in texts and "小盘占优" in texts
+    assert "板块竞价解析" in texts and "受消息影响高开" in texts
     assert "浦发银行" in texts  # 低开榜文本
 
 
