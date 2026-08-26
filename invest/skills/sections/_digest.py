@@ -53,8 +53,17 @@ def _llm(conn, system: str, user: str, max_tokens: int | None = None) -> str:
     from invest.agent.llm import LLMClient
 
     client = LLMClient(conn=conn)
-    return client.run(system=system, user=user, job="premarket", max_turns=1,
-                      max_tokens=max_tokens)
+    # 2026-08-26：LLM 抖动重试 1 次（盘前偶发失败会让消息汇总整节降级）
+    for attempt in (0, 1):
+        try:
+            out = client.run(system=system, user=user, job="premarket", max_turns=1,
+                             max_tokens=max_tokens)
+            if (out or "").strip():
+                return out
+        except Exception as exc:
+            if attempt == 1:
+                logger.warning("盘前 LLM 调用失败(重试后): %s", exc)
+    return ""
 
 
 def overnight_analysis(db_path: str) -> str:
@@ -131,6 +140,14 @@ def digest(db_path: str) -> dict:
                 result = {"ok": True, **parsed}
                 _digest_cache[db_path] = (now, result)
                 return result
+            # 2026-08-26：JSON 解析失败（LLM 输出带噪音）重试 1 次
+            out2 = _llm(conn, sys_prompt + "\n（上次输出 JSON 解析失败，请严格只输出 JSON 对象）",
+                        "\n".join(material)[:6000])
+            parsed2 = _parse_json(out2)
+            if parsed2:
+                result = {"ok": True, **parsed2}
+                _digest_cache[db_path] = (now, result)
+                return result
         finally:
             if conn is not None:
                 conn.close()
@@ -155,3 +172,24 @@ def _parse_json(text: str | None) -> dict | None:
         return d if isinstance(d, dict) else None
     except ValueError:
         return None
+
+
+def digest_fallback_text(db_path: str, n: int = 6) -> str:
+    """消息汇总降级素材（2026-08-26）：digest 失败时直列最近电报标题，避免整节'暂无素材'。
+
+    返回格式化的文本行（含时间+标题），无素材返回 ""（调用方再显示兜底文案）。
+    """
+    try:
+        material = _recent_telegraph()
+    except Exception:
+        return ""
+    if not material:
+        return ""
+    lines = []
+    for ln in material[:n]:
+        # 行首 "YYYY-MM-DD HH:MM:SS | 标题" → 标题部分
+        head, _, rest = ln.partition("|")
+        title = (rest or head).strip()
+        ts = head.strip()[-5:] if head.strip() else ""
+        lines.append(f"  - {title}{f'（{ts}）' if ts else ''}")
+    return "\n".join(lines) if lines else ""

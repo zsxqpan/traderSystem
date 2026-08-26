@@ -27,7 +27,7 @@ SKILL = {
     "kind": "report",
     "description": "盘中实时报告：盘面总览(含ETF)/情绪判断+预测/日内主线(ETF+推荐股)/核心关注与预案对照",
     "uses": ["d8_temp_guide", "d9_rating_guide", "d11_emotion", "d12_limit_up_ladder",
-             "d13_fund_line", "d21_freshness"],
+             "d13_fund_line", "d21_freshness", "d29_sector_resonance"],
     "params": {
         "db_path": "str, required",
         "public": "bool, optional, default False",
@@ -195,6 +195,14 @@ def _core_quotes(db_path: str) -> tuple[list[list[str]], str]:
             "SELECT symbol FROM candidate_pool WHERE level IN ('core','track') "
             "AND out_date IS NULL ORDER BY level"
         )]
+        # 2026-08-26：实时失败回退收盘价（表格不空白；盘中报告核心关注必须可见）
+        fallback = {r["symbol"]: float(r["close"]) for r in conn.execute(
+            """SELECT d.symbol, d.close FROM daily_bars d
+               JOIN (SELECT symbol, MAX(REPLACE(date,'-','')) md FROM daily_bars
+                     WHERE symbol IN (%s) GROUP BY symbol) m
+               ON d.symbol=m.symbol AND REPLACE(d.date,'-','')=m.md""" % ",".join("?" * len(core)),
+            core,
+        )} if core else {}
     finally:
         conn.close()
     if not core:
@@ -204,15 +212,19 @@ def _core_quotes(db_path: str) -> tuple[list[list[str]], str]:
 
         live, pct_map = _live_quotes(db_path, core)
     except Exception:
-        return [], ""
+        live, pct_map = {}, {}
     rows, lines = [], []
     for sym in core:
         price = live.get(sym)
+        pct = pct_map.get(sym)
+        if price is None and sym in fallback:
+            # 实时不可用 → 收盘价回退（标注来源，防止误当实时）
+            price, pct = fallback[sym], None
         if price is None:
             continue
-        pct = pct_map.get(sym)
-        rows.append([sym, f"{price:.2f}", f"{pct:+.2%}" if pct is not None else "-"])
-        lines.append(f"{sym} {price:.2f} ({pct:+.2%})" if pct is not None else f"{sym} {price:.2f}")
+        pct_txt = f"{pct:+.2%}" if pct is not None else "—(收盘)"
+        rows.append([sym, f"{price:.2f}", pct_txt])
+        lines.append(f"{sym} {price:.2f} ({pct_txt})")
     return rows, "；".join(lines)
 
 
@@ -232,13 +244,35 @@ def _core_industry(conn, symbols: list[str]) -> str:
 
 
 def _read_plan(conn) -> str:
-    """盘后预案对照：读 viewpoints source='plan' 最近 active。无则省略。"""
+    """盘后预案对照：读 viewpoints source='plan' 最近 active，把 JSON 结论格式化为可读文本。"""
     try:
+        import json
+
         rows = conn.execute(
             """SELECT conclusion FROM viewpoints WHERE source='plan' AND status='active'
-               ORDER BY created_at DESC LIMIT 3"""
+               ORDER BY created_at DESC LIMIT 1"""
         ).fetchall()
-        return "\n".join(f"  - {r['conclusion']}" for r in rows)
+        lines: list[str] = []
+        for r in rows:
+            try:
+                plan = json.loads(r["conclusion"])
+            except (ValueError, TypeError):
+                lines.append(f"  - {str(r['conclusion'])[:200]}")
+                continue
+            if not isinstance(plan, dict):
+                lines.append(f"  - {str(plan)[:200]}")
+                continue
+            if plan.get("direction"):
+                lines.append(f"  方向: {plan['direction']}")
+            for p in (plan.get("picks") or []):
+                name = p.get("name", "")
+                sym = f"({p.get('symbol', '')})" if p.get("symbol") else ""
+                lines.append(f"  · 介入 {name}{sym}：{p.get('reason', '')}｜{p.get('plan', '')}")
+            for p in (plan.get("plans") or []):
+                lines.append(f"  · {p.get('symbol', '')}：{p.get('action', '')}")
+            if not lines:
+                lines.append("  - （预案内容为空）")
+        return "\n".join(lines)
     except Exception:
         return ""
 
@@ -252,7 +286,8 @@ def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
     views: dict = {}
     now = dt.datetime.now()
 
-    # ---- 1) 盘面总览（指数表格 + 结构 + 图表 + 指数ETF大资金信号） ----
+    # ---- 1) 盘面总览（指数表格 + 结构 + 指数ETF大资金信号） ----
+    # 2026-08-24：去掉 index_bars 图表——表格已含全部指数涨跌幅，重复展示
     idx_rows, struct = _index_table()
     if idx_rows:
         sections.append({
@@ -261,12 +296,6 @@ def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
         })
         if struct:
             sections.append({"type": "text", "text": struct})
-        chart_data = _index_chart_data(idx_rows)
-        if chart_data:
-            sections.append({
-                "type": "chart", "chart": "index_bars",
-                "title": "主要指数涨跌幅（%）", "data": chart_data,
-            })
         etf_sig = _index_etf_text()
         if etf_sig:
             sections.append({
@@ -382,6 +411,17 @@ def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
                 sections.append({"type": "text", "text": f"**走势推演**: {mainline['core_outlook']}"})
     if plan and not brief:
         sections.append({"type": "text", "text": "**【与盘后预案对照】**\n" + plan})
+
+    # 2026-08-23 角度 skill 复用：板块共振（d29），失败静默不阻断
+    if not brief:
+        try:
+            from invest.skills.sections.d29_sector_resonance import render as _resonance_render
+
+            resonance = _resonance_render(db_path)
+            if resonance:
+                sections.append({"type": "text", "text": resonance})
+        except Exception:
+            pass
 
     if not brief:
         sections.append({

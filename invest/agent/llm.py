@@ -100,7 +100,8 @@ class LLMClient:
                 row = self.conn.execute(
                     "SELECT SUM(tokens) AS t FROM llm_usage WHERE date=date('now','localtime')"
                 ).fetchone()
-                total = row["t"] or 0
+                # 兼容 tuple 行（无 row_factory）与 sqlite3.Row 两种连接
+                total = (row[0] if isinstance(row, (tuple, list)) else row["t"]) or 0
             if total >= DAILY_TOTAL_ALERT and state.get("daily_alert_date") != time.strftime("%Y-%m-%d"):
                 _push_alert(
                     f"当日累计 {total:,} tokens（超 {DAILY_TOTAL_ALERT:,}）",
@@ -122,6 +123,7 @@ class LLMClient:
         job: str = "agent",
         max_turns: int = 5,
         max_tokens: int | None = None,
+        history: list[dict] | None = None,
     ) -> str:
         """执行一轮带工具调用的对话，返回最终文本。
 
@@ -129,11 +131,14 @@ class LLMClient:
         2026-08-21：会话内只读工具结果缓存——同一轮对话中相同 (工具, 参数) 的
         只读查询（强度/温度/个股日线/联网搜索等）不重复执行，命中直接复用，
         减少多轮工具调用对同一维度的重复查询（配合 max_turns 收敛降低延迟）。
+        2026-08-24：history 参数注入多轮对话历史（[{role: 'user'|'assistant', content}]），
+        置于当前用户消息之前，实现跨轮上下文记忆。
         """
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
+        messages = [{"role": "system", "content": system}]
+        for h in (history or []):
+            if h.get("role") in ("user", "assistant") and h.get("content"):
+                messages.append({"role": h["role"], "content": h["content"]})
+        messages.append({"role": "user", "content": user})
         tool_cache: dict[tuple[str, str], str] = {}
         for _turn in range(max_turns):
             try:

@@ -46,7 +46,7 @@ def render(db_path: str) -> dict:
     from invest.data.halt import fetch_halt_list
     from invest.db import connect
     from invest.report import _freshness, _rating_guide, _ratings, _style_block, _temp_guide
-    from invest.skills.sections._digest import digest, overnight_analysis
+    from invest.skills.sections._digest import digest, digest_fallback_text, overnight_analysis
 
     sections: list[dict] = []
 
@@ -141,6 +141,12 @@ def render(db_path: str) -> dict:
     if news_lines:
         sections.append({"type": "text", "text": "**【消息汇总】**\n" + "\n".join(news_lines)})
     elif not d.get("ok"):
-        sections.append({"type": "text", "text": "**【消息汇总】**（暂无素材或汇总失败）"})
+        # 2026-08-26：LLM 失败/素材空 → 降级直列最近电报，避免整节'暂无素材或汇总失败'
+        fb = digest_fallback_text(db_path)
+        if fb:
+            sections.append({"type": "text",
+                             "text": "**【消息汇总】**（LLM 汇总失败，直列原始电报素材）\n" + fb})
+        else:
+            sections.append({"type": "text", "text": "**【消息汇总】**（暂无素材或汇总失败）"})
 
     return {"title": "A股投资系统 · 盘前报告", "sections": sections}

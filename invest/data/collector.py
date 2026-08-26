@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 
 import pandas as pd
@@ -17,6 +18,8 @@ from invest.db import connect
 from .sources import SOURCE_REGISTRY
 from .storage import upsert_df
 from .validator import cross_check, update_credibility
+
+logger = logging.getLogger(__name__)
 
 # 采集任务模板（真实运行时可按关注度分级生成参数化任务）
 TASKS: list[dict] = [
@@ -247,6 +250,10 @@ def _run_one(
                     break
                 _check_df(df, task)
                 written = upsert_df(conn, table, df) if table else 0
+                if table == "daily_bars" and "date" in df.columns:
+                    # 2026-08-24：收盘快照（src='snapshot'，16:10 写入）为临时日线，
+                    # 权威日线（akshare）写入后删除当日 snapshot 行，避免同 (symbol,date) 双行
+                    _drop_snapshot_dups(conn, df)
                 update_credibility(conn, src_name, True)
                 source_results.append({
                     "source": src_name,
@@ -284,6 +291,30 @@ def _run_one(
         "sources": source_results,
         "error": "; ".join(errors),
     }
+
+
+def _drop_snapshot_dups(conn, df: pd.DataFrame) -> None:
+    """删除 df 涉及日期的 src='snapshot' 行（2026-08-24 初版；2026-08-25 修复 index_bars）。
+
+    收盘快照（15:01，东财 clist 拼的当日 OHLCV）是临时数据，晚间 akshare 日线/指数写入后
+    删除当日快照行，避免同 (symbol,date)/(index_code,date) 出现 snapshot/akshare 双行——
+    双行会导致 quant.strength.calc_rs 的 pd.concat 报 "cannot reindex on an axis with
+    duplicate labels"（2026-08-25 盘中 after_close/industry_refresh 故障）。
+    """
+    try:
+        dates = sorted({str(d)[:10] for d in pd.unique(df["date"]) if d is not None})
+        for d in dates:
+            conn.execute(
+                "DELETE FROM daily_bars WHERE src='snapshot' AND (date=? OR REPLACE(date,'-','')=?)",
+                (d, d.replace("-", "")),
+            )
+            conn.execute(
+                "DELETE FROM index_bars WHERE src='snapshot' AND (date=? OR REPLACE(date,'-','')=?)",
+                (d, d.replace("-", "")),
+            )
+        conn.commit()
+    except Exception as exc:
+        logger.warning("清理收盘快照行失败: %s", exc)
 
 
 def _check_df(df: pd.DataFrame, task: dict) -> None:

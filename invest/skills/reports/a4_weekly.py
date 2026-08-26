@@ -10,7 +10,7 @@ SKILL = {
     "kind": "report",
     "description": "周报：评级/仓位/温度/中线强度前8/低估值候选/宏观/消息面(近3日)/周度观点",
     "uses": ["d1_news_block", "d6_macro", "d7_agent_viewpoints", "d8_temp_guide",
-             "d9_rating_guide", "d21_freshness", "d22_ratings"],
+             "d9_rating_guide", "d21_freshness", "d22_ratings", "d30_cycle_position"],
     "params": {
         "db_path": "str, required",
         "agent_text": "str, optional, default ''",

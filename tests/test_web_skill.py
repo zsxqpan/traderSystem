@@ -161,21 +161,169 @@ def test_run_skill_async_with_sink():
         set_run_skill_sink(None)
 
 
+def test_xueqiu_search_filters():
+    """2026-08-24：xueqiu_search 只保留雪球链接（站内 WAF 抓不了正文，走必应摘要）。"""
+    from invest.agent.web_tools import xueqiu_search
+
+    mixed = [
+        {"title": "段永平 雪球文章", "url": "https://xueqiu.com/6192813830/366009201", "snippet": "段永平：…"},
+        {"title": "百度百科", "url": "https://baike.baidu.com/item/x", "snippet": "…"},
+        {"title": "雪球热帖", "url": "https://xueqiu.com/3000000000/123456789", "snippet": "讨论…"},
+    ]
+    with mock.patch("invest.agent.web_tools.web_search", return_value=mixed):
+        out = xueqiu_search("段永平", n=5)
+    assert isinstance(out, list) and len(out) == 2
+    assert all("xueqiu.com" in it["url"] for it in out)
+    # 无雪球结果 → error
+    with mock.patch("invest.agent.web_tools.web_search", return_value=[mixed[1]]):
+        out2 = xueqiu_search("不存在", n=5)
+    assert isinstance(out2, dict) and "error" in out2
+    print("test_xueqiu_search_filters OK")
+
+
+def test_web_fetch_waf_detected():
+    """2026-08-24：雪球等 WAF 保护页面——web_fetch 返回明确提示而非密文。"""
+    from invest.agent.web_tools import web_fetch
+
+    waf_html = ('<textarea id="renderData" style="display:none">{"_waf_bd8ce2ce37":"xxx"}</textarea>'
+                '<meta name="aliyun_waf_aa" content="yyy">')
+    with mock.patch("invest.agent.web_tools._session") as sess:
+        sess.return_value.get.return_value.raise_for_status.return_value = None
+        sess.return_value.get.return_value.text = waf_html
+        out = web_fetch("https://xueqiu.com/6192813830/366009201")
+    assert "error" in out and "WAF" in out["error"]
+    print("test_web_fetch_waf_detected OK")
+
+
+def test_web_search_deepseek():
+    """2026-08-25：DeepSeek 官方搜索——Anthropic /messages + web_search tool 解析（url/title/citations 摘要）。"""
+    from invest.agent.web_tools import web_search_deepseek
+
+    fake_resp = {
+        "content": [
+            {"type": "server_tool_use", "name": "web_search"},
+            {"type": "web_search_tool_result", "content": [
+                {"type": "web_search_result", "title": "孚日股份(002083)龙虎榜数据",
+                 "url": "http://data.hexin.cn/market/longhustock/code/002083/", "page_age": "1天"},
+                {"type": "web_search_result", "title": "孚日股份 股吧",
+                 "url": "https://guba.eastmoney.com/list,002083.html", "page_age": "3天"},
+            ]},
+            {"type": "text", "text": "查询结果", "citations": [
+                {"url": "http://data.hexin.cn/market/longhustock/code/002083/",
+                 "cited_text": "龙虎榜数据显示净买入"},
+            ]},
+        ],
+    }
+    with mock.patch("invest.agent.web_tools._session") as sess:
+        sess.return_value.post.return_value.raise_for_status.return_value = None
+        sess.return_value.post.return_value.json.return_value = fake_resp
+        out = web_search_deepseek("孚日股份 002083 龙虎榜", n=5)
+    assert isinstance(out, list) and len(out) == 2
+    assert out[0]["url"].startswith("http://data.hexin.cn")
+    assert out[0]["snippet"] == "龙虎榜数据显示净买入"  # citations 摘要
+    assert "002083" in out[1]["url"]
+    # 未触发原生搜索 → None（降级多引擎）
+    with mock.patch("invest.agent.web_tools._session") as sess:
+        sess.return_value.post.return_value.raise_for_status.return_value = None
+        sess.return_value.post.return_value.json.return_value = {"content": [{"type": "text", "text": "x"}]}
+        assert web_search_deepseek("x", n=5) is None
+    print("test_web_search_deepseek OK")
+
+
+def test_web_search_priority_deepseek_first():
+    """2026-08-25：web_search 官方优先——官方成功直接用；官方失败降级多引擎。"""
+    from invest.agent.web_tools import web_search
+
+    ds_items = [{"title": "官方搜索结果", "url": "https://x.com/1", "snippet": "s"}]
+    # 官方成功 → 不再走 HTML 引擎
+    with mock.patch("invest.agent.web_tools.web_search_deepseek", return_value=ds_items):
+        out = web_search("孚日股份 龙虎榜", n=5)
+    assert out[0]["url"] == "https://x.com/1"
+    # 官方失败（None）→ 降级多引擎（bing 词典 → 搜狗命中）
+    with mock.patch("invest.agent.web_tools.web_search_deepseek", return_value=None), \
+            mock.patch("invest.agent.web_tools._search_engine",
+                       side_effect=lambda e, q, n: [{"title": "孚日股份龙虎榜详情", "url": "http://x.com/2",
+                                                     "snippet": ""}] if e != "bing_cn" else
+                       [{"title": "孚_百科", "url": "https://baike.baidu.com/item/x", "snippet": ""}]):
+        out2 = web_search("孚日股份 龙虎榜", n=5)
+    assert out2[0]["url"] == "http://x.com/2"
+    print("test_web_search_priority_deepseek_first OK")
+
+
+def test_web_search_multi_engine_fallback():
+    """2026-08-25：多引擎降级——必应分词差时自动降级搜狗/360（百度硬反爬最后兜底）。"""
+    from invest.agent.web_tools import web_search
+
+    dict_items = [{"title": "孚_百度百科", "url": "https://baike.baidu.com/item/x", "snippet": "汉字"}] * 5
+    good_items = [{"title": "孚日股份(002083)龙虎榜数据(07-24)", "url": "http://www.sogou.com/link?x",
+                   "snippet": "龙虎榜"}] * 5
+    calls = []
+
+    def _fake(engine, query, n):
+        calls.append(engine)
+        return dict_items if engine == "bing_cn" else good_items
+
+    with mock.patch("invest.agent.web_tools._search_engine", side_effect=_fake), \
+            mock.patch("invest.agent.web_tools.web_search_deepseek", return_value=None):
+        out = web_search("孚日股份 002083 龙虎榜", n=5)
+    assert calls == ["bing_cn", "sogou"]  # 必应质量差 → 降级搜狗（百度在最后）
+    assert "002083" in out[0]["title"]
+    print("test_web_search_multi_engine_fallback OK")
+
+
+def test_web_search_quality_detection():
+    """质量检测：含代码必须命中；词典类 url 不算有效结果。"""
+    from invest.agent.web_tools import _quality_ok
+
+    assert _quality_ok("孚日股份 002083 龙虎榜",
+                       [{"title": "孚_百科", "url": "https://baike.baidu.com/item/x", "snippet": ""}]) is False
+    assert _quality_ok("孚日股份 002083 龙虎榜",
+                       [{"title": "孚日股份(002083)龙虎榜", "url": "http://x.com", "snippet": ""}]) is True
+    assert _quality_ok("孚日股份 龙虎榜",
+                       [{"title": "孚_字典", "url": "https://zdic.net/x", "snippet": ""}]) is False
+    assert _quality_ok("孚日股份 龙虎榜",
+                       [{"title": "孚日股份龙虎榜详情", "url": "http://x.com", "snippet": ""}]) is True
+    print("test_web_search_quality_detection OK")
+
+
+def test_web_search_site_force_bing():
+    """site: 查询强制走必应（百度/搜狗不支持 site: 操作符）。"""
+    from invest.agent.web_tools import web_search
+
+    calls = []
+
+    def _fake(engine, query, n):
+        calls.append(engine)
+        return [{"title": "t", "url": "https://xueqiu.com/1/2", "snippet": "s"}]
+
+    with mock.patch("invest.agent.web_tools._search_engine", side_effect=_fake):
+        web_search("site:xueqiu.com 段永平", n=3)
+    assert calls == ["bing_cn"]
+    print("test_web_search_site_force_bing OK")
+
+
 def test_skill_request_ack_keywords():
-    """2026-08-21：深度分析/UZI 请求触发系统 ack。"""
+    """2026-08-23 收紧：仅明确提到 UZI 才算 skill 请求（'深度分析/完整报告'不再触发 ack）。"""
     from invest.push.feishu_ws import _is_skill_request
 
     assert _is_skill_request("用UZI深度分析孚日股份") is True
-    assert _is_skill_request("帮我做完整报告 600519") is True
+    assert _is_skill_request("跑个uzi看看") is True
+    assert _is_skill_request("帮我做完整报告 600519") is False
+    assert _is_skill_request("深度分析一下600519") is False
     assert _is_skill_request("今天天气怎么样") is False
 
 
 if __name__ == "__main__":
     test_web_search_parse()
+    test_web_search_multi_engine_fallback()
+    test_web_search_quality_detection()
+    test_web_search_site_force_bing()
     test_web_fetch_strips_tags()
     test_run_skill_parses_report_path()
     test_run_skill_timeout()
     test_build_dispatch_no_conn_for_web_tools()
+    test_xueqiu_search_filters()
+    test_web_fetch_waf_detected()
     test_llm_run_summary_fallback()
     test_run_skill_async_with_sink()
     test_skill_request_ack_keywords()

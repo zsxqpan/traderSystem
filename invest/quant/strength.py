@@ -20,7 +20,13 @@ def calc_rs(
     windows: list[int],
     weights: list[float],
 ) -> float:
-    """相对强度：多窗口超额收益加权。industry/benchmark 已按日期对齐。"""
+    """相对强度：多窗口超额收益加权。industry/benchmark 已按日期对齐。
+
+    2026-08-25 防御：index 重复（如 index_bars snapshot/akshare 双行）会导致 concat 报
+    "cannot reindex on an axis with duplicate labels"——先按 index 去重（保留最后一条）。
+    """
+    industry = industry[~industry.index.duplicated(keep="last")]
+    benchmark = benchmark[~benchmark.index.duplicated(keep="last")]
     df = pd.concat([industry, benchmark], axis=1, keys=["ind", "bench"]).dropna()
     if len(df) <= max(windows):
         return float("nan")

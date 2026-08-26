@@ -53,6 +53,19 @@ def test_calc_rs_direction():
     print("test_calc_rs_direction OK")
 
 
+def test_calc_rs_duplicate_index():
+    """2026-08-25 回归：index 重复（index_bars snapshot/akshare 双行）不再崩 concat——
+    防御去重保留最后一条，结果与去重前一致。"""
+    closes, _, _, bench = _make_closes()
+    r_clean = calc_rs(closes["A"], bench, [5, 10, 20], [0.2, 0.3, 0.5])
+    # 构造重复 index（bench 最后一条日期出现两次）
+    bench_dup = pd.concat([bench, bench.iloc[[-1]]])  # 末尾重复
+    assert bench_dup.index.duplicated().any()
+    r_dup = calc_rs(closes["A"], bench_dup, [5, 10, 20], [0.2, 0.3, 0.5])
+    assert abs(r_dup - r_clean) < 1e-9  # 去重后结果一致
+    print("test_calc_rs_duplicate_index OK")
+
+
 def test_trend_stage():
     dates = pd.bdate_range("2024-01-02", periods=120)
     up = pd.Series(100 * np.full(120, 1.003).cumprod(), index=dates)   # 持续上行

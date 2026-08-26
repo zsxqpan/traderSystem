@@ -152,3 +152,31 @@ def plan_review_llm(db_path: str, ctx: dict) -> dict:
     except Exception as exc:
         logger.warning("预案质量复盘 LLM 失败: %s", exc)
         return {}
+
+
+def etf_analysis_llm(db_path: str, ctx: dict) -> dict:
+    """点1：指数 ETF 解读（2026-08-24，明显变化时详细归因 + 风格变化探讨）。
+
+    ctx: {material: "每行一个 ETF 的 涨跌/量比/主力净/成交额"}。失败返回 {}。
+    """
+    try:
+        from invest.db import connect
+
+        conn = connect(db_path)
+        try:
+            out = _llm(conn, _SYSTEM,
+                       "以下是主要指数 ETF 当日数据（涨跌/量比/主力净流入/成交额）：\n"
+                       + (ctx.get("material") or "暂无") + "\n\n"
+                       "请输出 JSON：\n"
+                       '{"summary": "整体一句话（简单概括当日 ETF 表现）",\n'
+                       '"notable": "有明显变化的 ETF 及具体数字（涨跌幅/量比/超大单），无则空串",\n'
+                       '"attribution": "变化归因（结合指数风格/量能/资金，2-3 句，25字内每句）",\n'
+                       '"style_shift": "可能的市场风格变化探讨（大盘vs小盘/成长vs价值/板块倾向，1-2 句，无则空串）"}\n'
+                       "只基于给定数据推理，禁止编造数字。",
+                       max_tokens=800)
+            return _parse_json(out) or {}
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("ETF 解读 LLM 失败: %s", exc)
+        return {}

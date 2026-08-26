@@ -428,6 +428,37 @@ def _evening_report(db: str, conn) -> None:
     return "push_ok"
 
 
+def _pool_trap_scan(db: str, conn) -> None:
+    """17:10 候选池/持仓杀猪盘 8 信号扫描（2026-08-23，d31_pool_trap_alerts 复用）。
+
+    写 pool_trap_alerts 表（全部结果留痕）+ 有 ≥🟡 预警推送飞书（1h 限频）。
+    """
+    import datetime as _dt
+    import json
+
+    from invest.data.storage import upsert_df
+    from invest.skills.sections.d31_pool_trap_alerts import scan_pool
+
+    alerts = scan_pool(conn)
+    if alerts:
+        import pandas as _pd
+
+        upsert_df(conn, "pool_trap_alerts", _pd.DataFrame([{
+            "date": _dt.date.today().isoformat(),
+            "symbol": a["symbol"], "level": a["level"], "trap_score": a["trap_score"],
+            "signals_hit": json.dumps(a["signals_hit"], ensure_ascii=False),
+            "recommendation": a["recommendation"],
+        } for a in alerts]))
+    warn = [a for a in alerts if a["level"] in ("🟡", "🟠", "🔴")]
+    if warn:
+        lines = ["⚠️【候选池预警 · 杀猪盘扫描】"]
+        for a in warn:
+            lines.append(f"  {a['symbol']} {a['name'] or ''} {a['level']} 命中{len(a['signals_hit'])}信号")
+            for s in a["signals_hit"]:
+                lines.append(f"    · {s['name']}: {(s.get('evidence') or '')[:60]}")
+        Notifier().send_text("\n".join(lines), key="pool_trap", min_interval=3600)
+
+
 # 单任务执行入口（供操作系统计划任务调用，见 scripts/run_job.py 与 install_os_tasks.ps1）
 JOB_FUNCS: dict[str, Callable] = {
     "premarket": _premarket,
@@ -441,6 +472,7 @@ JOB_FUNCS: dict[str, Callable] = {
     "industry_refresh": _industry_refresh,
     "daily_refresh": _daily_refresh,
     "evening_report": _evening_report,
+    "pool_trap_scan": _pool_trap_scan,  # 2026-08-23：候选池杀猪盘扫描
 }
 
 
@@ -474,8 +506,12 @@ def build_scheduler(ticker_only: bool = False) -> BackgroundScheduler:
     # 竞价报告（2026-08-22）：9:26（ticker-only 部署由 _intraday_tick_job 竞价窗口触发，这里为 full 模式备选）
     sched.add_job(_wrap("auction", _auction_report), CronTrigger(day_of_week="mon-fri", hour=9, minute=26), id="auction", misfire_grace_time=300)
     sched.add_job(_wrap("after_close", _after_close), CronTrigger(day_of_week="mon-fri", hour=16, minute=0), id="after_close", misfire_grace_time=21600)
-    # 收盘快照（2026-08-20）：16:10 实时源直接落当日收盘价，不必等晚间日线
-    sched.add_job(_wrap("snapshot_close", _snapshot_close), CronTrigger(day_of_week="mon-fri", hour=16, minute=10), id="snapshot_close", misfire_grace_time=7200)
+    # 收盘即日线（2026-08-20 初版 16:10；2026-08-24 提前到 15:01 并升级全市场 OHLCV）：
+    # 东财 clist 批量接口 15:00 收盘后立即返回全市场当日 OHLCV，15:01 落库 src='snapshot'，
+    # 不必等晚间 akshare 日线（约 21 点）；晚间权威数据写入后自动删当日 snapshot 行
+    sched.add_job(_wrap("snapshot_close", _snapshot_close), CronTrigger(day_of_week="mon-fri", hour=15, minute=1), id="snapshot_close", misfire_grace_time=7200)
+    # 候选池杀猪盘扫描（2026-08-23）：17:10 全 8 信号扫描候选池/持仓，≥🟡 推送
+    sched.add_job(_wrap("pool_trap_scan", _pool_trap_scan), CronTrigger(day_of_week="mon-fri", hour=17, minute=10), id="pool_trap_scan", misfire_grace_time=7200)
     # 周末周报（2026-08-18 改）：周日 20:00（原周六 09:00）——晚间数据齐备后发，
     # 内容含消息面（财联社电报近7日）+ 周度复盘（纪律/周期漂移/持仓卡片复评）
     sched.add_job(_wrap("weekend", _weekend), CronTrigger(day_of_week="sun", hour=20, minute=0), id="weekend", misfire_grace_time=21600)

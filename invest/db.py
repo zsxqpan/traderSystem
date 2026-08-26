@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 11
 
 SCHEMA_SQL = """
 -- ============ 行情 ============
@@ -408,6 +408,58 @@ CREATE TABLE IF NOT EXISTS stock_universe_history (
     src       TEXT DEFAULT 'manual',
     PRIMARY KEY (date, symbol)
 );
+
+-- ============ 雪球大V画像与观点（2026-08-23，轻量子 skill big-v-monitor） ============
+CREATE TABLE IF NOT EXISTS big_v_profile (
+    id          TEXT PRIMARY KEY,          -- slug，如 xq_duanyp
+    name        TEXT NOT NULL,             -- 显示名
+    platform    TEXT NOT NULL DEFAULT 'xueqiu',
+    xueqiu_id   TEXT,                      -- 雪球用户 ID
+    homepage    TEXT,                      -- 主页 URL
+    style       TEXT,                      -- 风格标签：价投/成长/游资/宏观/量化/技术/趋势
+    strengths   TEXT,                      -- 擅长方向（行业/赛道）
+    win_rate    TEXT,                      -- 自述/公开胜率（文本，注明口径）
+    track_record TEXT,                     -- 历史战绩/里程碑（文本或 JSON）
+    source_links TEXT,                     -- 公开资料链接（JSON 数组文本）
+    notes       TEXT,
+    updated_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS big_v_opinion (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id   TEXT NOT NULL REFERENCES big_v_profile(id),
+    opinion_date TEXT NOT NULL,            -- 观点发表日
+    symbol       TEXT,                     -- 涉及标的（空=大盘/行业）
+    topic        TEXT,
+    view         TEXT NOT NULL,            -- 观点内容
+    bias         TEXT,                     -- bullish / bearish / neutral
+    confidence   REAL,                     -- 0-1，可空
+    url          TEXT,                     -- 原文链接
+    collected_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_big_v_opinion_profile ON big_v_opinion(profile_id, opinion_date);
+
+-- ============ 候选池杀猪盘预警（2026-08-23，d31_pool_trap_alerts 定时扫描） ============
+CREATE TABLE IF NOT EXISTS pool_trap_alerts (
+    date           TEXT NOT NULL,
+    symbol         TEXT NOT NULL,
+    level          TEXT NOT NULL,           -- 🟢 / 🟡 / 🟠 / 🔴
+    trap_score     REAL,                    -- 反向分，越高越安全
+    signals_hit    TEXT,                    -- JSON 数组 [{id,name,evidence,severity}]
+    recommendation TEXT,
+    src            TEXT NOT NULL DEFAULT 'trap_scan',
+    PRIMARY KEY (date, symbol, src)
+);
+
+-- ============ 飞书对话历史（2026-08-24，run_chat 多轮上下文记忆） ============
+CREATE TABLE IF NOT EXISTS chat_history (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    TEXT NOT NULL,
+    role       TEXT NOT NULL,               -- user / assistant
+    content    TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_chat_history_chat ON chat_history(chat_id, id);
 """
 
 

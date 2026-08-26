@@ -39,3 +39,5 @@ tools/
 !.claude/skills/trader-system/
 =  # 0-byte accidental empty file
 =
+.dsh/
+_piptmp/

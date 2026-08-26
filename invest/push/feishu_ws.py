@@ -76,7 +76,7 @@ def setup_file_logging() -> None:
 MAX_REPORT_LEN = 3800
 REPLY_MIN_INTERVAL = 120.0  # 同一发送者两次报告回复的最小间隔（秒）；2026-08-22 由 30s 提到 120s（报告含 LLM）
 CHAT_MIN_INTERVAL = 10.0   # 同一发送者两次 Agent 会话回复的最小间隔（秒）
-_CHAT_MAX_LEN = 2000       # Agent 会话回复最大长度
+_CHAT_MAX_LEN = 6000       # Agent 会话回复最大长度（2026-08-27 由 2000 提：全能 Agent 分析可展开）
 
 _GREETING_KEYWORDS = ("在吗", "在不在", "你好", "您好", "hello", "hi", "help", "帮助", "你是谁", "你会什么", "怎么用")
 
@@ -352,9 +352,10 @@ def _is_greeting(text: str) -> bool:
     return len(t) <= 20 and any(k in t for k in _GREETING_KEYWORDS)
 
 
-def _agent_chat(text: str, nonadmin: bool = False) -> str:
+def _agent_chat(text: str, nonadmin: bool = False, chat_id: str = "") -> str:
     """会话 Agent 回复（2026-08-18：Skill 由大模型语义自选并在回复中自标注）。
 
+    2026-08-24：chat_id 传入 run_chat，启用多轮对话记忆（读/写 chat_history）。
     非管理员计入 job='group' 限额。
     """
     try:
@@ -363,7 +364,18 @@ def _agent_chat(text: str, nonadmin: bool = False) -> str:
 
         conn = connect(str(ROOT / "data" / "invest.db"))
         try:
-            out = run_chat(conn, text[:1000], job="group" if nonadmin else "feishu_chat")
+            # 2026-08-23：记录用户原文（thread-local），run_skill 门禁据此判断是否明确提到 UZI；
+            # 并启用数据新鲜度硬门禁——数据滞后时数据工具返回原因而非旧数据（对话结束复位）
+            from invest.agent.tools import set_current_user_text, set_freshness_gate
+
+            set_current_user_text(text[:1000])
+            set_freshness_gate(True)
+            try:
+                out = run_chat(conn, text[:1000], job="group" if nonadmin else "feishu_chat",
+                               chat_id=chat_id)
+            finally:
+                set_freshness_gate(False)
+                set_current_user_text("")  # 复位，避免 thread-local 残留影响后续（含测试）
         finally:
             conn.close()
         out = (out or "").strip()
@@ -430,16 +442,17 @@ def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False
     _last_reply_at["chat:" + sender_id] = now
 
     logger.info("Agent 会话回复（nonadmin=%s）: %s", nonadmin, text[:40])
-    reply = _agent_chat(text, nonadmin=nonadmin)
+    reply = _agent_chat(text, nonadmin=nonadmin, chat_id=chat_id)
     # Skill 由大模型语义自选并在回复文本末尾自标注（"↘ 已使用 Skill：xxx"），原样发送
     ok = send_message(chat_id, "chat_id", reply)
     logger.info("Agent 回复完成 ok=%s len=%d", ok, len(reply))
 
 
 def _is_skill_request(text: str) -> bool:
-    """是否请求 UZI 深度分析（2026-08-21）。"""
+    """是否请求 UZI 深度分析（2026-08-23 收紧：**仅明确提到 UZI 才算**；
+    '深度分析/完整报告'等词不再触发 ack——由 Agent 按角度 skill 处理）。"""
     t = (text or "").lower()
-    return any(k in t for k in ("深度分析", "深度报告", "uzi", "完整报告", "用 skill"))
+    return "uzi" in t
 
 
 def _skill_ack_ok() -> bool:
@@ -503,8 +516,6 @@ def _handle_event(data: P2ImMessageReceiveV1) -> None:
     if sender_type == "bot" or (sender_id and sender_id == _bot_open_id()):
         return  # 机器人自己发言，不处理
 
-    from invest.push.feishu_push import send_message
-
     # ---- 私聊（p2p）：任何消息都回应（非管理员计入每日限额）----
     # 意图识别：私聊始终走 LLM 语义判断（keyword=False），不用群聊的关键词短路
     if getattr(msg, "chat_type", "") == "p2p":
@@ -519,23 +530,12 @@ def _handle_event(data: P2ImMessageReceiveV1) -> None:
 
     if sender_id == owner_open_id:
         # ---- 管理员 ----
-        # 兜底：mentions 因权限/SDK 解析缺失时，文本里飞书占位符 @_user_N 也算被艾特
-        mentioned = mentioned or ("@_user" in text and "@" in text)
+        # 2026-08-25：群聊**仅在被 @ 机器人时**回应；未 @ 一律静默——
+        # 移除旧的"未@ 语义识别为报告请求仍触发盘中报告"分支（正常聊天含'盘中'等词会被误触发）
         if mentioned:
             # 群内 @ 管理员：任意消息都由 Agent 回应（报告/闲聊/提问）
             _agent_reply(chat_id, text, sender_id, nonadmin=False)
-        elif _is_report_request(text):
-            # 未 @ 的管理员发言：仅语义识别为要实时报告才触发
-            if _rate_limited(sender_id):
-                logger.info("管理员请求限频跳过（120s 内重复）: %s", text[:30])
-                return
-            logger.info("管理员请求盘中报告（未@）: %s", text[:40])
-            send_message(chat_id, "chat_id", "⏳ 收到，正在生成盘中实时报告…")
-            report = _build_intraday_report()
-            ok = _send_report(chat_id, report)
-            _persist_intraday_views(report.get("views") or {})
-            logger.info("盘中报告回复完成 ok=%s", ok)
-        return  # 管理员普通发言（未 @ 且非报告）不回复
+        return  # 未 @ 的管理员发言一律不回复（含报告请求）
 
     # ---- 非管理员（限额 100 万/日，超限只回额度提示）----
     if mentioned:

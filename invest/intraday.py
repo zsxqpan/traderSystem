@@ -61,6 +61,11 @@ def fetch_batch_prices(
     """批量取最新价（核心池一次轮询）：返回 {裸代码: price}，只收新鲜数据。
 
     db_path 提供时，将源/延迟/stale 计数写入 job_runs(job='realtime') 留痕。
+
+    2026-08-26：非交易时段（收盘后/休市）放宽新鲜度——三源返回的时间戳是
+    最近一次行情时刻（收盘后即收盘时刻），按 10s 严格过滤会把收盘价全部丢弃，
+    导致盘中报告「核心关注」表格空白。非交易时段接受最近 12 小时内的行情
+    （收盘后=收盘价，即最新可得）。
     """
     from invest.data.realtime import RealtimeQuoter, is_fresh, log_realtime_health
     symbols = list(dict.fromkeys(symbols))
@@ -73,9 +78,11 @@ def fetch_batch_prices(
         return {}
     if db_path:
         log_realtime_health(db_path, quotes, q.source_failures)
+    # 交易时段严格 10s；非交易时段放宽到 12h（收盘价/上一交易时段行情即最新）
+    effective_lag = max_lag if _in_trading_window() else 12 * 3600.0
     out: dict[str, float] = {}
     for sym, qq in quotes.items():
-        if qq.price is None or not is_fresh(qq, max_lag=max_lag):
+        if qq.price is None or not is_fresh(qq, max_lag=effective_lag):
             continue
         out[_bare_symbol(sym)] = qq.price
     return out

@@ -127,6 +127,46 @@ def test_a0_macro_unchanged_hides_macro(monkeypatch):
     assert "牛来电影票房破圈" in texts  # 市场外仍列
 
 
+def test_a0_digest_fail_fallback(monkeypatch):
+    """消息汇总 LLM 失败（ok=False）→ 降级直列原始电报素材，不再显示'暂无素材或汇总失败'。"""
+    monkeypatch.setattr("invest.skills.sections._digest.digest", lambda db: {"ok": False})
+    monkeypatch.setattr("invest.skills.sections._digest.overnight_analysis", lambda db: "")
+    monkeypatch.setattr("invest.data.global_snapshot.global_snapshot_rows", list)
+    monkeypatch.setattr("invest.data.halt.fetch_halt_list", list)
+    monkeypatch.setattr(
+        "invest.skills.sections._digest._recent_telegraph",
+        lambda cut_days=3: [
+            "2026-08-25 16:01:02 | 央行：保持流动性合理充裕",
+            "2026-08-25 16:30:11 | 某公司公告：拟回购1亿元",
+        ],
+    )
+    p = _tmp_db()
+    conn = connect(p)
+    _seed(conn)
+    conn.close()
+    struct = run_structured("a0_premarket", db_path=p)
+    texts = "".join(s.get("text", "") for s in struct["sections"])
+    assert "暂无素材或汇总失败" not in texts
+    assert "原始电报素材" in texts and "央行：保持流动性合理充裕" in texts
+
+
+def test_a0_digest_fail_no_material(monkeypatch):
+    """LLM 失败且无电报素材 → 仍显示兜底文案（不崩溃）。"""
+    monkeypatch.setattr("invest.skills.sections._digest.digest", lambda db: {"ok": False})
+    monkeypatch.setattr("invest.skills.sections._digest.overnight_analysis", lambda db: "")
+    monkeypatch.setattr("invest.data.global_snapshot.global_snapshot_rows", list)
+    monkeypatch.setattr("invest.data.halt.fetch_halt_list", list)
+    monkeypatch.setattr("invest.skills.sections._digest._recent_telegraph", lambda cut_days=3: [])
+    p = _tmp_db()
+    conn = connect(p)
+    _seed(conn)
+    conn.close()
+    struct = run_structured("a0_premarket", db_path=p)
+    texts = "".join(s.get("text", "") for s in struct["sections"])
+    assert "消息汇总" in texts  # 兜底文案存在，不崩溃
+
+
+
 def test_render_feishu_card():
     """结构化 → 飞书卡片：schema 2.0、table 组件、**加粗**、*星号*转加粗。"""
     struct = {

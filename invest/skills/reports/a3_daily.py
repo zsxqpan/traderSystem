@@ -29,7 +29,7 @@ SKILL = {
     "kind": "report",
     "description": "盘后日报（盘中PLUS）：盘面总览(含ETF)/盘中观点复盘/重要板块总分析/明日预案+质量复盘",
     "uses": ["d1_news_block", "d16_card_alerts", "d17_pool_delta", "d21_freshness",
-             "d12_limit_up_ladder", "d13_fund_line"],
+             "d12_limit_up_ladder", "d13_fund_line", "d28_community_hot", "d29_sector_resonance"],
     "params": {
         "db_path": "str, required",
         "agent_text": "str, optional, default ''（兼容旧调用，新结构未使用）",
@@ -78,6 +78,52 @@ def _index_etf_rows() -> list[list[str]]:
             f"{q['super_net']/1e8:+.2f}亿" if q.get("super_net") else "-",
         ])
     return rows
+
+
+def _etf_analysis_text(db_path: str, quotes: dict) -> str:
+    """指数 ETF 解读（2026-08-24）：无异常用规则简单解读（0 token）；
+    明显变化（涨跌≥1.2%/量比≥1.8/超大单占比≥0.5%）→ LLM 详细归因 + 风格变化探讨。"""
+    try:
+        rows = []
+        for code in ("510300", "510050", "510500", "512100", "159915", "588000"):
+            q = quotes.get(code)
+            if not q:
+                continue
+            pct = q.get("pct")
+            vol = q.get("vol_ratio")
+            amount = q.get("amount") or 0
+            super_net = q.get("super_net") or 0
+            rows.append({"name": q.get("name") or code, "pct": pct, "vol_ratio": vol,
+                         "super_net": super_net, "amount": amount})
+        if not rows:
+            return ""
+        notable = [r for r in rows
+                   if (r["pct"] is not None and abs(r["pct"]) >= 1.2)
+                   or (r["vol_ratio"] is not None and r["vol_ratio"] >= 1.8)
+                   or (r["amount"] and abs(r["super_net"]) / r["amount"] >= 0.005)]
+        if not notable:
+            parts = [f"{r['name']} {r['pct']:+.2f}%" for r in rows if r["pct"] is not None]
+            if not parts:
+                return ""
+            return "ETF 整体平稳（" + "；".join(parts[:4]) + "），未见明显放量或资金异动。"
+        from invest.skills.sections import _daily_llm
+
+        material = "\n".join(
+            f"{r['name']} 涨跌{r['pct']:+.2f}% 量比{r['vol_ratio'] or '-'} "
+            f"主力净{r['super_net'] / 1e8:+.2f}亿 成交{r['amount'] / 1e8:.0f}亿" for r in rows)
+        out = _daily_llm.etf_analysis_llm(db_path, {"material": material})
+        lines = []
+        if out.get("summary"):
+            lines.append(f"**整体**: {out['summary']}")
+        if out.get("notable"):
+            lines.append(f"**异动**: {out['notable']}")
+        if out.get("attribution"):
+            lines.append(f"**归因**: {out['attribution']}")
+        if out.get("style_shift"):
+            lines.append(f"**风格变化可能**: {out['style_shift']}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
 
 
 def _today_views_text(conn) -> str:
@@ -254,6 +300,19 @@ def render(db_path: str, agent_text: str = "") -> dict:
                 })
         except Exception:
             pass
+        # 2026-08-24：指数 ETF 解读——简单默认，明显变化 LLM 详细归因+风格探讨（失败静默）
+        try:
+            from invest.data.etf import INDEX_ETFS, fetch_etf_quotes
+
+            _etf_quotes = fetch_etf_quotes(list(INDEX_ETFS))
+            etf_analysis = _etf_analysis_text(db_path, _etf_quotes)
+            if etf_analysis:
+                sections.append({
+                    "type": "text",
+                    "text": "**【指数ETF解读】**\n" + etf_analysis,
+                })
+        except Exception:
+            pass
 
     # ---- 点2 盘中观点复盘（LLM） ----
     conn = connect(db_path)
@@ -383,5 +442,19 @@ def render(db_path: str, agent_text: str = "") -> dict:
         pass
     if pool and pool != "无":
         sections.append({"type": "text", "text": "**【候选池变化】**\n" + pool})
+
+    # 2026-08-23 角度 skill 复用：板块共振（d29）+ 社区热议（d28），失败静默不阻断
+    try:
+        from invest.skills.sections.d28_community_hot import render as _community_render
+        from invest.skills.sections.d29_sector_resonance import render as _resonance_render
+
+        resonance = _resonance_render(db_path)
+        if resonance:
+            sections.append({"type": "text", "text": resonance})
+        community = _community_render(db_path, n=3, job="daily_report")
+        if community:
+            sections.append({"type": "text", "text": "**【社区热议 · 雪球/股吧】**\n" + community})
+    except Exception:
+        pass
 
     return {"title": "A股投资系统 · 盘后日报", "sections": sections, "plan_data": plan_data}

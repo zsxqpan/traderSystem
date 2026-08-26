@@ -722,6 +722,16 @@ def weekly_report(db_path: str, agent_text: str = "") -> str:
         lines.append("【宏观流动性】")
         lines.append(_macro_text(conn))
         lines.append("")
+        # 2026-08-23 角度 skill 复用：周期行业定位（d30），失败静默不阻断
+        try:
+            from invest.skills.sections.d30_cycle_position import _cycle_position
+
+            cyc = _cycle_position(conn)
+            if cyc:
+                lines.append(cyc)
+                lines.append("")
+        except Exception:
+            pass
         lines.append("【消息面 · 大模型提炼（近3日）】")
         lines.append(_news_block(db_path))
         lines.append("")

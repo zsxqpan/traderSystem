@@ -20,10 +20,14 @@ def _fmt_group(title: str, items: list[dict]) -> list[str]:
 
 
 def render(db_path: str) -> str:
-    from invest.skills.sections._digest import digest
+    from invest.skills.sections._digest import digest, digest_fallback_text
 
     d = digest(db_path)
     if not d.get("ok"):
+        # 2026-08-26：LLM 失败/素材空 → 降级直列最近电报，避免整节'暂无素材'
+        fb = digest_fallback_text(db_path)
+        if fb:
+            return "（消息汇总 LLM 失败，以下为原始电报素材）\n" + fb
         return "（暂无消息素材或汇总失败）"
     lines: list[str] = []
     news = d.get("news") or {}

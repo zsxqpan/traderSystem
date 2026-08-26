@@ -84,13 +84,13 @@ def _fresh_db():
 # ---------- 注册表完整性 ----------
 
 def test_registry_complete():
-    """34 个 skill 全注册：7 报告 + 27 小节；元数据与 uses 引用全合法。"""
+    """38 个 skill 全注册：7 报告 + 31 小节；元数据与 uses 引用全合法。"""
     ids = registry.list_skills()
-    assert len(ids) == 34, f"期望 34 个 skill，实际 {len(ids)}"
+    assert len(ids) == 38, f"期望 38 个 skill，实际 {len(ids)}"
     reports = registry.list_skills("report")
     sections = registry.list_skills("section")
     assert len(reports) == 7
-    assert len(sections) == 27
+    assert len(sections) == 31
     assert set(reports) == {"a0_premarket", "a3_daily", "a4_weekly", "a5_monthly",
                             "a6_yearly", "a7_auction", "b1_intraday"}
     assert registry.validate_all() == []  # 元数据合法 + uses 引用存在
@@ -136,6 +136,12 @@ def test_a3_structured(monkeypatch):
         "plans": [{"symbol": "600519", "action": "持有"}]}
     _dl.plan_review_llm = lambda db, ctx: {
         "quality": "昨日预案基本兑现", "fixes": ["增加ETF量能权重"]}
+    # 2026-08-24：ETF 解读（量比 1.8 触发 LLM 详细解读）
+    _dl.etf_analysis_llm = lambda db, ctx: {
+        "summary": "沪深300ETF放量上行，大资金进场",
+        "notable": "沪深300ETF量比1.80",
+        "attribution": "量能放大与超大单流入同步，疑似国家队动作",
+        "style_shift": "大盘权重风格占优，小盘相对走弱"}
 
     p = _fresh_db()
     monkeypatch.setattr("invest.data.index_realtime.fetch_index_realtime", lambda: {
@@ -145,6 +151,8 @@ def test_a3_structured(monkeypatch):
                    "turnover": 2.1, "vol_ratio": 1.8, "main_net": 5e8, "super_net": 3e8}})
     monkeypatch.setattr("invest.data.etf.index_etf_signal_text", lambda: "沪深300ETF 量比1.80（明显放量）")
     monkeypatch.setattr("invest.data.etf.sector_etf_text", lambda: "[AI硬件] 半导体ETF +1.2% 成交80亿")
+    # 2026-08-23 d28 社区热议：mock 搜索为空（全 mock 不联网），d29 纯规则无影响
+    monkeypatch.setattr("invest.agent.web_tools.web_search", lambda query, n=5: [])
     # 预案历史（质量复盘输入）
     monkeypatch.setattr("invest.skills.reports.a3_daily._plan_history",
                         lambda conn: [{"date": "2026-08-21", "plan_summary": "看多半导体",
@@ -159,6 +167,8 @@ def test_a3_structured(monkeypatch):
     assert "点3 重要板块总分析" in texts and "AI硬件" in texts and "机器人" in texts
     assert "点4 明日预案" in texts and "600519" in texts
     assert "预案质量复盘" in texts and "增加ETF量能权重" in texts
+    # 2026-08-24：指数 ETF 解读（LLM 详细归因 + 风格变化）
+    assert "指数ETF解读" in texts and "大资金进场" in texts and "风格变化可能" in texts
     # 预案闭环：plan_data 可落库
     assert struct.get("plan_data", {}).get("direction") == "继续关注AI硬件"
 
@@ -186,14 +196,71 @@ def test_b1_structured(monkeypatch):
     with mock.patch("invest.report._live_quotes", return_value=({"600519": 105.0}, {"600519": 0.05})):
         struct = run_structured("b1_intraday", db_path=p)
     tables = [s for s in struct["sections"] if s.get("type") == "table"]
-    charts = [s for s in struct["sections"] if s.get("type") == "chart"]
     texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
     assert any(t["title"] == "盘面总览" for t in tables)
     assert any(t["title"] == "核心关注实时行情" for t in tables)
-    assert charts and charts[0]["chart"] == "index_bars"  # 图表节
+    # 2026-08-24：移除 index_bars 图表（表格已含全部指数涨跌幅，避免重复输出）
+    assert not [s for s in struct["sections"] if s.get("type") == "chart"]
     assert "情绪与预测" in texts and "短线主升日" in texts
     assert "日内主线" in texts and "半导体" in texts and "扩圈量能健康" in texts
     assert "核心标的今日偏强" in texts  # 核心关注推演
+
+
+def test_b1_core_quotes_fallback_close(monkeypatch):
+    """2026-08-26：实时失败 → 核心关注回退收盘价（表格不空白）。"""
+    from invest.skills.reports.b1_intraday import _core_quotes
+
+    p = _fresh_db()
+    # candidate_pool 已有 600519(core)，daily_bars 最新收盘 100.0
+    with mock.patch("invest.report._live_quotes", return_value=({}, {})):
+        rows, _lines = _core_quotes(p)
+    assert rows and any(r[0] == "600519" for r in rows)
+    row = next(r for r in rows if r[0] == "600519")
+    assert row[1] == "100.00" and "收盘" in row[2]  # 收盘价回退 + 标注
+
+
+def test_b1_core_quotes_realtime_ok(monkeypatch):
+    """2026-08-26：实时正常 → 核心关注用实时价与涨跌幅（不回退）。"""
+    from invest.skills.reports.b1_intraday import _core_quotes
+
+    p = _fresh_db()
+    with mock.patch("invest.report._live_quotes",
+                    return_value=({"600519": 105.0}, {"600519": 0.05})):
+        rows, _lines = _core_quotes(p)
+    row = next(r for r in rows if r[0] == "600519")
+    assert row[1] == "105.00" and "+5.00%" in row[2]
+
+
+def test_fetch_batch_prices_close_after_loosened():
+    """2026-08-26：收盘后（非交易时段）fetch_batch_prices 接受收盘价（不再 10s 全丢）。"""
+    from invest.intraday import fetch_batch_prices
+
+    qq = mock.Mock()
+    qq.price = 12.95
+    qq.ts = dt.datetime.now() - dt.timedelta(hours=2)  # 收盘后 2 小时（旧时间戳）
+    qq.src = "sina"
+    with mock.patch("invest.intraday._in_trading_window", return_value=False), \
+         mock.patch("invest.data.realtime.RealtimeQuoter") as m_rt:
+        m_rt.return_value.__enter__.return_value.fetch.return_value = {"sz002412": qq}
+        m_rt.return_value.__enter__.return_value.source_failures = {"sina": 0}
+        out = fetch_batch_prices(["002412"])
+    assert out.get("002412") == 12.95
+
+
+def test_fetch_batch_prices_intraday_strict():
+    """2026-08-26：交易时段仍严格 10s（旧时间戳被丢弃）。"""
+    from invest.intraday import fetch_batch_prices
+
+    qq = mock.Mock()
+    qq.price = 12.95
+    qq.ts = dt.datetime.now() - dt.timedelta(hours=2)
+    qq.src = "sina"
+    with mock.patch("invest.intraday._in_trading_window", return_value=True), \
+         mock.patch("invest.data.realtime.RealtimeQuoter") as m_rt:
+        m_rt.return_value.__enter__.return_value.fetch.return_value = {"sz002412": qq}
+        m_rt.return_value.__enter__.return_value.source_failures = {"sina": 0}
+        out = fetch_batch_prices(["002412"])
+    assert "002412" not in out  # 盘中旧时间戳 → 丢弃
 
 
 def test_runner_byte_identical_sections():
@@ -314,3 +381,136 @@ def test_runner_errors():
         run_skill("a3_daily")  # 缺 db_path
     with pytest.raises(TypeError):
         run_skill("a3_daily", db_path="x", bogus_param=1)  # 未声明参数
+
+
+# ---------- 2026-08-23 角度 skill 复用：d28-d31 ----------
+
+def test_d28_community_hot(monkeypatch):
+    """社区热议（d28）：mock 搜索 + LLM → 输出提炼内容；搜索失败 → 空串。"""
+    from invest.skills.sections._community import _cache, community_hot
+
+    _cache.clear()
+    fake_items = [
+        {"title": "某股票讨论", "url": "http://x", "snippet": "散户看多分歧"},
+        {"title": "板块热议", "url": "http://y", "snippet": "机构与散户分歧"},
+    ]
+    monkeypatch.setattr("invest.agent.web_tools.web_search", lambda query, n=5: fake_items)
+
+    class _FakeLLM:
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self, **k):
+            return "某股票｜散户看多｜雪球"
+
+    monkeypatch.setattr("invest.agent.llm.LLMClient", _FakeLLM)
+    p = _tmp_db()
+    out = community_hot(p, n=3, job="test")
+    assert "某股票" in out and "雪球" in out
+    # 搜索失败 → 空串（不阻断）
+    _cache.clear()
+    monkeypatch.setattr("invest.agent.web_tools.web_search", lambda query, n=5: [])
+    assert community_hot(p, n=3, job="test") == ""
+
+
+def test_d29_sector_resonance():
+    """板块共振（d29）：强度∩资金交集按 RS 排序 + 联动；空表 → 空串。"""
+    from invest.skills.sections.d29_sector_resonance import _sector_resonance
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        upsert_df(conn, "quant_strength", pd.DataFrame([
+            {"run_date": "2026-08-15", "obj_type": "industry", "obj": "半导体", "period": "short",
+             "rs": 0.15, "momentum": 0.1, "trend_stage": "加速", "calc_version": "v1"},
+            {"run_date": "2026-08-15", "obj_type": "industry", "obj": "白酒", "period": "short",
+             "rs": 0.12, "momentum": 0.05, "trend_stage": "启动", "calc_version": "v1"},
+            {"run_date": "2026-08-15", "obj_type": "industry", "obj": "银行", "period": "short",
+             "rs": 0.10, "momentum": 0.02, "trend_stage": "启动", "calc_version": "v1"},
+        ]))
+        upsert_df(conn, "sector_fund_flow", pd.DataFrame([
+            {"date": "2026-08-15", "industry": "半导体", "main_net": 5e8},
+            {"date": "2026-08-15", "industry": "白酒", "main_net": 3e8},
+        ]))
+        upsert_df(conn, "quant_linkage", pd.DataFrame([
+            {"run_date": "2026-08-15", "a": "半导体", "b": "元件", "corr": 0.85, "lead": "半导体"},
+        ]))
+        out = _sector_resonance(conn, n=3)
+        assert "板块共振" in out and "半导体" in out and "白酒" in out
+        assert "银行" not in out  # 无资金流入不入选
+        assert "半导体" in out.splitlines()[1]  # RS 最高排第一
+        assert "联动:元件" in out
+        # 空表 → 空串
+        conn.execute("DELETE FROM sector_fund_flow")
+        conn.commit()
+        assert _sector_resonance(conn) == ""
+    finally:
+        conn.close()
+
+
+def test_d30_cycle_position():
+    """周期行业定位（d30）：阶段判定 + 白名单输出；无数据 → 空串。"""
+    from invest.skills.sections.d30_cycle_position import _cycle_position, _stage
+
+    assert _stage(0.05, 1e8, None) == "上行"
+    assert _stage(-0.05, -1e8, None) == "下行"
+    assert _stage(0.05, -1e8, 0.5) == "震荡"
+    assert _stage(-0.1, None, 0.2) == "筑底"
+    assert _stage(0.1, None, 0.9) == "过热"
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        upsert_df(conn, "quant_strength", pd.DataFrame([
+            {"run_date": "2026-08-15", "obj_type": "industry", "obj": "有色", "period": "mid",
+             "rs": 0.08, "trend_stage": "加速", "calc_version": "v1"},
+        ]))
+        upsert_df(conn, "sector_fund_flow", pd.DataFrame([
+            {"date": "2026-08-15", "industry": "有色", "main_net": 2e8},
+        ]))
+        upsert_df(conn, "quant_valuation", pd.DataFrame([
+            {"run_date": "2026-08-15", "obj": "有色", "pe_pct": 0.45},
+        ]))
+        out = _cycle_position(conn)
+        assert "有色" in out and "上行" in out and "PE分位45%" in out
+        conn.execute("DELETE FROM quant_strength")
+        conn.commit()
+        assert _cycle_position(conn) == ""
+    finally:
+        conn.close()
+
+
+def test_d31_pool_trap_alerts(monkeypatch):
+    """候选池预警（d31）：K线异常硬信号 + 软信号命中 → ≥🟡 输出；软信号无命中仅硬信号 → 不输出。"""
+    from invest.skills.sections.d31_pool_trap_alerts import render, scan_pool
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        conn.execute("INSERT INTO candidate_pool(symbol, level, industry, in_date) VALUES('600001','core','X','2026-08-15')")
+        dates = ["2026-08-15", "2026-08-14", "2026-08-13", "2026-08-12", "2026-08-11", "2026-08-10"]
+        closes = [100.0, 98.0, 96.0, 94.0, 92.0, 83.3]  # 近5日 +20%（≥15% → K线异常）
+        upsert_df(conn, "daily_bars", pd.DataFrame([
+            {"date": d, "symbol": "600001", "close": c} for d, c in zip(dates, closes)
+        ]))
+        conn.commit()
+        # 软信号命中：mock 搜索返回推广内容 → 命中 1/2/3/6
+        monkeypatch.setattr(
+            "invest.agent.web_tools.web_search",
+            lambda query, n=5: [{"title": "600001 股票 暴涨 推荐", "url": "http://x",
+                                 "snippet": "老师带单 进群 直播间 翻倍"}],
+        )
+        alerts = scan_pool(conn)
+        assert len(alerts) == 1
+        hit_names = [s["name"] for s in alerts[0]["signals_hit"]]
+        assert "K线异常配合" in hit_names
+        assert alerts[0]["level"] in ("🟡", "🟠", "🔴")
+        txt = render(p)
+        assert "600001" in txt and "杀猪盘扫描" in txt
+        # 软信号无命中：只剩 K线 1 信号 → 🟢，render 不输出
+        monkeypatch.setattr("invest.agent.web_tools.web_search", lambda query, n=5: [])
+        alerts2 = scan_pool(conn)
+        assert alerts2[0]["level"] == "🟢"
+        assert render(p) == ""
+    finally:
+        conn.close()

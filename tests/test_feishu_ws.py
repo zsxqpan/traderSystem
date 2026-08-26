@@ -203,25 +203,40 @@ def test_owner_mentioned_agent_chat(monkeypatch):
     )
     _patch_llm(monkeypatch, answer="no")
     monkeypatch.setattr("invest.agent.agents.run_chat",
-        lambda conn, text, job="feishu_chat", skill="": "今天半导体板块资金净流入居前（工具数据）。")
+        lambda conn, text, job="feishu_chat", chat_id="", skill="": "今天半导体板块资金净流入居前（工具数据）。")
     feishu_ws._handle_event(_event("ou_owner", "今天半导体怎么样", mentions=["ou_bot"]))
     assert sent and "半导体" in sent[0]
 
 
-def test_owner_semantic_without_mention(monkeypatch):
-    """管理员不 @：识别为报告请求 → 触发报告；未决消息 LLM 说 no → 不回复。"""
+def test_owner_without_mention_ignored(monkeypatch):
+    """2026-08-25：管理员群内未 @ → 一律不回应（含'盘中/报告'字样，不再触发报告）。"""
     sent = []
     monkeypatch.setattr("invest.push.feishu_push.send_message",
         lambda cid, ctype, text: sent.append(text) or True,
     )
-    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: _report_struct())
-    _patch_llm(monkeypatch, answer="yes")
-    feishu_ws._handle_event(_event("ou_owner", "现在行情怎么样"))
-    assert len(sent) == 2
-    sent.clear()
-    _patch_llm(monkeypatch, answer="no")
-    feishu_ws._handle_event(_event("ou_owner", "今天半导体怎么样"))  # 未决 → LLM no → 不触发
+    monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: _report_struct("R"))
+    monkeypatch.setattr("invest.agent.agents.run_chat",
+        lambda conn, text, job="feishu_chat", chat_id="", skill="": "不应触发")
+    feishu_ws._handle_event(_event("ou_owner", "现在行情怎么样"))       # 未 @
     assert sent == []
+    feishu_ws._handle_event(_event("ou_owner", "来一份盘中报告"))        # 未 @ 报告请求
+    assert sent == []
+    feishu_ws._handle_event(_event("ou_owner", "今天聊点盘中数据"))      # 含'盘中'字样
+    assert sent == []
+    print("test_owner_without_mention_ignored OK")
+
+
+def test_owner_mentioned_other_not_triggered(monkeypatch):
+    """2026-08-25：管理员群内 @ 别人（非机器人）→ 不触发 Agent 回应（移除文本含@兜底）。"""
+    sent = []
+    monkeypatch.setattr("invest.push.feishu_push.send_message",
+        lambda cid, ctype, text: sent.append(text) or True,
+    )
+    monkeypatch.setattr("invest.agent.agents.run_chat",
+        lambda conn, text, job="feishu_chat", chat_id="", skill="": "不应触发")
+    feishu_ws._handle_event(_event("ou_owner", "@_user_2 晚上一起吃饭吗", mentions=["ou_other"]))
+    assert sent == []  # @ 的是别人 → 不回应
+    print("test_owner_mentioned_other_not_triggered OK")
 
 
 def test_non_owner_mentioned_report_gets_public(monkeypatch):
@@ -248,7 +263,7 @@ def test_non_owner_mentioned_agent_chat(monkeypatch):
     )
     _patch_llm(monkeypatch, answer="no")
     monkeypatch.setattr("invest.agent.agents.run_chat",
-        lambda conn, text, job="group", skill="": "（工具数据）资金风格偏小盘成长。")
+        lambda conn, text, job="group", chat_id="", skill="": "（工具数据）资金风格偏小盘成长。")
     feishu_ws._handle_event(_event("ou_other", "今天什么风格占优", mentions=["ou_bot"]))
     assert sent and "风格" in sent[0]
 
@@ -319,7 +334,7 @@ def test_agent_chat_skill_self_annotated(monkeypatch):
     )
     _patch_llm(monkeypatch, answer="no")
     monkeypatch.setattr("invest.agent.agents.run_chat",
-        lambda conn, text, job="feishu_chat": "（工具数据）情绪周期主升，短线可打板。\n↘ 已使用 Skill：youzi")
+        lambda conn, text, job="feishu_chat", chat_id="": "（工具数据）情绪周期主升，短线可打板。\n↘ 已使用 Skill：youzi")
     feishu_ws._handle_event(_event("ou_owner", "今天短线能不能打板，给个操作建议", mentions=["ou_bot"]))
     assert sent and "已使用 Skill：youzi" in sent[0]
 
@@ -353,7 +368,7 @@ def test_dm_owner_chat(monkeypatch):
     )
     _patch_llm(monkeypatch, answer="no")
     monkeypatch.setattr("invest.agent.agents.run_chat",
-        lambda conn, text, job="feishu_chat", skill="": "（工具数据）短线强度靠前的行业有半导体、军工。")
+        lambda conn, text, job="feishu_chat", chat_id="", skill="": "（工具数据）短线强度靠前的行业有半导体、军工。")
     feishu_ws._handle_event(_event("ou_owner", "最近哪些行业强", chat_type="p2p"))
     assert sent and "半导体" in sent[0]
 
@@ -404,7 +419,7 @@ def test_dm_report_needs_llm_yes(monkeypatch):
     )
     monkeypatch.setattr(feishu_ws, "_build_intraday_report", lambda public=False, brief=True: _report_struct())
     monkeypatch.setattr("invest.agent.agents.run_chat",
-        lambda conn, text, job="feishu_chat", skill="": "（会话回答，不触发报告）")
+        lambda conn, text, job="feishu_chat", chat_id="", skill="": "（会话回答，不触发报告）")
     _patch_llm(monkeypatch, answer="no")
     feishu_ws._handle_event(_event("ou_owner", "来一份盘中报告", chat_type="p2p"))
     assert len(sent) == 1 and "R" not in sent[0]  # 只发会话回答，不发报告

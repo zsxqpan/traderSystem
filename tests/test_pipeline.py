@@ -48,7 +48,7 @@ def test_scheduler_jobs():
     # 2026-08-18 合并盘后报告：nightly/p2_brief → evening_report（数据滞后时跳过并推送原因）
     assert {"premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend",
             "intraday_tick", "monthly", "yearly", "industry_refresh", "daily_refresh",
-            "evening_report"} <= ids
+            "evening_report", "pool_trap_scan"} <= ids
     assert "p2_brief" not in ids and "nightly" not in ids
     print("test_scheduler_jobs OK")
 
@@ -74,7 +74,7 @@ def test_ticker_only_and_job_funcs():
     assert {j.id for j in sched.get_jobs()} == {"intraday_tick"}
     assert set(JOB_FUNCS) == {
         "premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend", "monthly",
-        "yearly", "industry_refresh", "daily_refresh", "evening_report",
+        "yearly", "industry_refresh", "daily_refresh", "evening_report", "pool_trap_scan",
     }
     print("test_ticker_only_and_job_funcs OK")
 
@@ -154,18 +154,95 @@ def test_data_freshness_and_snapshot_close():
             def __exit__(self, *a): return None
             def fetch(self, symbols):
                 return {"sz000001": Quote(symbol="sz000001", price=10.66, ts=dt.datetime.now(), src="sina")}
+        # 2026-08-24：全市场收盘日线 mock（返回小样本验证写入；空验证兼容）
         with mock.patch("invest.data.realtime.RealtimeQuoter", _FakeQuoter), mock.patch(
                 "invest.pipeline._fetch_index_closes",
-                return_value=[{"index_code": "000300", "date": exp, "close": 4000.5, "src": "snapshot"}]):
+                return_value=[{"index_code": "000300", "date": exp, "close": 4000.5, "src": "snapshot"}]), \
+                mock.patch("invest.data.close_daily.fetch_all_close_daily",
+                           return_value=__import__("pandas").DataFrame([
+                               {"date": exp, "symbol": "600519", "open": 1271.01, "high": 1313.8,
+                                "low": 1270.33, "close": 1304.66, "volume": 48440, "amount": 6.3e9},
+                           ])):
             r = snapshot_close(p)
-        assert r.get("stock") == 1 and r.get("index") == 1
+        assert r.get("stock") == 1 and r.get("index") == 1 and r.get("market") == 1
         conn = connect(p)
         row = conn.execute(
             "SELECT close FROM daily_bars WHERE symbol='000001' AND date=? AND src='snapshot'", (exp,)
         ).fetchone()
         assert row and abs(float(row["close"]) - 10.66) < 1e-6
+        # 全市场快照行含完整 OHLCV
+        mrow = conn.execute(
+            "SELECT open, high, low, close FROM daily_bars WHERE symbol='600519' AND date=? AND src='snapshot'", (exp,)
+        ).fetchone()
+        assert mrow and abs(float(mrow["open"]) - 1271.01) < 1e-6 and abs(float(mrow["close"]) - 1304.66) < 1e-6
         conn.close()
     print("test_data_freshness_and_snapshot_close OK")
+
+
+def test_close_daily_fetch():
+    """2026-08-24：收盘即日线——clist 分页拼接全市场 OHLCV，停牌无价跳过。"""
+    from invest.data import close_daily as cd
+
+    page1 = [{"f12": f"600{i:03d}", "f2": 10.0, "f3": 0.0,
+              "f5": 100, "f6": 1e6, "f15": 10.5, "f16": 9.5, "f17": 9.8, "f18": 10.0}
+             for i in range(99)]
+    page1[0] = {"f12": "600519", "f14": "贵州茅台", "f2": 1304.66, "f3": 2.5,
+                "f5": 48440, "f6": 6299794441.0, "f15": 1313.8, "f16": 1270.33, "f17": 1271.01, "f18": 1272.83}
+    page1.append({"f12": "ST500000", "f14": "停牌股", "f2": None, "f3": 0})
+    pages = [
+        {"data": {"total": 150, "diff": page1}},
+        {"data": {"total": 150, "diff": [
+            {"f12": "000002", "f14": "万科A", "f2": 7.0, "f3": -1.0,
+             "f5": 2000, "f6": 1.4e8, "f15": 7.1, "f16": 6.9, "f17": 7.0, "f18": 7.05}]}},
+    ]
+    calls = {"n": 0}
+
+    def _fake_page(host, pn):
+        calls["n"] += 1
+        return pages[pn - 1]
+
+    with mock.patch.object(cd, "_fetch_page", side_effect=_fake_page):
+        df = cd.fetch_all_close_daily("2026-08-24")
+    assert calls["n"] == 2  # total=150 → 2 页
+    assert len(df) == 100  # 99 占位 + 600519 + 000002 = 101 - 1 停牌 = 100
+    row = df[df["symbol"] == "600519"].iloc[0]
+    assert row["open"] == 1271.01 and row["high"] == 1313.8 and row["low"] == 1270.33
+    assert row["close"] == 1304.66 and row["volume"] == 48440 and row["amount"] == 6299794441.0
+    assert "000002" in set(df["symbol"])
+    print("test_close_daily_fetch OK")
+
+
+def test_drop_snapshot_dups():
+    """2026-08-24/25：晚间权威日线写入后删除当日收盘快照行（daily_bars + index_bars，避免双行）。"""
+    from invest.data.collector import _drop_snapshot_dups
+    from invest.data.storage import upsert_df
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        upsert_df(conn, "daily_bars", pd.DataFrame([
+            {"date": "2026-08-24", "symbol": "600519", "close": 1304.66, "src": "snapshot"},
+            {"date": "2026-08-24", "symbol": "600519", "close": 1304.66, "src": "akshare"},
+            {"date": "2026-08-21", "symbol": "600519", "close": 1272.83, "src": "snapshot"},
+        ]))
+        # 2026-08-25：index_bars 也需清理（snapshot/akshare 双行导致 quant strength concat 崩溃）
+        upsert_df(conn, "index_bars", pd.DataFrame([
+            {"index_code": "000300", "date": "2026-08-24", "close": 4000.0, "src": "snapshot"},
+            {"index_code": "000300", "date": "2026-08-24", "close": 4001.0, "src": "akshare"},
+        ]))
+        _drop_snapshot_dups(conn, pd.DataFrame([{"date": "2026-08-24"}]))
+        rows = conn.execute("SELECT date, src, index_code FROM index_bars ORDER BY date").fetchall()
+        idx_got = {(r["index_code"], r["date"], r["src"]) for r in rows}
+        assert ("000300", "2026-08-24", "snapshot") not in idx_got  # 指数快照行被清
+        assert ("000300", "2026-08-24", "akshare") in idx_got       # 权威行保留
+        drows = conn.execute("SELECT date, src FROM daily_bars ORDER BY date").fetchall()
+        got = {(r["date"], r["src"]) for r in drows}
+        assert ("2026-08-24", "snapshot") not in got
+        assert ("2026-08-24", "akshare") in got
+        assert ("2026-08-21", "snapshot") in got  # 历史快照行保留
+    finally:
+        conn.close()
+    print("test_drop_snapshot_dups OK")
 
 
 def test_evening_report_freshness_gate():
@@ -374,6 +451,8 @@ if __name__ == "__main__":
     test_scheduler_jobs()
     test_ticker_only_and_job_funcs()
     test_data_freshness_and_snapshot_close()
+    test_close_daily_fetch()
+    test_drop_snapshot_dups()
     test_data_lag_reason()
     test_evening_report_freshness_gate()
     test_pipeline_quant()

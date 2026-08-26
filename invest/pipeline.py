@@ -647,11 +647,13 @@ def _fetch_index_closes(today) -> list[dict]:
 
 
 def snapshot_close(db_path: str) -> dict:
-    """收盘快照落库（2026-08-20）：交易日 16:10 用实时快照源直接写当日收盘价，
-    不必等 akshare 日线晚间（约 21 点）才发布。
+    """收盘快照落库（2026-08-20 初版；2026-08-24 升级为「收盘即日线」）。
 
-    - 核心池（core/track）个股 → daily_bars（src='snapshot'）；
-    - 指数（腾讯快照）→ index_bars（src='snapshot'）；
+    交易日 15:10 执行，不必等 akshare 日线晚间（约 21 点）才发布：
+    1. 核心池（core/track）个股 → daily_bars（src='snapshot'，实时源收盘价）；
+    2. **全市场当日完整 OHLCV**（东财 clist 批量接口，收盘后即有）→ daily_bars（src='snapshot'）；
+    3. 指数（腾讯快照）→ index_bars（src='snapshot'）。
+    晚间 akshare 权威日线写入后自动删除当日 snapshot 行（见 collector._run_one），不会双行。
     返回 {stock: 写入数, index: 写入数, skipped?: 原因}。
     """
     import datetime as dt
@@ -686,15 +688,28 @@ def snapshot_close(db_path: str) -> dict:
                     })
             except Exception as exc:
                 logger.warning("核心池收盘快照失败: %s", exc)
-        n_stock = len(stock_rows)
+        n_core = len(stock_rows)
         if stock_rows:
             upsert_df(conn, "daily_bars", pd.DataFrame(stock_rows))
 
-        # 2) 指数收盘（腾讯快照）
+        # 2) 全市场收盘即日线（2026-08-24：东财 clist 批量，收盘后即有完整 OHLCV）
+        n_market = 0
+        try:
+            from invest.data.close_daily import fetch_all_close_daily
+
+            market = fetch_all_close_daily(today.isoformat())
+            if not market.empty:
+                market = market.copy()
+                market["src"] = "snapshot"
+                n_market = upsert_df(conn, "daily_bars", market)
+        except Exception as exc:
+            logger.warning("全市场收盘日线失败: %s", exc)
+
+        # 3) 指数收盘（腾讯快照）
         idx_rows = _fetch_index_closes(today)
         n_idx = len(idx_rows)
         if idx_rows:
             upsert_df(conn, "index_bars", pd.DataFrame(idx_rows))
-        return {"stock": n_stock, "index": n_idx}
+        return {"stock": n_core, "market": n_market, "index": n_idx}
     finally:
         conn.close()
