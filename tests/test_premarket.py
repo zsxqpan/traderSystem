@@ -167,6 +167,64 @@ def test_a0_digest_fail_no_material(monkeypatch):
 
 
 
+def test_digest_recent_telegraph_relaxed_window(monkeypatch):
+    """2026-08-31：素材窗口放宽为近 cut_days 个自然日，不再过滤「最近交易日 15:00 后」——
+    周末/周一早报时段财联社电报素材也能进入消息汇总（旧逻辑会丢弃 15:00 前日期的行）。"""
+    from invest.skills.sections import _digest
+
+    monkeypatch.setattr(
+        "invest.report._fetch_telegraph_lines",
+        lambda days=3: [
+            "2026-08-30 20:01:02 | 周末快讯：海外市场消息",
+            "22:01:02 | 周一晚间快讯",
+        ],
+    )
+    out = _digest._recent_telegraph()
+    assert out == [
+        "2026-08-30 20:01:02 | 周末快讯：海外市场消息",
+        "22:01:02 | 周一晚间快讯",
+    ]
+
+
+def test_recent_web_hits_formats_title_with_url(monkeypatch):
+    """2026-08-31：web 要闻补充格式为「标题（来源URL）」，失败/无结果不阻断。"""
+    from invest.skills.sections import _digest
+
+    monkeypatch.setattr(
+        "invest.agent.web_tools.web_search",
+        lambda query, n=5: [{"title": f"要闻：{query}", "url": "https://eastmoney.com/news/20260830.html"}],
+    )
+    out = _digest._recent_web_hits()
+    assert out
+    assert all("（" in line and "https://" in line for line in out)
+    assert any("宏观政策" in line for line in out)
+
+
+def test_digest_material_includes_web_hits(monkeypatch):
+    """2026-08-31：早报素材 = 财联社电报 + web 要闻一起进 LLM 提炼。"""
+    from invest.skills.sections import _digest
+
+    _digest._digest_cache.clear()
+    monkeypatch.setattr("invest.skills.sections._digest._recent_telegraph",
+                        lambda cut_days=3: ["2026-08-30 20:01 | 电报快讯：央行操作"])
+    monkeypatch.setattr("invest.skills.sections._digest._recent_web_hits",
+                        lambda max_per_query=3: ["web要闻（https://x/20260830.html）"])
+    captured = {}
+
+    def fake_llm(conn, system, user, max_tokens=None):
+        captured["material"] = user
+        return '{"ok": true, "news": {"macro": [{"title": "t", "impact": "i"}]}}'
+
+    monkeypatch.setattr(_digest, "_llm", fake_llm)
+    try:
+        result = _digest.digest(":memory:")
+        assert result.get("ok") is True
+        assert "web要闻" in captured["material"]
+        assert "电报快讯：央行操作" in captured["material"]
+    finally:
+        _digest._digest_cache.clear()
+
+
 def test_render_feishu_card():
     """结构化 → 飞书卡片：schema 2.0、table 组件、**加粗**、*星号*转加粗。"""
     struct = {

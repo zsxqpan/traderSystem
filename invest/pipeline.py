@@ -473,29 +473,74 @@ def _agent_viewpoints(conn, n: int = 5) -> str:
     return "\n".join(lines)
 
 
-def _send_structured(struct: dict, key: str, min_interval: float = 600.0) -> bool:
-    """结构化报告分通道发送（2026-08-22）：飞书卡片（失败回退 text）+ 企微/微信纯文本。"""
+def _send_structured(
+    struct: dict,
+    key: str,
+    min_interval: float = 600.0,
+    *,
+    return_results: bool = False,
+    message_kind: str = "report",
+    message_id: str = "",
+) -> bool | dict[str, bool]:
+    """发送结构化报告；可返回逐通道结果，默认保持聚合 bool 兼容。"""
     from invest.config import get_settings
     from invest.notifier import Notifier
     from invest.push.feishu_push import send_card, send_text
     from invest.push.render import render_feishu, render_plain
 
     plain = render_plain(struct)
-    ok = False
+    stable_message_id = message_id or key
+    results = {"feishu": False, "wecom": False, "weixin": False}
     card = render_feishu(struct)
     chat_id = getattr(get_settings(), "feishu_chat_id", "") or ""
     if chat_id:
-        ok = send_card(chat_id, "chat_id", card) or send_text(plain, key=key, min_interval=min_interval)
-    ok = Notifier().send_text(plain, key=key, min_interval=min_interval, feishu=False) or ok
-    return ok
+        from invest.delivery import deliver_channel
+
+        def _send_feishu() -> bool:
+            return send_card(chat_id, "chat_id", card) or send_text(
+                plain,
+                key=key,
+                min_interval=min_interval,
+            )
+
+        results["feishu"] = deliver_channel(
+            "feishu",
+            _send_feishu,
+            message_kind=message_kind,
+            message_id=stable_message_id,
+        )
+    other = Notifier().send_text(
+        plain,
+        key=key,
+        min_interval=min_interval,
+        feishu=False,
+        return_results=True,
+        message_kind=message_kind,
+        message_id=stable_message_id,
+    )
+    if isinstance(other, dict):
+        results.update(other)
+    else:  # 兼容测试替身或旧式 Notifier 实现
+        results["wecom"] = bool(other)
+    return results if return_results else any(results.values())
 
 
-def notify_morning_brief(db_path: str) -> bool:
+def notify_morning_brief(
+    db_path: str,
+    *,
+    return_results: bool = False,
+) -> bool | dict[str, bool]:
     """盘前报告推送（2026-08-22：A1+A2 合并版 a0_premarket，飞书卡片 + 企微/微信纯文本）。"""
     from invest.skills.runner import run_structured
 
     struct = run_structured("a0_premarket", db_path=db_path)
-    return _send_structured(struct, key="morning_brief")
+    return _send_structured(
+        struct,
+        key="morning_brief",
+        return_results=return_results,
+        message_kind="report",
+        message_id="a0_premarket",
+    )
 
 
 def notify_after_close(db_path: str, agent_text: str = "") -> bool:
@@ -508,17 +553,57 @@ def notify_after_close(db_path: str, agent_text: str = "") -> bool:
     return _send_structured(struct, key="after_close")
 
 
-def notify_auction(db_path: str) -> bool:
-    """竞价报告推送（2026-08-22：9:25 集合竞价后 a7_auction，飞书卡片 + 企微/微信纯文本）。"""
-    from invest.skills.runner import run_structured
+def notify_auction(
+    db_path: str,
+    *,
+    return_results: bool = False,
+):
+    """竞价报告：先完整性再生成/发送；回执走任务1账本。"""
+    from invest.scheduler import JobResult
+    from invest.skills.report_pipeline import deliver_report
 
-    struct = run_structured("a7_auction", db_path=db_path)
-    # 2026-08-22：竞价情绪预判/模块解析落库（source='auction_report'），供盘后日报点2 复盘
-    _persist_auction_views(struct.get("views") or {})
-    return _send_structured(struct, key="auction")
+    captured: dict = {}
+
+    def send_fn(struct) -> bool:
+        captured["struct"] = struct
+        raw = _send_structured(
+            struct,
+            key="auction",
+            return_results=True,
+            message_kind="report",
+            message_id="a7_auction",
+        )
+        results = raw if isinstance(raw, dict) else {"delivery": bool(raw)}
+        captured["results"] = results
+        return any(results.values())
+
+    result = deliver_report("a7_auction", db_path, send_fn=send_fn)
+    if result.status == "ok":
+        _persist_auction_views(
+            (captured.get("struct") or {}).get("views") or {},
+            db_path=db_path,
+        )
+        channels = {
+            channel: ("succeeded" if ok else "failed")
+            for channel, ok in (captured.get("results") or {}).items()
+        }
+        result = JobResult.ok(
+            "竞价报告投递成功", artifact="a7_auction", channel_results=channels,
+        )
+    elif result.status == "send_failed":
+        channels = {
+            channel: ("succeeded" if ok else "failed")
+            for channel, ok in (captured.get("results") or {}).items()
+        }
+        if channels:
+            result = JobResult(
+                "send_failed", result.detail or "竞价报告投递失败",
+                artifact="a7_auction", channel_results=channels,
+            )
+    return result if return_results else result.success
 
 
-def _persist_auction_views(views: dict) -> None:
+def _persist_auction_views(views: dict, *, db_path: str | None = None) -> None:
     """竞价报告观点/解析落库（2026-08-22）：viewpoints source='auction_report'。失败静默。"""
     if not views:
         return
@@ -527,7 +612,8 @@ def _persist_auction_views(views: dict) -> None:
 
         from invest.db import connect as _connect
 
-        conn = _connect(str(Path(__file__).resolve().parents[1] / "data" / "invest.db"))
+        target = db_path or str(Path(__file__).resolve().parents[1] / "data" / "invest.db")
+        conn = _connect(target)
         try:
             for kind in ("mood", "analysis"):
                 content = views.get(kind)
@@ -576,12 +662,27 @@ def _persist_plan(plan_data: dict) -> None:
         logging.getLogger(__name__).warning("明日预案落库失败", exc_info=True)
 
 
-def notify_weekend(db_path: str, agent_text: str = "") -> bool:
+def notify_weekend(
+    db_path: str,
+    agent_text: str = "",
+    *,
+    return_results: bool = False,
+) -> bool | dict[str, bool]:
     """周报推送（2026-08-22：经 Skill Runner 调 a4_weekly）。"""
     from invest.skills.runner import run as run_skill
     msg = run_skill("a4_weekly", db_path=db_path, agent_text=agent_text)
     from invest.notifier import Notifier
-    return Notifier().send_text(msg, key="weekend", min_interval=600)
+    raw = Notifier().send_text(
+        msg,
+        key="weekend",
+        min_interval=600,
+        return_results=return_results,
+        message_kind="report",
+        message_id="a4_weekly",
+    )
+    if return_results:
+        return raw
+    return any(raw.values()) if isinstance(raw, dict) else bool(raw)
 
 
 def _macro_text(conn) -> str:

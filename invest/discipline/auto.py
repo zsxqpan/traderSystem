@@ -78,19 +78,33 @@ def auto_price_factors(close: pd.Series) -> dict:
     return {"factors": factors, "ok": bool(factors)}
 
 
-def _close_series(conn: sqlite3.Connection, symbol: str, years: int = 3) -> pd.Series:
-    """取个股近 years 年收盘价序列（升序）。"""
+def _close_series(
+    conn: sqlite3.Connection,
+    symbol: str,
+    years: int = 3,
+    as_of: str | None = None,
+) -> pd.Series:
+    """取个股近 years 年收盘价序列（升序）。as_of 有值时截断到该日。"""
     import datetime as dt
-    rows = conn.execute(
-        """SELECT date, close FROM daily_bars WHERE symbol=?
-           AND close IS NOT NULL ORDER BY date""",
-        (symbol,),
-    ).fetchall()
+    if as_of:
+        rows = conn.execute(
+            """SELECT date, close FROM daily_bars WHERE symbol=?
+               AND close IS NOT NULL AND date<=? ORDER BY date""",
+            (symbol, as_of),
+        ).fetchall()
+        end = pd.Timestamp(as_of)
+    else:
+        rows = conn.execute(
+            """SELECT date, close FROM daily_bars WHERE symbol=?
+               AND close IS NOT NULL ORDER BY date""",
+            (symbol,),
+        ).fetchall()
+        end = pd.Timestamp.now()
     if not rows:
         return pd.Series(dtype=float)
     df = pd.DataFrame([dict(r) for r in rows])
     df["date"] = pd.to_datetime(df["date"], format="mixed", errors="coerce")
-    cutoff = pd.Timestamp.now() - dt.timedelta(days=365 * years)
+    cutoff = end - dt.timedelta(days=365 * years)
     s = df[df["date"] >= cutoff]["close"]
     return s.reset_index(drop=True)
 
@@ -100,6 +114,7 @@ def auto_factor_score(
     symbol: str,
     cycle: str = "波段",
     spread: dict | None = None,
+    as_of: str | None = None,
 ) -> dict:
     """自动化因子打分：价格信号 + 主价差（传入或自动算）→ 综合分。
 
@@ -107,8 +122,8 @@ def auto_factor_score(
     """
     params = cycle_mirror_params(cycle)
     if spread is None:
-        spread = price_spread(conn, symbol, years=params["years"])
-    f = auto_price_factors(_close_series(conn, symbol, years=params["years"]))
+        spread = price_spread(conn, symbol, years=params["years"], as_of=as_of)
+    f = auto_price_factors(_close_series(conn, symbol, years=params["years"], as_of=as_of))
     # 主价差并入错价因子（若分位极低则加分）
     factors = list(f["factors"])
     if spread.get("ok") and spread.get("pct_rank") is not None:

@@ -177,10 +177,116 @@ def key_stock_llm(db_path: str, ctx: dict) -> dict:
         return {}
 
 
+def _candidate_entries(ctx: dict) -> list[dict]:
+    raw = ctx.get("candidates") or []
+    out: list[dict] = []
+    for item in raw:
+        if isinstance(item, dict):
+            sym = str(item.get("symbol") or "").strip()
+            name = str(item.get("name") or "").strip()
+            if sym:
+                out.append({"symbol": sym, "name": name})
+        elif isinstance(item, str) and item.strip():
+            out.append({"symbol": item.strip(), "name": ""})
+    return out
+
+
+def _pick_allowed(item: dict, allowed_syms: set[str]) -> bool:
+    """只按规则筛出的 symbol 放行；禁止用 name 绕过。"""
+    if not isinstance(item, dict):
+        return False
+    try:
+        from invest.data.quotes import normalize_symbol
+
+        sym = normalize_symbol(str(item.get("symbol") or ""))
+    except Exception:
+        sym = str(item.get("symbol") or "").strip()
+    if not sym:
+        return False
+    return bool(allowed_syms) and sym in allowed_syms
+
+
+def _schema_ok(item: dict, kind: str) -> bool:
+    """picks 必须有 reason；leaders 必须有 role。"""
+    if not isinstance(item, dict):
+        return False
+    if kind == "pick":
+        return bool(str(item.get("reason") or "").strip())
+    if kind == "leader":
+        return bool(str(item.get("role") or "").strip())
+    return True
+
+
+def _norm_sym(symbol: str) -> str:
+    try:
+        from invest.data.quotes import normalize_symbol
+
+        return normalize_symbol(str(symbol or ""))
+    except Exception:
+        return str(symbol or "").strip()
+
+
+def _align_pick_name(item: dict, names_by_sym: dict[str, str]) -> dict | None:
+    """放行后按候选表改写 name；候选名与自报 name 冲突时以候选表为准。"""
+    if not isinstance(item, dict):
+        return None
+    out = dict(item)
+    sym = _norm_sym(str(out.get("symbol") or ""))
+    official = (names_by_sym.get(sym) or "").strip()
+    if official:
+        out["name"] = official
+    return out
+
+
+def _sanitize_mainline(parsed: dict, ctx: dict) -> dict:
+    """推荐标的必须来自规则筛出的 symbol；无候选则清空 picks/leaders。"""
+    if not parsed:
+        return parsed
+    cands = _candidate_entries(ctx)
+    names_by_sym: dict[str, str] = {}
+    for c in cands:
+        sym = _norm_sym(c["symbol"])
+        if sym:
+            names_by_sym[sym] = str(c.get("name") or "").strip()
+    allowed_syms = {s for s in names_by_sym}
+    out = dict(parsed)
+    lines = []
+    for ml in out.get("main_lines") or []:
+        if not isinstance(ml, dict):
+            continue
+        row = dict(ml)
+        if not allowed_syms:
+            row["picks"] = []
+            row["leaders"] = []
+        else:
+            aligned: list[dict] = []
+            for p in (row.get("picks") or []):
+                if _pick_allowed(p, allowed_syms) and _schema_ok(p, "pick"):
+                    item = _align_pick_name(p, names_by_sym)
+                    if item is not None:
+                        aligned.append(item)
+            row["picks"] = aligned
+            aligned_ld: list[dict] = []
+            for ld in (row.get("leaders") or []):
+                if _pick_allowed(ld, allowed_syms) and _schema_ok(ld, "leader"):
+                    item = _align_pick_name(ld, names_by_sym)
+                    if item is not None:
+                        aligned_ld.append(item)
+            row["leaders"] = aligned_ld
+        lines.append(row)
+    out["main_lines"] = lines
+    return out
+
+
 def mainline_llm(db_path: str, ctx: dict) -> dict:
-    """日内主线分析（调用 2）。ctx 含 sector_top/fund_top/ladder/core/etf_sector。失败返回 {}。"""
+    """日内主线分析（调用 2）。ctx 含 sector_top/fund_top/ladder/core/etf_sector/candidates。
+
+    无候选股票列表时禁止 picks/leaders；有候选时输出前做 schema/证据校验。
+    """
     now = time.time()
-    cached = _mainline_cache.get(db_path)
+    cands = _candidate_entries(ctx)
+    cache_key = db_path + "|" + ",".join(sorted(c["symbol"] for c in cands))
+    cached = _mainline_cache.get(cache_key)
     if cached and now - cached[0] < _TTL:
         return cached[1]
     try:
@@ -188,29 +294,45 @@ def mainline_llm(db_path: str, ctx: dict) -> dict:
 
         conn = connect(db_path)
         try:
+            cand_text = "、".join(
+                f"{c['name']}({c['symbol']})" if c.get("name") else c["symbol"]
+                for c in cands
+            ) or "（无）"
+            pick_schema = (
+                '"picks": [], "leaders": []'
+                if not cands else
+                ('"picks": [{"name": "推荐关注股票名", "symbol": "6位代码", "reason": "推荐理由15字内"}],'
+                 '"leaders": [{"role": "连板龙头|趋势龙头|容量龙头|行业龙头",'
+                 ' "name": "股票名", "symbol": "6位代码", "analysis": "走势分析（25字内）"}]')
+            )
+            pick_rule = (
+                "禁止输出 picks/leaders（没有候选股票列表）。"
+                if not cands else
+                f"picks/leaders 只能引用以下规则筛出的标的，禁止编造：{cand_text}。每条必须带 symbol。"
+            )
             prompt = (
                 "以下是今日盘中板块/资金/连板/ETF/核心池数据：\n"
                 f"板块涨幅TOP:\n{ctx.get('sector_top') or '暂无'}\n"
                 f"资金净流入TOP:\n{ctx.get('fund_top') or '暂无'}\n"
                 f"连板梯队:\n{ctx.get('ladder') or '暂无'}\n"
                 f"板块ETF(纯度高于板块指数,体现方向真实强度):\n{ctx.get('etf_sector') or '暂无'}\n"
-                f"核心关注实时行情:\n{ctx.get('core') or '暂无'}\n\n"
+                f"核心关注实时行情:\n{ctx.get('core') or '暂无'}\n"
+                f"规则筛选候选股:\n{cand_text}\n\n"
                 "请输出 JSON（只分析 1-3 个最强方向）：\n"
                 '{"main_lines": [{"direction": "方向名",'
                 '"reason": "上涨原因（结合资金/连板，25字内）",'
                 '"internal": "方向内部涨跌分化（大盘vs小盘、细分如医药内创新药vsCXO、机器人内电机vs执行器，25字内）",'
                 '"etf": "对应板块ETF强度（涨跌/量能/资金一句话，25字内；无数据写无）",'
-                '"picks": [{"name": "推荐关注股票名", "reason": "推荐理由15字内"}],'
-                '"leaders": [{"role": "连板龙头|趋势龙头|容量龙头|行业龙头", "name": "股票名",'
-                '"analysis": "走势分析（25字内）"}],'
+                f"{pick_schema},"
                 '"outlook": "方向走势推演：一日游/见底反弹/面临分化/缩圈/扩圈量能健康持续/即将分歧（20字内）"}],\n'
                 '"core_outlook": "结合指数与板块判断，对核心关注标的今日走势的一句话推演（40字内）"}\n'
-                "只许引用给定数据，禁止编造个股与数字。"
+                f"{pick_rule}只许引用给定数据，禁止编造个股与数字。"
             )
             out = _llm(conn, _YOUZI_SYSTEM, prompt, max_tokens=2000)
             parsed = _parse_json(out)
             if parsed:
-                _mainline_cache[db_path] = (now, parsed)
+                parsed = _sanitize_mainline(parsed, ctx)
+                _mainline_cache[cache_key] = (now, parsed)
                 return parsed
         finally:
             conn.close()

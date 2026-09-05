@@ -79,6 +79,129 @@ def test_freshness_guard():
     print("test_freshness_guard OK")
 
 
+def test_partial_merge_fills_missing_from_next_source():
+    """核心 bug：新浪部分成功后必须继续对 missing/stale 标的请求腾讯/东财。"""
+    now = dt.datetime.now()
+    tencent_called = []
+
+    def _sina(session, symbols):
+        return {"sh600519": rt.Quote(symbol="sh600519", price=100.0, pct=0.01, ts=now, src="sina")}
+
+    def _tencent(session, symbols):
+        tencent_called.append(list(symbols))
+        out = {}
+        for s in symbols:
+            bare = s[2:] if s[:2] in ("sh", "sz", "bj") else s
+            if bare == "000001":
+                out["sz000001"] = rt.Quote(
+                    symbol="sz000001", price=11.0, pct=0.02, ts=now, src="tencent"
+                )
+        return out
+
+    with mock.patch.object(rt, "_fetch_sina", side_effect=_sina), \
+         mock.patch.object(rt, "_fetch_tencent", side_effect=_tencent), \
+         mock.patch.object(rt, "_fetch_em", return_value={}), rt.RealtimeQuoter() as q:
+        quotes = q.fetch(["600519", "000001"])
+    assert tencent_called, "新浪部分成功后应继续请求腾讯"
+    asked = [s[2:] if s[:2] in ("sh", "sz", "bj") else s for s in tencent_called[0]]
+    assert "000001" in asked
+    assert "600519" not in asked  # 已 live 的不再打下一源
+    bares = {s[2:] if s[:2] in ("sh", "sz", "bj") else s for s in quotes}
+    assert "600519" in bares and "000001" in bares
+    srcs = { (k[2:] if k[:2] in ("sh", "sz", "bj") else k): v.src for k, v in quotes.items() }
+    assert srcs["600519"] == "sina"
+    assert srcs["000001"] == "tencent"
+    print("test_partial_merge_fills_missing_from_next_source OK")
+
+
+def test_stale_symbol_continues_to_next_source():
+    """逐标的新鲜度：stale 标的继续换源，live 保留。"""
+    now = dt.datetime.now()
+    stale_ts = now - dt.timedelta(seconds=120)
+    tencent_called = []
+
+    def _sina(session, symbols):
+        return {
+            "sh600519": rt.Quote(symbol="sh600519", price=100.0, pct=0.01, ts=now, src="sina"),
+            "sz000001": rt.Quote(symbol="sz000001", price=9.0, pct=0.0, ts=stale_ts, src="sina"),
+        }
+
+    def _tencent(session, symbols):
+        tencent_called.append(list(symbols))
+        return {
+            "sz000001": rt.Quote(symbol="sz000001", price=11.0, pct=0.02, ts=now, src="tencent"),
+        }
+
+    with mock.patch.object(rt, "_fetch_sina", side_effect=_sina), \
+         mock.patch.object(rt, "_fetch_tencent", side_effect=_tencent), \
+         mock.patch.object(rt, "_fetch_em", return_value={}), rt.RealtimeQuoter() as q:
+        quotes = q.fetch(["600519", "000001"])
+    assert tencent_called
+    asked = [s[2:] if s[:2] in ("sh", "sz", "bj") else s for s in tencent_called[0]]
+    assert asked == ["000001"]
+    by_bare = { (k[2:] if k[:2] in ("sh", "sz", "bj") else k): v for k, v in quotes.items() }
+    assert by_bare["600519"].src == "sina"
+    assert by_bare["000001"].src == "tencent"
+    assert by_bare["000001"].price == 11.0
+    print("test_stale_symbol_continues_to_next_source OK")
+
+
+def test_zero_price_with_name_tries_next_source():
+    """源层价=0 但有名称：不是停牌终态；下一源有价则换源。"""
+    now = dt.datetime.now()
+    tencent_called = []
+
+    def _sina(session, symbols):
+        return {
+            "sh600519": rt.Quote(
+                symbol="sh600519", price=0.0, pct=None, ts=now, src="sina",
+                prev_close=100.0, name="贵州茅台", suspended=True,
+            ),
+        }
+
+    def _tencent(session, symbols):
+        tencent_called.append(list(symbols))
+        return {
+            "sh600519": rt.Quote(
+                symbol="sh600519", price=101.0, pct=0.01, ts=now, src="tencent",
+                prev_close=100.0, name="贵州茅台",
+            ),
+        }
+
+    with mock.patch.object(rt, "_fetch_sina", side_effect=_sina), \
+         mock.patch.object(rt, "_fetch_tencent", side_effect=_tencent), \
+         mock.patch.object(rt, "_fetch_em", return_value={}), rt.RealtimeQuoter() as q:
+        quotes = q.fetch(["600519"])
+        resolved = q.fetch_resolved(["600519"])
+    assert tencent_called, "价=0 有名称也应继续问下一源"
+    by_bare = {(k[2:] if k[:2] in ("sh", "sz", "bj") else k): v for k, v in quotes.items()}
+    assert by_bare["600519"].src == "tencent"
+    assert by_bare["600519"].price == 101.0
+    assert resolved["600519"].status == "live"
+    assert resolved["600519"].price == 101.0
+    assert resolved["600519"].fallback_level != "suspended"
+    print("test_zero_price_with_name_tries_next_source OK")
+
+
+def test_fetch_keeps_requested_when_later_sources_empty():
+    """后续源为空时，已成功标的保留；缺失标的不能从结果里被静默丢掉（由 fetch_resolved 补齐）。"""
+    now = dt.datetime.now()
+
+    def _sina(session, symbols):
+        return {"sh600519": rt.Quote(symbol="sh600519", price=100.0, pct=0.01, ts=now, src="sina")}
+
+    with mock.patch.object(rt, "_fetch_sina", side_effect=_sina), \
+         mock.patch.object(rt, "_fetch_tencent", return_value={}), \
+         mock.patch.object(rt, "_fetch_em", return_value={}), rt.RealtimeQuoter() as q:
+        quotes = q.fetch(["600519", "000001"])
+        resolved = q.fetch_resolved(["600519", "000001"])
+    assert any((k[2:] if k[:2] in ("sh", "sz", "bj") else k) == "600519" for k in quotes)
+    assert set(resolved) == {"600519", "000001"}
+    assert resolved["600519"].status == "live"
+    assert resolved["000001"].status == "missing"
+    print("test_fetch_keeps_requested_when_later_sources_empty OK")
+
+
 def test_parse_sina_line():
     line = 'var hq_str_sh600519="贵州茅台,1355.000,1355.290,1341.990,1359.000,1338.140,1341.980,1341.990,2985315,4024065608.000,100,1341.980,200,1341.900,100,1341.690,100,1341.680,300,1341.620,28316,1341.990,2300,1342.000,100,1342.010,200,1342.020,300,1342.060,2026-08-14,15:34:56,00,D|1600|2147184.00";'
     q = rt._parse_sina_line(line)
@@ -143,6 +266,10 @@ if __name__ == "__main__":
     test_all_sources_down_raises()
     test_empty_result_falls_through()
     test_freshness_guard()
+    test_partial_merge_fills_missing_from_next_source()
+    test_stale_symbol_continues_to_next_source()
+    test_zero_price_with_name_tries_next_source()
+    test_fetch_keeps_requested_when_later_sources_empty()
     test_parse_sina_line()
     test_realtime_health_states()
     print("\nALL REALTIME TESTS PASSED")

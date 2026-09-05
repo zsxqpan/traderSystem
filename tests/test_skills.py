@@ -193,7 +193,9 @@ def test_b1_structured(monkeypatch):
         "000300": {"name": "沪深300", "price": 4618.9, "pct": 0.1},
         "000852": {"name": "中证1000", "price": 7601.8, "pct": 0.9},
     })
-    with mock.patch("invest.report._live_quotes", return_value=({"600519": 105.0}, {"600519": 0.05})):
+    monkeypatch.setattr("invest.data.etf.fetch_etf_quotes", lambda codes=None: {})
+    with mock.patch("invest.report._live_quotes", return_value=({"600519": 105.0}, {"600519": 0.05})), \
+         mock.patch("invest.data.realtime.RealtimeQuoter._fetch_merged", side_effect=RuntimeError("down")):
         struct = run_structured("b1_intraday", db_path=p)
     tables = [s for s in struct["sections"] if s.get("type") == "table"]
     texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
@@ -212,8 +214,9 @@ def test_b1_core_quotes_fallback_close(monkeypatch):
 
     p = _fresh_db()
     # candidate_pool 已有 600519(core)，daily_bars 最新收盘 100.0
-    with mock.patch("invest.report._live_quotes", return_value=({}, {})):
-        rows, _lines = _core_quotes(p)
+    with mock.patch("invest.data.realtime.RealtimeQuoter._fetch_merged",
+                    side_effect=RuntimeError("down")):
+        rows, _lines, _rs = _core_quotes(p)
     assert rows and any(r[0] == "600519" for r in rows)
     row = next(r for r in rows if r[0] == "600519")
     assert row[1] == "100.00" and "收盘" in row[2]  # 收盘价回退 + 标注
@@ -224,9 +227,14 @@ def test_b1_core_quotes_realtime_ok(monkeypatch):
     from invest.skills.reports.b1_intraday import _core_quotes
 
     p = _fresh_db()
-    with mock.patch("invest.report._live_quotes",
-                    return_value=({"600519": 105.0}, {"600519": 0.05})):
-        rows, _lines = _core_quotes(p)
+    from invest.data.quotes import QuoteResult, parse_asset
+
+    live = QuoteResult(
+        ref=parse_asset("600519"), price=105.0, pct=0.05, status="live",
+        freshness="live", fallback_level="none", src="sina",
+    )
+    with mock.patch("invest.data.quotes.get_quotes", return_value=[live]):
+        rows, _lines, _rs = _core_quotes(p)
     row = next(r for r in rows if r[0] == "600519")
     assert row[1] == "105.00" and "+5.00%" in row[2]
 
@@ -342,6 +350,29 @@ def test_a7_auction_structured(monkeypatch):
     monkeypatch.setattr("invest.data.auction.fetch_batch_quotes",
                         lambda symbols=None: {s: {"name": f"N{s}", "price": 10.0, "pct": 1.2,
                                                   "vol": 1000} for s in (symbols or [])})
+    now = dt.datetime.now()
+
+    class _LiveQuoter:
+        source_failures = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def fetch(self, symbols):
+            from invest.data.realtime import Quote
+
+            out = {}
+            for s in symbols:
+                ms = ("sh" + s) if str(s).startswith(("6", "5", "9")) else (
+                    "bj" + s if str(s).startswith(("4", "8")) else "sz" + s
+                )
+                out[ms] = Quote(symbol=ms, price=10.0, pct=0.012, ts=now, src="sina", name=f"N{s}")
+            return out
+
+    monkeypatch.setattr("invest.data.realtime.RealtimeQuoter", _LiveQuoter)
     # 关键股票：mock 热门板块核心股（避免依赖 industry_map 数据）
     monkeypatch.setattr("invest.skills.reports.a7_auction._hot_core_stocks",
                         lambda conn: [{"block": "半导体", "count": 2,
@@ -512,5 +543,635 @@ def test_d31_pool_trap_alerts(monkeypatch):
         alerts2 = scan_pool(conn)
         assert alerts2[0]["level"] == "🟢"
         assert render(p) == ""
+    finally:
+        conn.close()
+
+
+# ---------- 任务 4：报告 manifest / 快照 / 无来源推荐 / 投递状态 ----------
+
+def test_report_manifests_define_contract():
+    """每份报告契约含必需/可选块、时点、最低覆盖率、降级方式和最大时长。"""
+    from invest.skills.contract import REPORT_MANIFESTS, get_manifest
+
+    for sid in ("a7_auction", "b1_intraday", "a0_premarket", "a3_daily"):
+        m = get_manifest(sid)
+        assert m.skill_id == sid
+        assert m.required_blocks, f"{sid} 缺少必需数据块"
+        assert m.optional_blocks is not None
+        assert m.slot
+        assert 0 < m.min_coverage <= 1
+        assert m.degrade_modes
+        assert m.max_seconds > 0
+        assert sid in REPORT_MANIFESTS
+    a7 = get_manifest("a7_auction")
+    assert a7.slot == "09:25"
+    assert "index_quotes" in a7.required_blocks
+    b1 = get_manifest("b1_intraday")
+    assert b1.slot == "intraday"
+    assert "index_quotes" in b1.required_blocks
+    assert "core_quotes" in b1.required_blocks
+    assert "facts_only" in b1.degrade_modes
+
+
+def test_manifest_drives_coverage_degrade():
+    """覆盖率门槛来自 manifest，而不是 render 里的 except: pass。"""
+    from invest.data.quotes import QuoteResult, parse_asset
+    from invest.skills.contract import check_completeness, get_manifest
+    from invest.skills.snapshot import DataBlock, ReportSnapshot
+
+    m = get_manifest("b1_intraday")
+    idx = [
+        QuoteResult(
+            ref=parse_asset("000001", "index"),
+            status="missing", fallback_level="source_fail", missing_reason="源失败",
+        )
+    ]
+    snap = ReportSnapshot(
+        skill_id="b1_intraday",
+        as_of="2026-08-28T10:30:00",
+        blocks={
+            "index_quotes": DataBlock(
+                name="index_quotes", as_of="2026-08-28T10:30:00",
+                realtime=True, payload=idx, quotes=idx,
+            ),
+            "core_quotes": DataBlock(
+                name="core_quotes", as_of="2026-08-28T10:30:00",
+                realtime=True, payload=[], quotes=[],
+            ),
+        },
+    )
+    result = check_completeness(m, snap)
+    assert result.degrade is True
+    assert result.ok is True  # facts_only 允许降级发送
+    assert "facts_only" in m.degrade_modes
+
+
+def test_mainline_llm_forbids_picks_without_candidates():
+    """输入没有候选股票列表时，禁止输出 picks/leaders。"""
+    import invest.skills.sections._intraday_llm as _il
+
+    fake = {
+        "main_lines": [{
+            "direction": "半导体",
+            "picks": [{"name": "编造股", "symbol": "600001", "reason": "无来源"}],
+            "leaders": [{"role": "连板龙头", "name": "编造股", "symbol": "600001",
+                         "analysis": "编造"}],
+            "outlook": "扩圈",
+        }],
+        "core_outlook": "偏强",
+    }
+    out = _il._sanitize_mainline(fake, {"candidates": []})
+    assert out.get("main_lines")
+    assert out["main_lines"][0].get("picks") in (None, [])
+    assert out["main_lines"][0].get("leaders") in (None, [])
+
+
+def test_mainline_llm_keeps_only_rule_symbols():
+    """推荐标的必须来自规则筛出的 symbol，输出前做 schema/证据校验。"""
+    import invest.skills.sections._intraday_llm as _il
+
+    fake = {
+        "main_lines": [{
+            "direction": "白酒",
+            "picks": [
+                {"name": "贵州茅台", "symbol": "600519", "reason": "核心池"},
+                {"name": "编造股", "symbol": "600001", "reason": "幻觉"},
+                {"name": "无代码股", "reason": "缺 symbol"},
+            ],
+            "leaders": [
+                {"role": "行业龙头", "name": "贵州茅台", "symbol": "600519",
+                 "analysis": "核心池"},
+                {"role": "连板龙头", "name": "编造股", "symbol": "999999",
+                 "analysis": "幻觉"},
+            ],
+            "outlook": "震荡",
+        }],
+    }
+    out = _il._sanitize_mainline(fake, {
+        "candidates": [{"symbol": "600519", "name": "贵州茅台"}],
+    })
+    picks = out["main_lines"][0]["picks"]
+    leaders = out["main_lines"][0]["leaders"]
+    assert [pk["symbol"] for pk in picks] == ["600519"]
+    assert [ld["symbol"] for ld in leaders] == ["600519"]
+
+
+def test_mainline_rejects_name_bypass_and_incomplete_schema():
+    """禁止用 name 绕过 symbol；缺 reason/role 的条目丢弃。"""
+    import invest.skills.sections._intraday_llm as _il
+
+    fake = {
+        "main_lines": [{
+            "direction": "白酒",
+            "picks": [
+                {"name": "贵州茅台", "symbol": "000001", "reason": "错码绕过"},
+                {"name": "贵州茅台", "symbol": "600519"},
+                {"name": "贵州茅台", "symbol": "600519", "reason": "核心池"},
+            ],
+            "leaders": [
+                {"name": "贵州茅台", "symbol": "000001", "role": "行业龙头",
+                 "analysis": "错码绕过"},
+                {"name": "贵州茅台", "symbol": "600519", "analysis": "缺 role"},
+                {"role": "行业龙头", "name": "贵州茅台", "symbol": "600519",
+                 "analysis": "核心池"},
+            ],
+            "outlook": "震荡",
+        }],
+    }
+    out = _il._sanitize_mainline(fake, {
+        "candidates": [{"symbol": "600519", "name": "贵州茅台"}],
+    })
+    picks = out["main_lines"][0]["picks"]
+    leaders = out["main_lines"][0]["leaders"]
+    assert picks == [{"name": "贵州茅台", "symbol": "600519", "reason": "核心池"}]
+    assert [ld["symbol"] for ld in leaders] == ["600519"]
+    assert all(ld.get("role") for ld in leaders)
+
+
+def test_mainline_rewrites_or_drops_mismatched_pick_name():
+    """候选同时有 000001 时，name=茅台/symbol=000001 不得显示茅台。"""
+    import invest.skills.sections._intraday_llm as _il
+
+    fake = {
+        "main_lines": [{
+            "direction": "混搭",
+            "picks": [
+                {"name": "贵州茅台", "symbol": "000001", "reason": "错配"},
+                {"name": "贵州茅台", "symbol": "600519", "reason": "核心池"},
+            ],
+            "leaders": [
+                {"role": "行业龙头", "name": "贵州茅台", "symbol": "000001",
+                 "analysis": "错配"},
+            ],
+            "outlook": "震荡",
+        }],
+    }
+    out = _il._sanitize_mainline(fake, {
+        "candidates": [
+            {"symbol": "000001", "name": "平安银行"},
+            {"symbol": "600519", "name": "贵州茅台"},
+        ],
+    })
+    picks = out["main_lines"][0]["picks"]
+    leaders = out["main_lines"][0]["leaders"]
+    assert not any(p.get("name") == "贵州茅台" and p.get("symbol") == "000001" for p in picks)
+    assert not any(ld.get("name") == "贵州茅台" and ld.get("symbol") == "000001" for ld in leaders)
+    moutai = [p for p in picks if p.get("symbol") == "600519"]
+    assert moutai and moutai[0]["name"] == "贵州茅台"
+    ping_an = [p for p in picks if p.get("symbol") == "000001"]
+    if ping_an:
+        assert ping_an[0]["name"] == "平安银行"
+
+
+def test_b1_snapshot_shares_as_of_and_labels_eod(monkeypatch):
+    """盘中一次冻结：指数/ETF/核心池共享 as_of；板块 EOD 显式非实时。"""
+    from invest.data.quotes import QuoteResult, parse_asset
+    from invest.skills.snapshot import freeze_snapshot
+
+    p = _fresh_db()
+    now = dt.datetime(2026, 8, 28, 10, 30, 5)
+
+    def _gq(symbols, obj_type="stock", **kw):
+        out = []
+        for s in symbols:
+            ref = parse_asset(s, obj_type)
+            if ref is None:
+                continue
+            extras = None
+            if obj_type == "etf":
+                extras = {
+                    "amount": 8e9, "vol_ratio": 2.4, "main_net": 5e8,
+                    "super_net": 12e8, "turnover": 2.1,
+                }
+            out.append(QuoteResult(
+                ref=ref, price=10.0, pct=0.01, status="live",
+                freshness="unknown", fallback_level="none", src="eastmoney",
+                extras=extras,
+            ))
+        return out
+
+    monkeypatch.setattr("invest.data.quotes.get_quotes", _gq)
+    snap = freeze_snapshot("b1_intraday", p, now=now)
+    assert snap.as_of == "2026-08-28T10:30:05"
+    for name in ("index_quotes", "etf_quotes", "core_quotes"):
+        assert name in snap.blocks
+        assert snap.blocks[name].as_of == snap.as_of
+        assert snap.blocks[name].realtime is True
+    assert "sector_eod" in snap.blocks
+    assert snap.blocks["sector_eod"].realtime is False
+
+    from invest.skills.reports.b1_intraday import render
+
+    etf_fetches = {"n": 0}
+
+    def _count_etf(codes=None):
+        etf_fetches["n"] += 1
+        return {}
+
+    monkeypatch.setattr("invest.data.etf.fetch_etf_quotes", _count_etf)
+    monkeypatch.setattr("invest.skills.sections._intraday_llm.mood_llm", lambda *a, **k: {})
+    monkeypatch.setattr("invest.skills.sections._intraday_llm.mainline_llm", lambda *a, **k: {})
+    import invest.skills.sections.d29_sector_resonance as _d29
+    monkeypatch.setattr(_d29, "render", lambda *a, **k: "")
+    freeze_etf_calls = etf_fetches["n"]
+    struct = render(p, snapshot=snap)
+    assert etf_fetches["n"] == freeze_etf_calls  # 生成阶段不得再拉 akshare
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+    assert "非实时" in texts or "收盘参考" in texts
+    assert "资金主线(实时)" not in texts
+    assert "量比" in texts or "ETF" in texts or "超大单" in texts
+    assert struct.get("as_of") == snap.as_of
+
+
+def test_a7_freezes_925_snapshot_before_render(monkeypatch):
+    """竞价报告先冻结 9:25 快照，再生成；不再各自 except: pass 重拉。"""
+    from invest.data.quotes import QuoteResult, parse_asset
+    from invest.skills.snapshot import freeze_snapshot
+
+    p = _fresh_db()
+    now = dt.datetime(2026, 8, 28, 9, 26, 0)
+    calls = {"n": 0}
+
+    def _gq(symbols, obj_type="stock", **kw):
+        calls["n"] += 1
+        return [
+            QuoteResult(
+                ref=parse_asset(s, obj_type) or parse_asset("000001", obj_type),
+                price=10.0, pct=0.01, status="live",
+                freshness="unknown", fallback_level="none", src="tencent",
+            )
+            for s in symbols
+        ]
+
+    monkeypatch.setattr("invest.data.quotes.get_quotes", _gq)
+    monkeypatch.setattr("invest.data.auction.fetch_top_gainers",
+                        lambda limit=8: [{"symbol": "600519", "name": "贵州茅台", "pct": 1.5}])
+    monkeypatch.setattr("invest.data.auction.fetch_top_losers", lambda limit=3: [])
+    monkeypatch.setattr("invest.data.auction.fetch_vol_top", lambda limit=8: [])
+    monkeypatch.setattr("invest.skills.reports.a7_auction._hot_core_stocks", lambda conn: [])
+    monkeypatch.setattr("invest.skills.reports.a7_auction._yesterday_ladder", lambda conn: [])
+    monkeypatch.setattr("invest.skills.sections._intraday_llm.section_analysis_llm", lambda *a, **k: {})
+    monkeypatch.setattr("invest.skills.sections._intraday_llm.auction_llm", lambda *a, **k: {})
+    monkeypatch.setattr("invest.skills.sections._intraday_llm.key_stock_llm", lambda *a, **k: {})
+
+    snap = freeze_snapshot("a7_auction", p, now=now)
+    assert snap.as_of.startswith("2026-08-28T09:25")
+    assert not snap.as_of.startswith("2026-08-28T09:26")
+    freeze_calls = calls["n"]
+    assert freeze_calls >= 1
+
+    from invest.skills.reports.a7_auction import render
+
+    struct = render(p, snapshot=snap)
+    assert calls["n"] == freeze_calls  # 生成阶段不再重新拉行情
+    assert struct.get("as_of") == snap.as_of
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+    assert "09:25" in texts or "竞价" in texts
+
+
+def test_deliver_report_checks_completeness_before_send(monkeypatch):
+    """发送前完整性检查：必需块缺失则不发送，状态=数据不足。"""
+    from invest.data.quotes import QuoteResult, parse_asset
+    from invest.scheduler import JobResult
+    from invest.skills.report_pipeline import deliver_report
+    from invest.skills.snapshot import DataBlock, ReportSnapshot
+
+    p = _fresh_db()
+    sent = []
+    idx = [
+        QuoteResult(
+            ref=parse_asset("000001", "index"),
+            status="missing", fallback_level="source_fail", missing_reason="源失败",
+        )
+    ]
+    snap = ReportSnapshot(
+        skill_id="b1_intraday",
+        as_of="2026-08-28T10:30:00",
+        blocks={
+            "index_quotes": DataBlock(
+                name="index_quotes", as_of="2026-08-28T10:30:00",
+                realtime=True, payload=[], quotes=[],
+            ),
+            "core_quotes": DataBlock(
+                name="core_quotes", as_of="2026-08-28T10:30:00",
+                realtime=True, payload=idx, quotes=idx,
+            ),
+        },
+    )
+    result = deliver_report(
+        "b1_intraday", p,
+        snapshot=snap,
+        send_fn=lambda struct: sent.append(struct) or True,
+    )
+    assert isinstance(result, JobResult)
+    assert result.status == "data_insufficient"
+    assert sent == []
+
+
+def test_render_body_typeerror_does_not_bypass_completeness(monkeypatch):
+    """render 体内 TypeError 不得当「不支持 snapshot」而无快照重跑、绕过门禁。"""
+    from invest.data.quotes import QuoteResult, parse_asset
+    from invest.skills.report_pipeline import deliver_report
+    from invest.skills.snapshot import DataBlock, ReportSnapshot
+
+    p = _fresh_db()
+    live = QuoteResult(
+        ref=parse_asset("000001", "index"),
+        price=3900.0, pct=0.003, status="live",
+        freshness="live", fallback_level="none", src="tencent",
+    )
+    core = QuoteResult(
+        ref=parse_asset("600519"),
+        price=105.0, pct=0.05, status="live",
+        freshness="live", fallback_level="none", src="sina",
+    )
+    ok_snap = ReportSnapshot(
+        skill_id="b1_intraday",
+        as_of="2026-08-28T10:31:00",
+        blocks={
+            "index_quotes": DataBlock(
+                "index_quotes", "2026-08-28T10:31:00", True,
+                payload=[live], quotes=[live],
+            ),
+            "core_quotes": DataBlock(
+                "core_quotes", "2026-08-28T10:31:00", True,
+                payload=[core], quotes=[core],
+            ),
+        },
+    )
+    sent = []
+    calls = []
+
+    def _boom_render(db_path, snapshot=None, **kw):
+        calls.append(snapshot is not None)
+        if snapshot is not None:
+            raise TypeError("cannot unpack NoneType in table row")
+        return {
+            "title": "偷跑",
+            "sections": [{"type": "text", "text": "无快照重跑绕过门禁"}],
+        }
+
+    monkeypatch.setattr("invest.skills.reports.b1_intraday.render", _boom_render)
+    result = deliver_report(
+        "b1_intraday", p, now=dt.datetime(2026, 8, 28, 10, 31),
+        snapshot=ok_snap, send_fn=lambda s: sent.append(s) or True,
+    )
+    assert result.status == "generate_failed"
+    assert sent == []
+    assert calls == [True]
+
+
+def test_empty_eod_does_not_refetch(monkeypatch):
+    """空 EOD 块不得回源再查库。"""
+    from invest.data.quotes import QuoteResult, parse_asset
+    from invest.skills.reports.b1_intraday import render
+    from invest.skills.snapshot import DataBlock, ReportSnapshot
+
+    p = _fresh_db()
+    live = QuoteResult(
+        ref=parse_asset("000001", "index"),
+        price=3900.0, pct=0.003, status="live",
+        freshness="unknown", fallback_level="none", src="tencent",
+    )
+    core = QuoteResult(
+        ref=parse_asset("600519"),
+        price=105.0, pct=0.05, status="live",
+        freshness="unknown", fallback_level="none", src="sina",
+    )
+    snap = ReportSnapshot(
+        skill_id="b1_intraday",
+        as_of="2026-08-28T10:31:00",
+        blocks={
+            "index_quotes": DataBlock(
+                "index_quotes", "2026-08-28T10:31:00", True,
+                payload=[live], quotes=[live],
+            ),
+            "core_quotes": DataBlock(
+                "core_quotes", "2026-08-28T10:31:00", True,
+                payload=[core], quotes=[core],
+            ),
+            "sector_eod": DataBlock(
+                "sector_eod", "2026-08-28T10:31:00", False,
+                payload={"sector_top": "", "fund_top": ""},
+            ),
+        },
+    )
+    fetched = {"sector": 0, "fund": 0}
+    monkeypatch.setattr(
+        "invest.skills.reports.b1_intraday._sector_top",
+        lambda *a, **k: fetched.__setitem__("sector", fetched["sector"] + 1) or "回源板块",
+    )
+    monkeypatch.setattr(
+        "invest.skills.reports.b1_intraday._fund_top",
+        lambda *a, **k: fetched.__setitem__("fund", fetched["fund"] + 1) or "回源资金",
+    )
+    monkeypatch.setattr("invest.skills.sections._intraday_llm.mood_llm", lambda *a, **k: {})
+    monkeypatch.setattr("invest.skills.sections._intraday_llm.mainline_llm", lambda *a, **k: {})
+    import invest.skills.sections.d29_sector_resonance as _d29
+    monkeypatch.setattr(_d29, "render", lambda *a, **k: "")
+    struct = render(p, snapshot=snap, brief=True)
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+    assert fetched == {"sector": 0, "fund": 0}
+    assert "回源板块" not in texts
+    assert "回源资金" not in texts
+
+
+def test_report_outcomes_and_channel_receipts(monkeypatch):
+    """生成失败 / 数据不足 / 发送失败 / 被限频 / 已成功 五态可区分，成功后写逐通道回执。"""
+    from invest.data.quotes import QuoteResult, parse_asset
+    from invest.skills.report_pipeline import REPORT_OUTCOMES, deliver_report
+    from invest.skills.snapshot import DataBlock, ReportSnapshot
+
+    p = _fresh_db()
+    now = dt.datetime(2026, 8, 28, 10, 31, 0)
+    live = QuoteResult(
+        ref=parse_asset("000001", "index"),
+        price=3900.0, pct=0.003, status="live",
+        freshness="live", fallback_level="none", src="tencent",
+    )
+    core = QuoteResult(
+        ref=parse_asset("600519"),
+        price=105.0, pct=0.05, status="live",
+        freshness="live", fallback_level="none", src="sina",
+    )
+    ok_snap = ReportSnapshot(
+        skill_id="b1_intraday",
+        as_of="2026-08-28T10:31:00",
+        blocks={
+            "index_quotes": DataBlock(
+                name="index_quotes", as_of="2026-08-28T10:31:00",
+                realtime=True, payload=[live], quotes=[live],
+            ),
+            "core_quotes": DataBlock(
+                name="core_quotes", as_of="2026-08-28T10:31:00",
+                realtime=True, payload=[core], quotes=[core],
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        "invest.skills.reports.b1_intraday.render",
+        lambda *a, **k: {
+            "title": "盘中", "sections": [{"type": "text", "text": "ok"}],
+            "as_of": ok_snap.as_of,
+        },
+    )
+
+    assert REPORT_OUTCOMES == (
+        "generate_failed", "data_insufficient", "send_failed", "rate_limited", "ok",
+    )
+
+    limited = deliver_report("b1_intraday", p, rate_limited=True, now=now)
+    assert limited.status == "rate_limited"
+
+    failed_send = deliver_report(
+        "b1_intraday", p, now=now, snapshot=ok_snap,
+        send_fn=lambda struct: False,
+    )
+    assert failed_send.status == "send_failed"
+
+    def _boom(*a, **k):
+        raise RuntimeError("llm down")
+
+    monkeypatch.setattr("invest.skills.reports.b1_intraday.render", _boom)
+    gen_fail = deliver_report(
+        "b1_intraday", p, now=now, snapshot=ok_snap, send_fn=lambda s: True,
+    )
+    assert gen_fail.status == "generate_failed"
+
+    monkeypatch.setattr(
+        "invest.skills.reports.b1_intraday.render",
+        lambda *a, **k: {
+            "title": "盘中", "sections": [{"type": "text", "text": "ok"}],
+            "as_of": ok_snap.as_of,
+        },
+    )
+
+    def _send_ok(struct):
+        from invest.delivery import deliver_channel
+
+        return deliver_channel("feishu", lambda: True, message_kind="report",
+                               message_id="b1_intraday")
+
+    from invest.delivery import delivery_context
+
+    with delivery_context(p, "intraday_report", "2026-08-28", "10:31"):
+        ok = deliver_report(
+            "b1_intraday", p, now=now, snapshot=ok_snap, send_fn=_send_ok,
+        )
+    assert ok.status == "ok"
+    conn = connect(p)
+    try:
+        rows = conn.execute(
+            "SELECT channel, status FROM delivery_receipts WHERE message_id='b1_intraday'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows
+    assert any(r["status"] == "succeeded" for r in rows)
+
+
+def test_a0_a3_skip_deliver_report_empty_freeze():
+    """盘前/晚报暂不走 deliver_report 门禁；_freeze_light 不种空列表冒充必需块。"""
+    import inspect
+
+    from invest.pipeline import notify_after_close, notify_morning_brief
+    from invest.skills.snapshot import freeze_snapshot
+
+    p = _fresh_db()
+    now = dt.datetime(2026, 8, 28, 8, 40, 0)
+    for sid in ("a0_premarket", "a3_daily"):
+        snap = freeze_snapshot(sid, p, now=now)
+        assert snap.as_of.startswith("2026-08-28T")
+        for name, block in snap.blocks.items():
+            quotes = getattr(block, "quotes", None)
+            payload = getattr(block, "payload", None)
+            assert quotes != [], f"{sid}.{name} 用空 quotes 冒充块"
+            assert payload not in ([],), f"{sid}.{name} 用空列表冒充块"
+
+    assert "deliver_report" not in inspect.getsource(notify_morning_brief)
+    assert "deliver_report" not in inspect.getsource(notify_after_close)
+
+
+def test_notify_auction_checks_completeness_before_generate(monkeypatch):
+    """竞价生产路径：先完整性再生成/发送，缺指数块不得叙事。"""
+    from invest.data.quotes import QuoteResult, parse_asset
+    from invest.pipeline import notify_auction
+    from invest.skills.snapshot import DataBlock, ReportSnapshot
+
+    p = _fresh_db()
+    generated = []
+    sent = []
+    empty = ReportSnapshot(
+        skill_id="a7_auction",
+        as_of="2026-08-28T09:25:00",
+        blocks={
+            "index_quotes": DataBlock(
+                "index_quotes", "2026-08-28T09:25:00", True,
+                payload=[], quotes=[],
+            ),
+        },
+    )
+    monkeypatch.setattr("invest.skills.snapshot.freeze_snapshot", lambda *a, **k: empty)
+    monkeypatch.setattr(
+        "invest.skills.reports.a7_auction.render",
+        lambda *a, **k: generated.append(1) or {
+            "title": "竞价", "sections": [{"type": "text", "text": "完整竞价报告"}],
+        },
+    )
+    monkeypatch.setattr(
+        "invest.skills.runner.run_structured",
+        lambda *a, **k: generated.append(1) or {
+            "title": "竞价", "sections": [{"type": "text", "text": "完整竞价报告"}],
+        },
+    )
+    monkeypatch.setattr(
+        "invest.pipeline._send_structured",
+        lambda *a, **k: sent.append(1) or True,
+    )
+    result = notify_auction(p, return_results=True)
+    assert result.status == "data_insufficient"
+    assert generated == []
+    assert sent == []
+
+    live = QuoteResult(
+        ref=parse_asset("000001", "index"),
+        price=3900.0, pct=0.003, status="live",
+        freshness="unknown", fallback_level="none", src="tencent",
+    )
+    ok_snap = ReportSnapshot(
+        skill_id="a7_auction",
+        as_of="2026-08-28T09:25:00",
+        blocks={
+            "index_quotes": DataBlock(
+                "index_quotes", "2026-08-28T09:25:00", True,
+                payload=[live], quotes=[live],
+            ),
+        },
+    )
+    monkeypatch.setattr("invest.skills.snapshot.freeze_snapshot", lambda *a, **k: ok_snap)
+    result_ok = notify_auction(p, return_results=True)
+    assert generated  # 完整性通过后才生成
+    assert sent
+    assert result_ok.status == "ok"
+
+
+def test_query_data_freshness_includes_report_ledger():
+    """系统状态接到任务1账本，不新造驾驶舱。"""
+    from invest.agent.tools import query_data_freshness
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        conn.execute(
+            """INSERT INTO job_executions(
+                   job, scheduled_date, run_slot, status, attempt, detail, artifact
+               ) VALUES('auction', '2026-08-28', '09:26', 'data_insufficient', 1,
+                        '缺少指数竞价', 'a7_auction')"""
+        )
+        conn.commit()
+        out = query_data_freshness(conn)
+        assert "reports" in out
+        jobs = {r["job"]: r["status"] for r in out["reports"]}
+        assert jobs.get("auction") == "data_insufficient"
     finally:
         conn.close()

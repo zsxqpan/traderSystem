@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 
 from openai import OpenAI
@@ -31,8 +32,8 @@ ALERT_STATE_FILE = ROOT / "data" / "llm_alert_state.json"
 _READONLY_TOOLS = {
     "query_strength", "query_rotation", "query_temperature", "query_capital",
     "query_linkage", "query_macro", "query_pool", "query_realtime_health",
-    "cross_validate", "query_stock_daily", "query_data_freshness",
-    "web_search", "web_fetch",
+    "cross_validate",     "query_stock_daily", "query_data_freshness",
+    "web_search", "web_fetch", "query_evidence",
 }
 
 
@@ -124,6 +125,8 @@ class LLMClient:
         max_turns: int = 5,
         max_tokens: int | None = None,
         history: list[dict] | None = None,
+        route: str = "",
+        planned_tools: list | None = None,
     ) -> str:
         """执行一轮带工具调用的对话，返回最终文本。
 
@@ -133,7 +136,18 @@ class LLMClient:
         减少多轮工具调用对同一维度的重复查询（配合 max_turns 收敛降低延迟）。
         2026-08-24：history 参数注入多轮对话历史（[{role: 'user'|'assistant', content}]），
         置于当前用户消息之前，实现跨轮上下文记忆。
+        2026-08-28：last_trace 记录 route/planned_tools/actual_tools/errors/data_as_of/evidence_ids；
+        模型后调的工具结果打成证据 ID；缓存命中也记时点。
         """
+        self.last_trace: dict = {
+            "route": route,
+            "planned_tools": list(planned_tools or []),
+            "actual_tools": [],
+            "errors": [],
+            "data_as_of": [],
+            "evidence_ids": [],
+            "evidence": [],
+        }
         messages = [{"role": "system", "content": system}]
         for h in (history or []):
             if h.get("role") in ("user", "assistant") and h.get("content"):
@@ -171,27 +185,37 @@ class LLMClient:
                     args = {}
                 fn = (dispatch or {}).get(tc.function.name)
                 cache_key = (tc.function.name, tc.function.arguments or "")
+                raw: object
+                from_cache = False
                 if fn is None:
-                    result = json.dumps({"error": f"未知工具 {tc.function.name}"}, ensure_ascii=False)
+                    raw = {"error": f"未知工具 {tc.function.name}"}
+                    self.last_trace["errors"].append(f"未知工具 {tc.function.name}")
                 elif tc.function.name in _READONLY_TOOLS and cache_key in tool_cache:
-                    result = tool_cache[cache_key]  # 会话内重复查询直接复用
+                    raw = _parse_cached(tool_cache[cache_key])
+                    from_cache = True
                 else:
                     try:
-                        result = json.dumps(fn(**args), ensure_ascii=False, default=str)
+                        raw = fn(**args)
+                        if isinstance(raw, dict) and raw.get("error"):
+                            self.last_trace["errors"].append(str(raw["error"]))
                     except Exception as exc:
-                        result = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                        raw = {"error": str(exc)}
+                        self.last_trace["errors"].append(str(exc))
                     if tc.function.name in _READONLY_TOOLS:
                         if len(tool_cache) >= 64:
                             tool_cache.clear()
-                        tool_cache[cache_key] = result
+                        tool_cache[cache_key] = json.dumps(raw, ensure_ascii=False, default=str)
+                result = self._record_tool_observation(tc.function.name, raw, from_cache=from_cache)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-        # 2026-08-21 兜底：轮数耗尽且最后一条是工具结果时，再让模型做一次"纯文本总结"
-        # （不再给 tools），避免把工具 JSON 当最终回复返回给用户。
+        # 轮数耗尽：再让模型基于已有工具结果给出完整结论（不得为「简洁」而丢掉结论）。
         if messages[-1].get("role") == "tool":
             try:
                 resp = self.client.chat.completions.create(
                     model=self.settings.llm_model,
-                    messages=messages + [{"role": "assistant", "content": "请基于以上工具结果给出最终简洁结论。"}],
+                    messages=messages + [{
+                        "role": "assistant",
+                        "content": "请基于以上工具结果给出完整结论，保留关键数字与证据引用，不要省略结论。",
+                    }],
                     temperature=0.2,
                     max_tokens=max_tokens,
                 )
@@ -204,6 +228,49 @@ class LLMClient:
             except Exception:
                 pass
         return messages[-1].get("content") or "[达到最大工具轮数]"
+
+    def _record_tool_observation(self, name: str, raw, *, from_cache: bool = False) -> str:
+        """记账：actual_tools / data_as_of / evidence_ids；返回带 evidence_id 的 JSON。"""
+        from invest.agent.agents import wrap_tool_evidence
+
+        ts = _extract_ts(raw)
+        if not ts:
+            ts = datetime.now().isoformat(timespec="seconds")
+        self.last_trace["actual_tools"].append(name)
+        self.last_trace["data_as_of"].append({"tool": name, "ts": ts})
+        ev = wrap_tool_evidence(name, raw)
+        self.last_trace["evidence"].append(ev)
+        self.last_trace["evidence_ids"].append(ev["id"])
+        payload = {"evidence_id": ev["id"], "data": raw}
+        if from_cache:
+            payload["cache_hit"] = True
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _parse_cached(blob: str):
+    try:
+        return json.loads(blob)
+    except (ValueError, TypeError):
+        return {"value": blob}
+
+
+def _extract_ts(raw) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    ts = raw.get("ts") or raw.get("as_of") or raw.get("fetched_at") or raw.get("published_at")
+    if ts:
+        return str(ts)
+    quotes = raw.get("quotes")
+    if isinstance(quotes, dict):
+        for q in quotes.values():
+            if isinstance(q, dict) and q.get("ts"):
+                return str(q["ts"])
+    items = raw.get("items") or raw.get("results")
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        t = items[0].get("ts") or items[0].get("published_at") or items[0].get("date")
+        if t:
+            return str(t)
+    return None
 
 
 def _push_alert(title: str, detail: str) -> None:

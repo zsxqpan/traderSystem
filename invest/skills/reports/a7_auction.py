@@ -26,26 +26,40 @@ SKILL = {
     "uses": ["d12_limit_up_ladder", "d21_freshness"],
     "params": {
         "db_path": "str, required",
+        "snapshot": "optional, 冻结快照；缺省则 render 内 freeze",
     },
 }
 
 
-def _index_table() -> tuple[list[list[str]], list[dict]]:
-    """指数竞价表格行 + 图表数据。"""
-    try:
-        from invest.data.index_realtime import fetch_index_realtime
+_INDEX_ORDER = ("000001", "399001", "000300", "000905", "000852", "000688", "399006", "899050")
 
-        idx = fetch_index_realtime()
-    except Exception:
-        return [], []
-    order = ("000001", "399001", "000300", "000905", "000852", "000688", "399006", "899050")
+
+def _pct_txt(pct: float | None) -> str:
+    if pct is None:
+        return "-"
+    return f"{pct:+.2%}"
+
+
+def _index_table(results=None) -> tuple[list[list[str]], list[dict], list]:
+    """指数竞价表格行 + 图表数据 + QuoteResult。"""
+    from invest.data.quotes import INDEX_UNIVERSE, get_quotes, status_label
+
+    if results is None:
+        try:
+            results = get_quotes(list(INDEX_UNIVERSE), obj_type="index")
+        except Exception:
+            return [], [], []
+    by = {r.ref.symbol: r for r in results}
     rows, chart = [], []
-    for code in order:
-        d = idx.get(code)
-        if d:
-            rows.append([d["name"], f"{d['price']:.2f}", f"{d['pct']:+.2f}%"])
-            chart.append({"name": d["name"], "value": d["pct"]})
-    return rows, chart
+    for code in _INDEX_ORDER:
+        r = by.get(code)
+        if r is None:
+            continue
+        price_txt = f"{r.price:.2f}" if r.price is not None else "—"
+        rows.append([r.ref.name or code, price_txt, _pct_txt(r.pct), status_label(r)])
+        if r.pct is not None:
+            chart.append({"name": r.ref.name or code, "value": r.pct * 100.0})
+    return rows, chart, results
 
 
 def _format_rows(items: list[dict], with_vol: bool = False) -> list[list[str]]:
@@ -140,74 +154,61 @@ def _core_symbols(db_path: str) -> list[str]:
         conn.close()
 
 
-def render(db_path: str) -> dict:
-    from invest.data.auction import fetch_batch_quotes, fetch_top_gainers, fetch_top_losers, fetch_vol_top
+def render(db_path: str, snapshot=None) -> dict:
     from invest.skills.sections import _intraday_llm
+    from invest.skills.snapshot import freeze_snapshot
 
     sections: list[dict] = []
+    snap = snapshot or freeze_snapshot("a7_auction", db_path)
     now = dt.datetime.now()
+    as_of = snap.as_of
 
-    # ========== 第一段：收集各模块数据 + 摘要文本 ==========
-    # 1) 指数竞价
-    idx_rows, chart = _index_table()
-    # 2) 竞价异动榜
-    try:
-        gainers = fetch_top_gainers(8)
-        losers = fetch_top_losers(3)
-        vol_top = fetch_vol_top(8)
-    except Exception:
-        gainers, losers, vol_top = [], [], []
-    # 3) 昨日连板竞价
-    conn = connect(db_path)
-    try:
-        ladder_symbols = _yesterday_ladder(conn)
-    finally:
-        conn.close()
+    # ========== 第一段：消费冻结快照（不再各自重拉） ==========
+    idx_block = snap.blocks.get("index_quotes")
+    idx_results = list(getattr(idx_block, "quotes", None) or [])
+    idx_rows, chart, idx_results = _index_table(idx_results)
+
+    boards = getattr(snap.blocks.get("auction_boards"), "payload", None) or {}
+    gainers = list(boards.get("gainers") or [])
+    losers = list(boards.get("losers") or [])
+    vol_top = list(boards.get("vol_top") or [])
+
+    from invest.data.quotes import status_label
+
+    ladder_results = list(getattr(snap.blocks.get("ladder_quotes"), "quotes", None) or [])
     ladder_rows: list[list[str]] = []
-    if ladder_symbols:
-        try:
-            quotes = fetch_batch_quotes(ladder_symbols)
-            ladder_rows = [
-                [s, (quotes.get(s) or {}).get("name", ""),
-                 f"{(quotes[s]['pct']):+.2f}%" if quotes.get(s) and quotes[s].get("pct") is not None else "-"]
-                for s in ladder_symbols if s in quotes
-            ]
-        except Exception:
-            pass
-    # 4) 市场关键股票竞价
-    conn = connect(db_path)
-    try:
-        hot_blocks = _hot_core_stocks(conn)
-    finally:
-        conn.close()
+    for r in ladder_results:
+        ladder_rows.append([r.ref.symbol, r.ref.name, _pct_txt(r.pct), status_label(r)])
+
+    key_block = snap.blocks.get("key_quotes")
+    key_payload = getattr(key_block, "payload", None) or {}
+    hot_blocks = key_payload.get("hot") if isinstance(key_payload, dict) else []
+    key_quotes = {r.ref.symbol: r for r in (getattr(key_block, "quotes", None) or [])}
     block_rows, block_texts = [], []
-    if hot_blocks:
-        try:
-            core_syms = [s["symbol"] for b in hot_blocks for s in b["stocks"]]
-            quotes = fetch_batch_quotes(core_syms)
-            for b in hot_blocks:
-                for s in b["stocks"]:
-                    q = quotes.get(s["symbol"])
-                    pct_txt = (f"{(q['pct']):+.2f}%" if q and q.get("pct") is not None else "-")
-                    block_rows.append([b["block"], f"{s['name']}({s['symbol']})",
-                                       f"{int(s.get('lianban') or 0)}板", pct_txt])
-                    block_texts.append(f"[{b['block']}] {s['name']} {pct_txt}")
-        except Exception:
-            pass
-    # 5) 核心关注/持仓竞价
-    core = _core_symbols(db_path)
+    for b in hot_blocks or []:
+        for s in b.get("stocks") or []:
+            q = key_quotes.get(s["symbol"])
+            pct_txt = _pct_txt(q.pct) if q else "—"
+            label = status_label(q) if q else "源失败"
+            block_rows.append([b["block"], f"{s['name']}({s['symbol']})",
+                               f"{int(s.get('lianban') or 0)}板", pct_txt, label])
+            block_texts.append(f"[{b['block']}] {s['name']} {pct_txt} {label}")
+
+    core_results = list(getattr(snap.blocks.get("core_quotes"), "quotes", None) or [])
     core_rows: list[list[str]] = []
-    if core:
-        try:
-            quotes = fetch_batch_quotes(core)
-            core_rows = [
-                [s, (quotes.get(s) or {}).get("name", ""),
-                 f"{(quotes[s]['price']):.2f}",
-                 f"{(quotes[s]['pct']):+.2f}%" if quotes.get(s) and quotes[s].get("pct") is not None else "-"]
-                for s in core if s in quotes
-            ]
-        except Exception:
-            pass
+    for r in core_results:
+        core_rows.append([
+            r.ref.symbol, r.ref.name,
+            f"{r.price:.2f}" if r.price is not None else "—",
+            _pct_txt(r.pct), status_label(r),
+        ])
+
+    from invest.data.quotes import coverage_text, degrade_alert_text, report_should_degrade
+
+    degrade, cov_info = report_should_degrade(idx_results, list(ladder_results) + list(core_results))
+    sections.append({"type": "text", "text": coverage_text(idx_results, list(ladder_results) + list(core_results))})
+    if degrade:
+        sections.append({"type": "text", "text": degrade_alert_text(cov_info)})
 
     # ========== 第二段：LLM 解析（各模块一次调用）+ 情绪预判（独立） ==========
     index_text = " ".join(f"{r[0]} {r[2]}" for r in idx_rows) if idx_rows else ""
@@ -218,15 +219,18 @@ def render(db_path: str) -> dict:
     ladder_text = "\n".join(f"  {r[0]} {r[2]}" for r in ladder_rows)
     key_text = "\n".join(block_texts)
     core_text = "\n".join(f"  {r[0]} {r[3]}" for r in core_rows)
-    analysis = _intraday_llm.section_analysis_llm(db_path, {
-        "index_text": index_text, "boards_text": boards_text, "ladder_text": ladder_text,
-        "key_text": key_text, "core_text": core_text,
-    })
-    pred = _intraday_llm.auction_llm(db_path, {
-        "index_text": index_text, "gainers": boards_text,
-        "vol_ratio": "\n".join(f"  {g['name']} {g['pct']:+.2f}%" for g in vol_top),
-        "ladder": ladder_text,
-    })
+    if degrade:
+        analysis, pred = {}, {}
+    else:
+        analysis = _intraday_llm.section_analysis_llm(db_path, {
+            "index_text": index_text, "boards_text": boards_text, "ladder_text": ladder_text,
+            "key_text": key_text, "core_text": core_text,
+        })
+        pred = _intraday_llm.auction_llm(db_path, {
+            "index_text": index_text, "gainers": boards_text,
+            "vol_ratio": "\n".join(f"  {g['name']} {g['pct']:+.2f}%" for g in vol_top),
+            "ladder": ladder_text,
+        })
 
     def _an(key: str) -> str:
         """模块解析文案：无特别消息显示'（无特别消息）'。"""
@@ -238,7 +242,7 @@ def render(db_path: str) -> dict:
     if idx_rows:
         sections.append({
             "type": "table", "title": "指数竞价",
-            "columns": ["指数", "竞价点位", "竞价涨跌幅"], "rows": idx_rows,
+            "columns": ["指数", "竞价点位", "竞价涨跌幅", "状态"], "rows": idx_rows,
         })
         if chart:
             sections.append({
@@ -274,7 +278,7 @@ def render(db_path: str) -> dict:
         up = sum(1 for r in ladder_rows if r[2] not in ("-",) and r[2].startswith("+"))
         sections.append({
             "type": "table", "title": f"昨日连板今日竞价（高开{up}/{len(ladder_rows)}=承接）",
-            "columns": ["代码", "名称", "竞价涨幅"], "rows": ladder_rows,
+            "columns": ["代码", "名称", "竞价涨幅", "状态"], "rows": ladder_rows,
         })
         if analysis:
             sections.append({"type": "text", "text": f"**连板竞价解析**: {_an('ladder')}"})
@@ -283,9 +287,11 @@ def render(db_path: str) -> dict:
     if block_rows:
         sections.append({
             "type": "table", "title": "市场关键股票竞价（昨日热门板块核心股·成交量最大）",
-            "columns": ["板块", "核心股", "昨日", "竞价涨幅"], "rows": block_rows,
+            "columns": ["板块", "核心股", "昨日", "竞价涨幅", "状态"], "rows": block_rows,
         })
-        ks = _intraday_llm.key_stock_llm(db_path, {"blocks_text": "\n".join(block_texts)})
+        ks = {} if degrade else _intraday_llm.key_stock_llm(
+            db_path, {"blocks_text": "\n".join(block_texts)}
+        )
         analysis_map = {b.get("name"): b.get("analysis") for b in (ks.get("blocks") or [])}
         lines = []
         for b in hot_blocks:
@@ -301,7 +307,7 @@ def render(db_path: str) -> dict:
     if core_rows:
         sections.append({
             "type": "table", "title": "核心关注/持仓竞价",
-            "columns": ["代码", "名称", "竞价价", "竞价涨幅"], "rows": core_rows,
+            "columns": ["代码", "名称", "竞价价", "竞价涨幅", "状态"], "rows": core_rows,
         })
         if analysis:
             sections.append({"type": "text", "text": f"**核心关注竞价解析**: {_an('core')}"})
@@ -314,14 +320,20 @@ def render(db_path: str) -> dict:
         if pred.get("hint"):
             lines.append(f"**操作提示**: {pred['hint']}")
         sections.append({"type": "text", "text": "**【竞价情绪预判】**\n" + "\n".join(lines)})
-    elif idx_rows:
+    elif idx_rows and not degrade:
         sections.append({"type": "text", "text": f"**【竞价情绪预判】**（规则回退）指数竞价: {index_text}"})
 
+    stamp = as_of[11:16] if len(as_of) >= 16 else now.strftime("%H:%M")
     sections.append({
         "type": "text",
-        "text": f"（9:25 集合竞价数据 · {now.strftime('%H:%M')} 生成）",
+        "text": f"（9:25 集合竞价数据 · {stamp} 生成 · as_of {as_of}）",
     })
     # views：情绪预判 + 模块解析（发送层落库 source='auction_report'，供盘后复盘/竞价解读 skill 迭代）
     views = {"mood": pred, "analysis": analysis}
-    return {"title": f"A股投资系统 · 竞价报告 {now.strftime('%H:%M')}",
-            "sections": sections, "views": views}
+    from invest.skills.contract import check_completeness, get_manifest
+
+    gate = check_completeness(get_manifest("a7_auction"), snap)
+    return {"title": f"A股投资系统 · 竞价报告 {stamp}",
+            "sections": sections, "views": views, "as_of": as_of,
+            "completeness": {"status": gate.status, "detail": gate.detail,
+                             "degrade": gate.degrade}}

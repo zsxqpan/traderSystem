@@ -2,7 +2,7 @@
 
 两次调用：
 1. overnight_analysis(db_path) -> str：外围数据行 → LLM 解读对 A 股影响（2-4 句）；
-2. digest(db_path) -> dict：昨收(15:00)后财联社电报素材 → LLM 输出 JSON
+2. digest(db_path) -> dict：近 3 个自然日财联社电报素材 → LLM 输出 JSON
    {risk_items[], news{macro,stock,market_outside}, macro_changed, risk_summary}。
 
 - 模块级缓存（_DIGEST_TTL=600s）避免同一次盘前生成重复调用；
@@ -10,7 +10,6 @@
 """
 from __future__ import annotations
 
-import datetime as dt
 import json
 import logging
 import time
@@ -22,12 +21,12 @@ _OA_TTL = 300.0      # 外围解读缓存 5 分钟
 _digest_cache: dict[str, tuple[float, dict]] = {}
 _oa_cache: dict[str, tuple[float, str]] = {}
 
-# 昨收时刻：最近交易日的 15:00（消息汇总从此时起算）
-_CUT_HOUR, _CUT_MINUTE = 15, 0
+# 素材窗口：近 cut_days 个自然日（2026-08-31 起不再限定「最近交易日 15:00 之后」——
+# 周末/周一早报时段财联社无电报会让消息汇总整节为空；放宽后周末素材也能进入汇总）
 
 
 def _recent_telegraph(cut_days: int = 3) -> list[str]:
-    """财联社电报（近 cut_days 天），过滤到「最近交易日 15:00 之后」。失败返回 []。"""
+    """财联社电报（近 cut_days 个自然日原始素材）。失败返回 []。"""
     try:
         from invest.report import _fetch_telegraph_lines
 
@@ -35,18 +34,39 @@ def _recent_telegraph(cut_days: int = 3) -> list[str]:
     except Exception as exc:
         logger.warning("电报素材获取失败: %s", exc)
         return []
-    if not lines:
-        return []
-    from invest.data.calendar import latest_trading_day
+    return lines or []
 
-    cut = latest_trading_day(dt.date.today())
-    cut_iso = f"{cut.isoformat()} {_CUT_HOUR:02d}:{_CUT_MINUTE:02d}"
-    out: list[str] = []
-    for ln in lines:
-        ts = ln.split("|", 1)[0].strip()  # 行首时间 "YYYY-MM-DD HH:MM:SS | ..."
-        if ts >= cut_iso:
-            out.append(ln)
-    return out
+
+# web 要闻补充查询（2026-08-31）：早报消息汇总在财联社电报之外补全网要闻；
+# DeepSeek 官方搜索每次=一次模型调用（max_tokens 512），控制在 4 个查询 × 3 条。
+_DIGEST_WEB_QUERIES = (
+    "A股 今日要闻",
+    "A股 宏观政策 监管",
+    "隔夜美股 大宗商品 汇率",
+    "A股 业绩预告 风险警示",
+)
+
+
+def _recent_web_hits(max_per_query: int = 3) -> list[str]:
+    """web 检索近 1-2 日要闻（"标题（来源URL）"行）。失败/无结果降级为空，不阻断。"""
+    from invest.agent.web_tools import web_search
+
+    lines: list[str] = []
+    for q in _DIGEST_WEB_QUERIES:
+        try:
+            raw = web_search(q, n=max_per_query)
+        except Exception as exc:
+            logger.warning("早报 web 检索失败 %s: %s", q, exc)
+            continue
+        if not isinstance(raw, list):
+            continue
+        for hit in raw[:max_per_query]:
+            title = str(hit.get("title") or "").strip()
+            url = str(hit.get("url") or "").strip()
+            if not title:
+                continue
+            lines.append(f"{title}（{url}）")
+    return lines
 
 
 def _llm(conn, system: str, user: str, max_tokens: int | None = None) -> str:
@@ -111,6 +131,7 @@ def digest(db_path: str) -> dict:
     result: dict = {"ok": False}
     try:
         material = _recent_telegraph()
+        material += _recent_web_hits()  # 2026-08-31：电报之外补全网要闻，提升宏观/海外/板块覆盖
         if not material:
             result["reason"] = "no_material"
             return result
@@ -120,7 +141,7 @@ def digest(db_path: str) -> dict:
 
             conn = connect(db_path)
             sys_prompt = (
-                "你是 A 股盘前财经编辑。下面是财联社电报（最近交易日 15:00 后至今晨）。\n"
+                "你是 A 股盘前财经编辑。下面是财联社电报与全网要闻检索（近 3 个自然日）。\n"
                 "任务：1) 筛选市场关注度高的关键消息（宏观政策/个股/市场外社会热点都算，如电影票房破圈这类");
             sys_prompt += (
                 "也算）；2) 识别与个股相关的风险事件（业绩雷/司法雷/停牌核查/风险警示/异动监控/黑天鹅）。\n"

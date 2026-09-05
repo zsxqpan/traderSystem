@@ -34,10 +34,10 @@ def _tmp_db_with_trades():
     init_db(p)
     conn = connect(p)
     from invest.discipline import plans, pool, records
-    pool.add_to_pool(conn, "X1", level="core")
-    pool.add_to_pool(conn, "X2", level="track")
-    plan1 = plans.create_plan(conn, "X1", stop_loss=9.0, buy_range="10.0,10.5")
-    plan2 = plans.create_plan(conn, "X2", stop_loss=9.0, buy_range="10.0,10.5")
+    pool.add_to_pool(conn, "600001", level="core")
+    pool.add_to_pool(conn, "600002", level="track")
+    plan1 = plans.create_plan(conn, "600001", stop_loss=9.0, buy_range="10.0,10.5")
+    plan2 = plans.create_plan(conn, "600002", stop_loss=9.0, buy_range="10.0,10.5")
     # X1(core)：10 笔，8 胜 2 负
     for i in range(10):
         rec = records.record_trade(conn, plan1["plan_id"], "buy", 10.0, 100)
@@ -66,7 +66,7 @@ def test_attribution_report():
     # 亏损集中度：X1 净盈利(+6)、X2 净亏损(-1) -> 仅 X2 为亏损贡献
     losers = top_losers(recs)
     assert len(losers) == 1
-    assert losers[0]["symbol"] == "X2"
+    assert losers[0]["symbol"] == "600002"
     assert losers[0]["total_pnl"] < 0
     conn.close()
     print("test_attribution_report OK")

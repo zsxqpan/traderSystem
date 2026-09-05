@@ -192,6 +192,101 @@ def page_mid():
     st.dataframe(q.load_macro(DB), width="stretch")
 
 
+def page_mid_compare():
+    """中期比价工作台：并排事实卡 + 证据/缺口 + 人工比较组 + 入池/建卡。"""
+    import json as _json
+
+    _health_line()
+    st.header("中期比价")
+    st.caption("规则生成事实卡；AI 只提炼带来源的消息/公告/舆情。综合买卖由人判断，系统不产出排名。")
+    as_of_raw = st.text_input("时点 as_of（YYYY-MM-DD，空=最新已落库时点）", value="")
+    as_of = q.resolve_workbench_as_of(DB, as_of_raw)
+    st.caption(f"当前工作台时点 {as_of}")
+    dimension = st.selectbox(
+        "维度筛选",
+        ["全部", "strength", "rotation", "valuation", "crowding", "capital", "cycle", "macro"],
+    )
+    dim = None if dimension == "全部" else dimension
+    cards = q.load_fact_cards(DB, as_of=as_of, dimension=dim)
+    st.subheader("事实卡")
+    st.dataframe(cards.drop(columns=["dimensions_json"], errors="ignore"), width="stretch")
+    evid_q = st.text_input("按证据编号检索（EVID-YYYYMMDD-xxxx）", value="")
+    if evid_q.strip():
+        found = q.find_evidence(DB, evid_q.strip())
+        if found.get("error"):
+            st.warning(found["error"])
+        else:
+            st.json(found)
+    options = cards["obj"].tolist() if not cards.empty else []
+    selected = st.multiselect("人工比较组（建议 3–5 个行业）", options, max_selections=5)
+    if st.button("深查并落库") and selected:
+        try:
+            result = q.run_deep_dive(
+                DB,
+                industries=selected,
+                as_of=as_of,
+            )
+            st.success(
+                f"已深查 {len(result['industry_cards'])} 个行业 / "
+                f"{len(result['stock_cards'])} 只个股并落库"
+            )
+        except Exception as exc:
+            st.error(str(exc))
+    if selected:
+        cols = st.columns(len(selected))
+        for col, obj in zip(cols, selected):
+            sub = cards[cards["obj"] == obj]
+            if sub.empty:
+                continue
+            row = sub.iloc[0]
+            with col:
+                st.markdown(f"**{obj}**")
+                st.caption(f"as_of={row['as_of']} · {row['rule_version']}")
+                try:
+                    st.json(_json.loads(row["dimensions_json"] or "{}"), expanded=False)
+                except Exception:
+                    st.write(row["dimensions_json"])
+                with st.expander("证据"):
+                    ev = q.load_fact_evidence(DB, int(row["id"]))
+                    st.dataframe(ev, width="stretch")
+                with st.expander("缺口"):
+                    st.write(row["missing_json"])
+    st.subheader("记录结论")
+    conclusion = st.text_input("比较结论")
+    notes = st.text_area("备注")
+    if st.button("写入比较记录") and selected and conclusion:
+        rec = q.save_comparison(
+            DB,
+            as_of=as_of,
+            peer_set=selected,
+            conclusion=conclusion,
+            notes=notes,
+        )
+        st.success(f"已记录比较 #{rec['id']}")
+    hist = q.load_comparisons(DB, as_of=as_of)
+    if not hist.empty:
+        st.dataframe(hist, width="stretch")
+    st.subheader("送入候选池 / 机会卡片")
+    symbol = st.text_input("股票代码")
+    industry = st.text_input("行业（可选）")
+    thesis = st.text_area("建卡三句话验证", value="人工比价后认为中期赔率可接受，先观察")
+    c1, c2 = st.columns(2)
+    if c1.button("送入候选池") and symbol:
+        try:
+            q.promote_factcard_to_pool(DB, symbol, industry=industry)
+            st.success(f"{symbol} 已入池")
+        except Exception as exc:
+            st.error(str(exc))
+    if c2.button("生成机会卡片") and symbol:
+        try:
+            created = q.promote_factcard_to_card(
+                DB, symbol, thesis=thesis, industry=industry,
+            )
+            st.success(f"卡片 #{created.get('card_id')} {created.get('status')}")
+        except Exception as exc:
+            st.error(str(exc))
+
+
 def page_viewpoints():
     _health_line()
     st.header("观点库")
@@ -240,6 +335,7 @@ PAGES = {
     "轮动与联动": page_rotation,
     "短线轨": page_short,
     "中线轨": page_mid,
+    "中期比价": page_mid_compare,
     "观点库": page_viewpoints,
     "执行纪律": page_discipline,
     "回测": page_backtest,

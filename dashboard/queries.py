@@ -214,3 +214,192 @@ def load_coverage(db: str) -> pd.DataFrame:
         return pd.DataFrame([dict(r) for r in rows])
     finally:
         conn.close()
+
+
+def resolve_workbench_as_of(db: str, as_of: str | None = None) -> str:
+    """工作台时点：显式 as_of 优先；空则取已落库事实卡最新日期；再没有才用当天。"""
+    import datetime as dt
+
+    raw = (as_of or "").strip()
+    if raw:
+        return raw
+    conn = connect(db)
+    try:
+        row = conn.execute("SELECT MAX(as_of) AS as_of FROM fact_cards").fetchone()
+        latest = row["as_of"] if row else None
+    finally:
+        conn.close()
+    if latest:
+        return str(latest)
+    return dt.date.today().isoformat()
+
+
+def load_fact_cards(
+    db: str,
+    as_of: str | None = None,
+    obj_type: str | None = "industry",
+    dimension: str | None = None,
+) -> pd.DataFrame:
+    """中期比价工作台：事实卡列表，可按 as_of / 维度筛选。"""
+    sql = """SELECT id, obj_type, obj, as_of, data_version, rule_version,
+                    dimensions_json, missing_json, created_at
+             FROM fact_cards WHERE 1=1"""
+    args: list = []
+    if as_of:
+        sql += " AND as_of=?"
+        args.append(as_of)
+    if obj_type:
+        sql += " AND obj_type=?"
+        args.append(obj_type)
+    sql += " ORDER BY obj"
+    df = _read(db, sql, tuple(args))
+    if df.empty or not dimension:
+        return df
+    import json
+
+    keep = []
+    for idx, row in df.iterrows():
+        missing = json.loads(row["missing_json"] or "[]")
+        dims = json.loads(row["dimensions_json"] or "{}")
+        if dimension in missing or not dims.get(dimension):
+            continue
+        keep.append(idx)
+    return df.loc[keep].reset_index(drop=True)
+
+
+def load_fact_card_detail(db: str, card_id: int) -> dict:
+    conn = connect(db)
+    try:
+        row = conn.execute("SELECT * FROM fact_cards WHERE id=?", (card_id,)).fetchone()
+        return dict(row) if row else {}
+    finally:
+        conn.close()
+
+
+def load_fact_evidence(db: str, card_id: int) -> pd.DataFrame:
+    return _read(
+        db,
+        """SELECT evidence_id, kind, source, url, published_at, as_of, summary
+           FROM fact_evidence WHERE card_id=? ORDER BY id""",
+        (card_id,),
+    )
+
+
+def load_comparisons(db: str, as_of: str | None = None) -> pd.DataFrame:
+    sql = """SELECT id, as_of, peer_set_json, conclusion, notes,
+                    data_version, rule_version, created_at
+             FROM comparison_records"""
+    args: list = []
+    if as_of:
+        sql += " WHERE as_of=?"
+        args.append(as_of)
+    sql += " ORDER BY id DESC"
+    return _read(db, sql, tuple(args))
+
+
+def save_comparison(
+    db: str,
+    *,
+    as_of: str,
+    peer_set: list[str],
+    conclusion: str,
+    notes: str = "",
+) -> dict:
+    from invest.evidence.factcards import record_comparison
+
+    conn = connect(db)
+    try:
+        return record_comparison(
+            conn, as_of=as_of, peer_set=peer_set, conclusion=conclusion, notes=notes,
+        )
+    finally:
+        conn.close()
+
+
+def run_deep_dive(
+    db: str,
+    industries: list[str],
+    *,
+    as_of: str,
+    symbols: list[str] | None = None,
+    news_fn=None,
+) -> dict:
+    """仪表盘深查：仅允许 3–5 个行业 + 候选池/指定个股 ≤20，并落库。
+
+    2026-08-31：默认使用 deep_dive_news（电报快讯优先 + web 检索，URL 提取真实日期），
+    深查由用户主动触发，token 可控。
+    """
+    from invest.evidence.factcards import deep_dive, deep_dive_news
+
+    if news_fn is None:
+        news_fn = deep_dive_news
+    conn = connect(db)
+    try:
+        return deep_dive(
+            conn, industries=industries, as_of=as_of, symbols=symbols, news_fn=news_fn,
+        )
+    finally:
+        conn.close()
+
+
+def find_evidence(db: str, evidence_id: str) -> dict:
+    from invest.evidence.factcards import lookup_evidence
+
+    conn = connect(db)
+    try:
+        found = lookup_evidence(conn, evidence_id)
+        return found if found else {"error": f"未找到证据 {evidence_id}"}
+    finally:
+        conn.close()
+
+
+def _workbench_symbol(symbol: str) -> str:
+    """入池与建卡共用：600519.SH / sh600519 → 600519。"""
+    from invest.data.quotes import normalize_symbol
+
+    norm = normalize_symbol(symbol, "stock")
+    if not norm:
+        raise ValueError(f"非法或未规范化代码: {symbol!r}")
+    return norm
+
+
+def promote_factcard_to_pool(
+    db: str,
+    symbol: str,
+    *,
+    industry: str = "",
+    reason: str = "事实卡人工比价",
+    level: str = "track",
+) -> dict:
+    from invest.discipline.pool import add_to_pool
+
+    symbol = _workbench_symbol(symbol)
+    conn = connect(db)
+    try:
+        return add_to_pool(conn, symbol, level=level, industry=industry, reason=reason)
+    finally:
+        conn.close()
+
+
+def promote_factcard_to_card(
+    db: str,
+    symbol: str,
+    *,
+    thesis: str,
+    industry: str = "",
+    reason: str = "事实卡人工比价",
+) -> dict:
+    from invest.discipline.cards import create_card
+
+    symbol = _workbench_symbol(symbol)
+    conn = connect(db)
+    try:
+        row = conn.execute(
+            "SELECT symbol FROM candidate_pool WHERE symbol=? AND out_date IS NULL",
+            (symbol,),
+        ).fetchone()
+        if row is None:
+            promote_factcard_to_pool(db, symbol, industry=industry, reason=reason)
+        return create_card(conn, symbol, thesis=thesis, cycle="mid")
+    finally:
+        conn.close()

@@ -61,6 +61,9 @@ class Quote:
     pct: float | None = None
     ts: dt.datetime | None = None
     src: str = ""
+    prev_close: float | None = None
+    name: str = ""
+    suspended: bool = False
 
 
 def _f(v) -> float | None:
@@ -92,8 +95,15 @@ def _parse_sina_line(line: str) -> Quote | None:
         return None
     price = _f(seg[3])
     prev_close = _f(seg[2])
+    name = (seg[0] or "").strip()
     if price is None or price <= 0:
-        return None
+        if not name:
+            return None
+        # 无价 ≠ 立刻停牌：留给合并层继续换源
+        return Quote(
+            symbol=msym, price=None, pct=None, ts=_parse_ts(f"{seg[30]} {seg[31]}"),
+            src="sina", prev_close=prev_close, name=name, suspended=False,
+        )
     pct = (price / prev_close - 1.0) if prev_close and prev_close > 0 else None
     return Quote(
         symbol=msym,
@@ -101,6 +111,8 @@ def _parse_sina_line(line: str) -> Quote | None:
         pct=pct,
         ts=_parse_ts(f"{seg[30]} {seg[31]}"),
         src="sina",
+        prev_close=prev_close,
+        name=name,
     )
 
 
@@ -113,7 +125,7 @@ def _fetch_sina(session: requests.Session, symbols: list[str]) -> dict[str, Quot
     resp = session.get(
         url,
         headers={**_UA, "Referer": "https://finance.sina.com.cn"},
-        timeout=8,
+        timeout=getattr(session, "_rt_timeout", 8),
     )
     resp.raise_for_status()
     resp.encoding = "gbk"
@@ -136,8 +148,15 @@ def _parse_tencent_line(line: str) -> Quote | None:
     if len(seg) < 40:
         return None
     price = _f(seg[3])
+    prev_close = _f(seg[4]) if len(seg) > 4 else None
+    name = (seg[1] or "").strip() if len(seg) > 1 else ""
     if price is None or price <= 0:
-        return None
+        if not name:
+            return None
+        return Quote(
+            symbol=msym, price=None, pct=None, ts=None, src="tencent",
+            prev_close=prev_close, name=name, suspended=False,
+        )
     pct = _f(seg[32])
     ts = None
     try:
@@ -150,6 +169,8 @@ def _parse_tencent_line(line: str) -> Quote | None:
         pct=(pct / 100.0) if pct is not None else None,
         ts=ts,
         src="tencent",
+        prev_close=prev_close,
+        name=name,
     )
 
 
@@ -159,7 +180,7 @@ def _fetch_tencent(session: requests.Session, symbols: list[str]) -> dict[str, Q
         return {}
     msyms = [_to_market_symbol(s) for s in symbols]
     url = "https://qt.gtimg.cn/q=" + ",".join(msyms)
-    resp = session.get(url, headers=_UA, timeout=8)
+    resp = session.get(url, headers=_UA, timeout=getattr(session, "_rt_timeout", 8))
     resp.raise_for_status()
     resp.encoding = "gbk"
     out: dict[str, Quote] = {}
@@ -189,7 +210,7 @@ def _fetch_em(session: requests.Session, symbols: list[str]) -> dict[str, Quote]
             resp = session.get(
                 url,
                 headers={**_UA, "Referer": "https://quote.eastmoney.com"},
-                timeout=8,
+                timeout=getattr(session, "_rt_timeout", 8),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -201,7 +222,9 @@ def _fetch_em(session: requests.Session, symbols: list[str]) -> dict[str, Quote]
                     continue
                 key = str(it.get("f12", "")).lower()
                 price = _f(it.get("f2"))
-                if not key or price is None or price <= 0:
+                name = str(it.get("f14") or "")
+                prev_close = _f(it.get("f18"))
+                if not key:
                     continue
                 pct = _f(it.get("f3"))
                 ts_ms = it.get("f124")
@@ -211,12 +234,22 @@ def _fetch_em(session: requests.Session, symbols: list[str]) -> dict[str, Quote]
                         ts = dt.datetime.fromtimestamp(int(ts_ms) / 1000)
                     except (ValueError, OSError, OverflowError):
                         ts = None
+                if price is None or price <= 0:
+                    if not name:
+                        continue
+                    out[key] = Quote(
+                        symbol=key, price=None, pct=None, ts=ts, src="em_push2",
+                        prev_close=prev_close, name=name, suspended=False,
+                    )
+                    continue
                 out[key] = Quote(
                     symbol=key,
                     price=price,
                     pct=(pct / 100.0) if pct is not None else None,
                     ts=ts,
                     src="em_push2",
+                    prev_close=prev_close,
+                    name=name,
                 )
             if out:
                 return out
@@ -257,32 +290,117 @@ class RealtimeQuoter:
         self.session = requests.Session()
         # 关键：忽略 Windows 系统代理（WinINET 注册表），否则代理未运行时全部请求被拒
         self.session.trust_env = False
+        self.session._rt_timeout = timeout
         # 源健康：连续失败计数（用于日志/告警）
         self.source_failures: dict[str, int] = {s: 0 for s in source_order}
 
-    def fetch(self, symbols: list[str]) -> dict[str, Quote]:
-        """按优先级尝试各源，首个成功即返回（含部分成功）；全部失败抛 RuntimeError。"""
+    def _bare(self, sym: str) -> str:
+        s = (sym or "").lower()
+        for prefix in ("sh", "sz", "bj"):
+            if s.startswith(prefix) and len(s) > 2:
+                return s[2:]
+        return s
+
+    def _is_live(self, quote: Quote, now: dt.datetime) -> bool:
+        if getattr(quote, "suspended", False) is True or quote.price is None or quote.price <= 0:
+            return False
+        return is_fresh(quote, now=now, max_lag=10.0)
+
+    def _fetch_merged(self, symbols: list[str]) -> tuple[dict[str, Quote], Exception | None]:
+        """按标的合并三源：live 收下；missing/stale 继续换源。返回 {裸代码: Quote}。"""
         symbols = list(dict.fromkeys(symbols))
-        if not symbols:
-            return {}
+        remaining: dict[str, str] = {self._bare(s): s for s in symbols}
+        merged: dict[str, Quote] = {}
         last_err: Exception | None = None
+        now = dt.datetime.now()
+        asked_any = False
         for src in self.source_order:
+            if not remaining:
+                break
             fetcher = _fetcher_for(src)
             if fetcher is None:
                 continue
+            to_ask = list(remaining.values())
             for attempt in range(self.retries + 1):
                 try:
-                    quotes = fetcher(self.session, symbols)
-                    if quotes:
-                        self.source_failures[src] = 0
-                        return quotes
-                    self.source_failures[src] += 1
+                    quotes = fetcher(self.session, to_ask)
+                    asked_any = True
+                    if not quotes:
+                        self.source_failures[src] += 1
+                        continue
+                    self.source_failures[src] = 0
+                    for key, q in quotes.items():
+                        bare = self._bare(q.symbol or key)
+                        if self._is_live(q, now):
+                            merged[bare] = q
+                            remaining.pop(bare, None)
+                        elif q.price and q.price > 0:
+                            prev = merged.get(bare)
+                            if prev is None or not self._is_live(prev, now):
+                                merged[bare] = q
+                            # stale 留在 remaining，继续换源
+                        else:
+                            # 无价：记下候选，继续换源（不立刻当停牌终态）
+                            if bare not in merged:
+                                merged[bare] = q
+                    break
                 except Exception as exc:
                     last_err = exc
                     self.source_failures[src] += 1
                     if attempt < self.retries:
                         time.sleep(0.3)
-        raise RuntimeError(f"实时行情三源全部失败: {last_err}")
+        for q in merged.values():
+            if (q.price is None or q.price <= 0) and (q.name or "").strip():
+                q.suspended = True
+        if last_err is None and asked_any and not merged:
+            last_err = RuntimeError("三源均空")
+        return merged, last_err
+
+    def fetch(self, symbols: list[str]) -> dict[str, Quote]:
+        """三源按标的合并；只返回有价快照（键=源符号）。全部无价时抛 RuntimeError。"""
+        symbols = list(dict.fromkeys(symbols))
+        if not symbols:
+            return {}
+        merged, last_err = self._fetch_merged(symbols)
+        priced = {q.symbol: q for q in merged.values() if q.price and q.price > 0}
+        if not priced:
+            raise RuntimeError(f"实时行情三源全部失败: {last_err}")
+        return priced
+
+    def fetch_resolved(self, symbols: list[str]) -> dict:
+        """每个请求标的一条 QuoteResult（live/fallback/missing），不静默丢行。"""
+        from invest.data.quotes import AssetRef, QuoteResult, parse_asset
+
+        symbols = list(dict.fromkeys(symbols))
+        if not symbols:
+            return {}
+        merged, _last_err = self._fetch_merged(symbols)
+        out: dict = {}
+        for raw in symbols:
+            ref = parse_asset(raw, "stock") or AssetRef(self._bare(raw), "stock")
+            bare = ref.symbol
+            q = merged.get(bare)
+            if q is not None and q.price and q.price > 0:
+                status = "live" if self._is_live(q, dt.datetime.now()) else "fallback"
+                out[bare] = QuoteResult(
+                    ref=ref, price=q.price, prev_close=q.prev_close, pct=q.pct, ts=q.ts,
+                    src=q.src, freshness="live" if status == "live" else "stale",
+                    fallback_level="none",
+                    status=status,
+                )
+            elif q is not None and getattr(q, "suspended", False) is True:
+                out[bare] = QuoteResult(
+                    ref=ref, price=q.prev_close, prev_close=q.prev_close, ts=q.ts,
+                    src=q.src, fallback_level="suspended", missing_reason="停牌",
+                    status="fallback" if q.prev_close else "missing",
+                )
+            else:
+                out[bare] = QuoteResult(
+                    ref=ref, status="missing",
+                    fallback_level="source_fail",
+                    missing_reason="源失败",
+                )
+        return out
 
     def close(self) -> None:
         self.session.close()
@@ -313,7 +431,7 @@ def is_fresh(quote: Quote, now: dt.datetime | None = None, max_lag: float = 10.0
         return False
     now = now or dt.datetime.now()
     lag = (now - quote.ts).total_seconds()
-    return 0 <= lag <= max_lag
+    return -2.0 <= lag <= max_lag
 
 
 def quote_lag_seconds(quote: Quote, now: dt.datetime | None = None) -> float | None:

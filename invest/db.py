@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 18
 
 SCHEMA_SQL = """
 -- ============ 行情 ============
@@ -325,6 +325,46 @@ CREATE TABLE IF NOT EXISTS job_runs (
     detail      TEXT
 );
 
+-- 可靠任务执行账本：一个计划槽位只保留一条最新状态；job_runs 继续作为兼容事件流。
+CREATE TABLE IF NOT EXISTS job_executions (
+    job             TEXT NOT NULL,
+    scheduled_date  TEXT NOT NULL,
+    run_slot        TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    attempt         INTEGER NOT NULL DEFAULT 0,
+    detail          TEXT DEFAULT '',
+    artifact        TEXT DEFAULT '',
+    channel_results TEXT DEFAULT '{}',
+    started_at      TEXT,
+    lease_expires_at TEXT,
+    lease_owner     TEXT,
+    finished_at     TEXT,
+    created_at      TEXT DEFAULT (datetime('now','localtime')),
+    updated_at      TEXT DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (job, scheduled_date, run_slot)
+);
+CREATE INDEX IF NOT EXISTS idx_job_executions_status_date
+    ON job_executions(status, scheduled_date);
+
+-- 逐通道持久投递回执。sending 在进程崩溃恢复时转 uncertain，禁止盲目重发。
+CREATE TABLE IF NOT EXISTS delivery_receipts (
+    job             TEXT NOT NULL,
+    scheduled_date  TEXT NOT NULL,
+    run_slot        TEXT NOT NULL,
+    message_kind    TEXT NOT NULL,
+    message_id      TEXT NOT NULL,
+    channel         TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempt         INTEGER NOT NULL DEFAULT 0,
+    detail          TEXT DEFAULT '',
+    started_at      TEXT,
+    succeeded_at    TEXT,
+    updated_at      TEXT DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (job, scheduled_date, run_slot, message_kind, message_id, channel)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_receipts_status
+    ON delivery_receipts(status, scheduled_date);
+
 CREATE TABLE IF NOT EXISTS llm_usage (
     date   TEXT NOT NULL,
     job    TEXT NOT NULL,
@@ -455,11 +495,58 @@ CREATE TABLE IF NOT EXISTS pool_trap_alerts (
 CREATE TABLE IF NOT EXISTS chat_history (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id    TEXT NOT NULL,
+    sender_id  TEXT NOT NULL DEFAULT '',    -- 群聊按发送者隔离（2026-08-28）
     role       TEXT NOT NULL,               -- user / assistant
     content    TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_chat_history_chat ON chat_history(chat_id, id);
+CREATE INDEX IF NOT EXISTS idx_chat_history_chat_sender ON chat_history(chat_id, sender_id, id);
+
+-- ============ 中期证据驾驶舱（2026-08-28） ============
+CREATE TABLE IF NOT EXISTS fact_cards (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    obj_type        TEXT NOT NULL,             -- industry / stock
+    obj             TEXT NOT NULL,
+    as_of           TEXT NOT NULL,             -- YYYY-MM-DD
+    data_version    TEXT NOT NULL DEFAULT '',
+    rule_version    TEXT NOT NULL DEFAULT '',
+    dimensions_json TEXT NOT NULL DEFAULT '{}',
+    missing_json    TEXT NOT NULL DEFAULT '[]',
+    created_at      TEXT DEFAULT (datetime('now','localtime')),
+    UNIQUE (obj_type, obj, as_of)
+);
+CREATE INDEX IF NOT EXISTS idx_fact_cards_as_of ON fact_cards(as_of, obj_type);
+
+CREATE TABLE IF NOT EXISTS fact_evidence (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    evidence_id   TEXT NOT NULL UNIQUE,        -- EVID-YYYYMMDD-0001
+    card_id       INTEGER NOT NULL,
+    kind          TEXT NOT NULL,               -- dimension / news / announcement / sentiment
+    source        TEXT NOT NULL DEFAULT '',
+    url           TEXT DEFAULT '',
+    published_at  TEXT DEFAULT '',
+    fetched_at    TEXT DEFAULT '',
+    as_of         TEXT NOT NULL,
+    summary       TEXT NOT NULL DEFAULT '',
+    payload_json  TEXT DEFAULT '{}',
+    created_at    TEXT DEFAULT (datetime('now','localtime')),
+    FOREIGN KEY (card_id) REFERENCES fact_cards(id)
+);
+CREATE INDEX IF NOT EXISTS idx_fact_evidence_card ON fact_evidence(card_id);
+CREATE INDEX IF NOT EXISTS idx_fact_evidence_as_of ON fact_evidence(as_of, evidence_id);
+
+CREATE TABLE IF NOT EXISTS comparison_records (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of          TEXT NOT NULL,
+    peer_set_json  TEXT NOT NULL,              -- 人工选择的比较组
+    conclusion     TEXT NOT NULL DEFAULT '',
+    notes          TEXT DEFAULT '',
+    data_version   TEXT DEFAULT '',
+    rule_version   TEXT DEFAULT '',
+    created_at     TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_comparison_as_of ON comparison_records(as_of);
 """
 
 
@@ -493,6 +580,58 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols_ind = [r["name"] for r in conn.execute("PRAGMA table_info(industry_valuation)")]
     if "pb" not in cols_ind:
         conn.execute("ALTER TABLE industry_valuation ADD COLUMN pb REAL")
+    cols_jobs = [r["name"] for r in conn.execute("PRAGMA table_info(job_executions)")]
+    if "lease_expires_at" not in cols_jobs:
+        conn.execute("ALTER TABLE job_executions ADD COLUMN lease_expires_at TEXT")
+    if "lease_owner" not in cols_jobs:
+        conn.execute("ALTER TABLE job_executions ADD COLUMN lease_owner TEXT")
+    receipt_cols = [r["name"] for r in conn.execute("PRAGMA table_info(delivery_receipts)")]
+    if "message_kind" not in receipt_cols or "message_id" not in receipt_cols:
+        conn.execute("ALTER TABLE delivery_receipts RENAME TO delivery_receipts_v15")
+        conn.execute(
+            """CREATE TABLE delivery_receipts (
+                   job TEXT NOT NULL,
+                   scheduled_date TEXT NOT NULL,
+                   run_slot TEXT NOT NULL,
+                   message_kind TEXT NOT NULL,
+                   message_id TEXT NOT NULL,
+                   channel TEXT NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'pending',
+                   attempt INTEGER NOT NULL DEFAULT 0,
+                   detail TEXT DEFAULT '',
+                   started_at TEXT,
+                   succeeded_at TEXT,
+                   updated_at TEXT DEFAULT (datetime('now','localtime')),
+                   PRIMARY KEY (
+                       job, scheduled_date, run_slot, message_kind, message_id, channel
+                   )
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO delivery_receipts(
+                   job, scheduled_date, run_slot, message_kind, message_id,
+                   channel, status, attempt, detail, started_at, succeeded_at, updated_at
+               )
+               SELECT job, scheduled_date, run_slot,
+                      CASE WHEN job='pool_trap_scan' THEN 'alert' ELSE 'report' END,
+                      CASE job
+                          WHEN 'auction' THEN 'a7_auction'
+                          WHEN 'morning_brief' THEN 'a0_premarket'
+                          WHEN 'weekend' THEN 'a4_weekly'
+                          WHEN 'monthly' THEN 'a5_monthly'
+                          WHEN 'yearly' THEN 'a6_yearly'
+                          WHEN 'evening_report' THEN 'a3_daily'
+                          WHEN 'pool_trap_scan' THEN 'd31_pool_trap_alerts'
+                          ELSE job
+                      END,
+                      channel, status, attempt, detail, started_at, succeeded_at, updated_at
+               FROM delivery_receipts_v15"""
+        )
+        conn.execute("DROP TABLE delivery_receipts_v15")
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_delivery_receipts_status
+               ON delivery_receipts(status, scheduled_date)"""
+        )
     # dragon_tiger 历史 bug：榜单行不写 seat_type（NULL），SQLite 主键中
     # NULL!=NULL，导致每次采集重复插入。清理每个 (date,symbol) 仅保留一行；
     # 新数据由采集层统一写入非空 seat_type='list'（见 akshare_source.py）。
@@ -503,12 +642,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
                WHERE seat_type IS NULL GROUP BY date, symbol
            )"""
     )
+    chat_cols = [r["name"] for r in conn.execute("PRAGMA table_info(chat_history)")]
+    if chat_cols and "sender_id" not in chat_cols:
+        conn.execute("ALTER TABLE chat_history ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_history_chat_sender "
+        "ON chat_history(chat_id, sender_id, id)"
+    )
 
 
 def init_db(db_path: str | Path) -> None:
     """初始化 Schema；若版本落后则升级。"""
     conn = connect(db_path)
     try:
+        # chat_history 是旧库已存在的表：先补 sender_id 列再跑 SCHEMA_SQL
+        # （SCHEMA_SQL 中 idx_chat_history_chat_sender 引用该列，旧库直接
+        #  executescript 会报 "no such column: sender_id"；新库无此表时跳过，
+        #  由 SCHEMA_SQL 建全表）。幂等：_migrate 中同样的 ALTER 无副作用。
+        chat_cols = [r["name"] for r in conn.execute("PRAGMA table_info(chat_history)")]
+        if chat_cols and "sender_id" not in chat_cols:
+            conn.execute("ALTER TABLE chat_history ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''")
         conn.executescript(SCHEMA_SQL)
         _migrate(conn)
         current = conn.execute("PRAGMA user_version").fetchone()[0]

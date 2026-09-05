@@ -88,13 +88,14 @@ def _start_feishu_ws() -> None:
 def main() -> None:
     acquire_singleton_lock()
     log_service_started()
-    # 2026-08-18：默认 OS 计划任务模式（--ticker-only，只跑盘中 10s 轮询 + 飞书接收）；
+    # 默认 OS 计划任务模式（--ticker-only，盘中 10s 轮询 + 每分钟任务补偿 + 飞书接收）；
     # 显式加 --full 才启用完整 APScheduler（不装 OS 任务的旧模式）
     ticker_only = "--full" not in sys.argv
     sched = build_scheduler(ticker_only=ticker_only)
     sched.start()
     if ticker_only:
-        print(f"调度服务已启动(pid={os.getpid()})：ticker-only 模式（默认）——仅盘中 10s 轮询 + 飞书接收，"
+        print(f"调度服务已启动(pid={os.getpid()})：ticker-only 模式（默认）——盘中 10s 轮询"
+              f" + 每分钟任务补偿 + 飞书接收，"
               f"定时任务由 OS 计划任务承担；如需完整 APScheduler 请加 --full")
     else:
         print(f"调度服务已启动(pid={os.getpid()})：完整 APScheduler 模式（--full）——盘前08:30 / 盘后16:00 / 周末周日20:00 / 夜间22:00")

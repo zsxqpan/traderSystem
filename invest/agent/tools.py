@@ -20,7 +20,18 @@ def _query(conn: sqlite3.Connection, sql: str, args=()):
 # ---------- 个股日线（按需） ----------
 
 _stock_daily_cache: dict[str, tuple[float, dict]] = {}
-_STOCK_DAILY_TTL = 1800.0  # 缓存 30 分钟
+_STOCK_DAILY_TTL = 1800.0  # 非交易时段缓存 30 分钟
+_STOCK_DAILY_TTL_TRADING = 45.0  # 交易时段缩短，避免把实时价冻进日线缓存
+
+
+def _daily_cache_ttl() -> float:
+    """交易时段 30–60 秒；休市仍 30 分钟。"""
+    try:
+        from invest.intraday import _in_trading_window
+
+        return _STOCK_DAILY_TTL_TRADING if _in_trading_window() else _STOCK_DAILY_TTL
+    except Exception:
+        return _STOCK_DAILY_TTL
 
 
 def _norm_symbol(symbol: str) -> str:
@@ -166,49 +177,49 @@ def query_lhb(conn: sqlite3.Connection, symbol: str = "", name: str = "", n: int
 
 def query_realtime_quote(conn=None, symbol: str = "", obj_type: str = "stock",
                          symbols: list | None = None) -> dict:
-    """实时报价（2026-08-25）：个股/指数/ETF 三源实时快照。
+    """实时报价：只消费统一行情契约（QuoteResult）。
 
-    - obj_type=stock：RealtimeQuoter 三源（新浪→腾讯→东财 push2），盘中=现价，收盘后=收盘价；
-    - obj_type=index：腾讯指数快照；obj_type=etf：东财 ETF 快照；
+    - obj_type=stock/index/etf：走 invest.data.quotes.get_quotes；
+    每个请求标的都有 live/fallback/missing，附覆盖率。
     实时数据即最新，**不受 daily_bars 新鲜度守卫约束**。
-    返回 {obj_type, quotes: {code: {name?, price, pct?, ...}}}；失败 {error}。
+
+    涨跌幅单位（调用方必读）：
+    - pct：小数 ratio（0.0035 = +0.35%），与 Quote.pct 一致；
+    - pct_percent：百分数（0.35 = +0.35%）；
+    - pct_unit 恒为 "ratio"，标明 pct 字段单位。
+    ETF 额外保留 amount / vol_ratio / main_net / super_net。
     """
-    out: dict = {"obj_type": obj_type, "quotes": {}}
+    from invest.data.quotes import INDEX_UNIVERSE, get_quotes, summarize_coverage
+
     try:
         if obj_type == "index":
-            from invest.data.index_realtime import fetch_index_realtime
+            target = list(symbols or INDEX_UNIVERSE)
+        elif obj_type == "etf":
+            from invest.data.etf import INDEX_ETFS
 
-            for code, d in fetch_index_realtime().items():
-                out["quotes"][code] = {"name": d.get("name"), "price": d.get("price"),
-                                       "pct": d.get("pct")}
-            return out
-        if obj_type == "etf":
-            from invest.data.etf import INDEX_ETFS, fetch_etf_quotes
-
-            codes = symbols or list(INDEX_ETFS)
-            for code, q in fetch_etf_quotes(codes).items():
-                out["quotes"][code] = {
-                    "name": q.get("name") or code, "price": q.get("price"), "pct": q.get("pct"),
-                    "amount": q.get("amount"), "vol_ratio": q.get("vol_ratio"),
-                    "main_net": q.get("main_net"), "super_net": q.get("super_net"),
-                }
-            return out
-        from invest.data.realtime import RealtimeQuoter
-        from invest.intraday import _bare_symbol
-
-        target = list(dict.fromkeys(symbols or ([symbol] if symbol else [])))
-        if not target:
-            return {"error": "请提供 symbol（个股代码）或 symbols 列表"}
-        with RealtimeQuoter() as q:
-            quotes = q.fetch(target)
-        for msym, qq in quotes.items():
-            out["quotes"][_bare_symbol(msym)] = {
-                "price": qq.price, "pct": qq.pct,
-                "ts": qq.ts.isoformat() if qq.ts else None, "src": qq.src,
+            target = list(symbols or INDEX_ETFS)
+        else:
+            target = list(dict.fromkeys(symbols or ([symbol] if symbol else [])))
+            if not target:
+                return {"error": "请提供 symbol（个股代码）或 symbols 列表"}
+        results = get_quotes(target, obj_type=obj_type)
+        quotes = {}
+        for r in results:
+            item = {
+                "name": r.ref.name, "price": r.price, "prev_close": r.prev_close,
+                "pct": r.pct,
+                "pct_percent": (r.pct * 100.0) if r.pct is not None else None,
+                "pct_unit": "ratio",
+                "ts": r.ts.isoformat() if r.ts else None, "src": r.src,
+                "freshness": r.freshness, "fallback_level": r.fallback_level,
+                "missing_reason": r.missing_reason, "status": r.status,
             }
-        if not out["quotes"]:
-            return {"error": "未取到实时报价"}
-        return out
+            extras = r.extras or {}
+            for k in ("amount", "vol_ratio", "main_net", "super_net"):
+                if k in extras:
+                    item[k] = extras[k]
+            quotes[r.ref.symbol] = item
+        return {"obj_type": obj_type, "quotes": quotes, "coverage": summarize_coverage(results)}
     except Exception as exc:
         return {"error": f"实时报价失败: {type(exc).__name__}: {exc}"}
 
@@ -229,7 +240,7 @@ def query_stock_daily(conn: sqlite3.Connection, symbol: str, days: int = 60) -> 
 
     now = time.time()
     cached = _stock_daily_cache.get(sym)
-    if cached and now - cached[0] < _STOCK_DAILY_TTL:
+    if cached and now - cached[0] < _daily_cache_ttl():
         return cached[1]
 
     rows = _query(
@@ -376,36 +387,102 @@ def query_realtime_health(conn) -> dict:
     return realtime_health(get_settings().db_path)
 
 
-def query_data_freshness(conn) -> dict:
-    """数据新鲜度总览（2026-08-20）：daily_bars/index_bars/quant 最新时点 vs 最近交易日。
+def evaluate_freshness(conn, *, now=None) -> dict:
+    """query_data_freshness 与 freshness_gate 的唯一判定（合并后口径一致）。
 
-    回复涉及具体行情/板块/个股数据前先调用：fresh=False 时数据滞后，
-    应说明"数据截至 XX"再回答，不要假装是当天最新。
+    - 非交易时段：日线/指数**任一**到最近交易日即 fresh（都缺才滞后）；
+    - 交易时段：实时能力看本次 probe/逐标的 live，不读 job_runs.realtime；
+    - quant 滞后只提示，不进 stale_parts。
     """
-    import datetime as dt
+    import datetime as _dt
 
     from invest.data.calendar import latest_trading_day
+    from invest.intraday import _in_trading_window
 
-    exp = latest_trading_day(dt.date.today()).isoformat()
-    latest_bars = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()[0] or ""
-    latest_idx = conn.execute("SELECT MAX(date) FROM index_bars").fetchone()[0] or ""
-    latest_q = conn.execute("SELECT MAX(run_date) FROM quant_strength").fetchone()[0] or ""
-    # 2026-08-24：quant 是衍生指标（晚间/盘后计算），滞后不阻塞行情回答——只提示，不进 stale
+    exp = latest_trading_day(_dt.date.today()).isoformat()
+    try:
+        latest_bars = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()[0] or ""
+        latest_idx = conn.execute("SELECT MAX(date) FROM index_bars").fetchone()[0] or ""
+        latest_q = conn.execute("SELECT MAX(run_date) FROM quant_strength").fetchone()[0] or ""
+    except Exception:
+        latest_bars = latest_idx = latest_q = ""
     stale = [k for k, v in (("daily_bars", latest_bars), ("index_bars", latest_idx)) if v < exp]
-    latest_all = max(latest_bars, latest_idx, latest_q) or "无"
+    bars_ok = len(stale) < 2
     quant_stale = bool(latest_q and latest_q < exp)
+    trading = _in_trading_window(now)
+    realtime_ok = True
+    if trading:
+        try:
+            from invest.data.quotes import probe_realtime
+
+            pr = probe_realtime()
+            realtime_ok = bool(pr.get("ok"))
+            detail = pr.get("detail") or ""
+        except Exception as exc:
+            realtime_ok = False
+            detail = f"probe失败: {exc}"
+        fresh = realtime_ok
+        note = ("数据已是最新" if fresh
+                else f"实时行情数据失效/过期（{detail}），暂不提供数据与结论，请稍后重试")
+    else:
+        fresh = bars_ok
+        latest = max(latest_bars, latest_idx) or "无"
+        if fresh:
+            note = "数据已是最新"
+            if quant_stale:
+                note += "；quant 衍生指标滞后（盘后计算，正常现象），不阻塞行情回答"
+        else:
+            note = (f"数据截至 {latest}（日线/指数均未到最近交易日 {exp}），"
+                    f"数据滞后暂不提供数据与结论，请稍后重试")
     return {
         "expected_trading_day": exp,
         "daily_bars_latest": latest_bars or "无",
         "index_bars_latest": latest_idx or "无",
         "quant_latest": latest_q or "无",
-        "fresh": not stale,
+        "fresh": fresh,
         "stale_parts": stale,
         "quant_stale": quant_stale,
-        "note": ("数据已是最新" if not stale
-                 else f"数据滞后：{','.join(stale)}（最新到 {latest_all}）；当日日线/板块数据源通常晚间才发布")
-                + ("；quant 衍生指标滞后（盘后计算，正常现象），不阻塞行情回答" if quant_stale and not stale else ""),
+        "realtime_ok": realtime_ok,
+        "note": note,
+        "trading": trading,
     }
+
+
+def latest_report_statuses(conn) -> list[dict]:
+    """任务1账本上的最新报告状态（按 job 取最近一条），不新造驾驶舱。"""
+    try:
+        rows = conn.execute(
+            """SELECT job, status, detail, artifact, scheduled_date, run_slot
+               FROM job_executions
+               WHERE artifact LIKE 'a%' OR artifact LIKE 'b%'
+                  OR job IN ('auction','morning_brief','evening_report','intraday_report')
+               ORDER BY scheduled_date DESC, updated_at DESC"""
+        ).fetchall()
+    except Exception:
+        return []
+    seen: set[str] = set()
+    out: list[dict] = []
+    for r in rows:
+        job = str(r["job"])
+        if job in seen:
+            continue
+        seen.add(job)
+        out.append({
+            "job": job,
+            "status": r["status"],
+            "detail": r["detail"] or "",
+            "artifact": r["artifact"] or "",
+            "scheduled_date": r["scheduled_date"],
+            "run_slot": r["run_slot"],
+        })
+    return out
+
+
+def query_data_freshness(conn) -> dict:
+    """数据新鲜度总览：与 freshness_gate 共用 evaluate_freshness；附带报告账本。"""
+    out = dict(evaluate_freshness(conn))
+    out["reports"] = latest_report_statuses(conn)
+    return out
 
 
 def web_search(query: str, n: int = 5) -> list[dict] | dict:
@@ -741,59 +818,37 @@ _FRESH_TTL = 30.0  # 新鲜度判定缓存 30s（避免每次工具调用都查�
 
 
 def freshness_gate(conn) -> tuple[bool, str]:
-    """数据新鲜度门禁（2026-08-23 对话守卫）：返回 (可答, 说明)。
-
-    - 交易时段：实时行情健康才可答（当日日线晚间才发布属正常，不看日线）；
-    - 非交易时段：daily_bars/index_bars 到最近交易日才可答，滞后返回原因。
-    带 30s 缓存；判定失败保守放行（不误伤）。
-    """
-    import datetime as _dt
+    """数据新鲜度门禁：与 query_data_freshness 共用 evaluate_freshness。"""
     import time as _time
-
-    from invest.data.calendar import latest_trading_day
 
     db = _db_path_of(conn) or "memory"
     now = _time.time()
     cached = _fresh_cache.get(db)
     if cached and now - cached[0] < _FRESH_TTL:
         return cached[1]
-
-    def _set(out: tuple[bool, str]) -> tuple[bool, str]:
-        _fresh_cache[db] = (now, out)
-        return out
-
-    exp = latest_trading_day(_dt.date.today()).isoformat()
-    # 交易时段：实时行情健康优先
     try:
-        from invest.intraday import _in_trading_window
-
-        if _in_trading_window():
-            from invest.config import get_settings
-            from invest.data.realtime import realtime_health
-
-            rh = realtime_health(get_settings().db_path)
-            if not rh.get("ok", False):
-                detail = rh.get("last_detail") or f"stale={rh.get('stale', 0)}"
-                return _set((False, f"实时行情数据失效/过期（{detail}），暂不提供数据与结论，请稍后重试"))
-            return _set((True, ""))
+        ev = evaluate_freshness(conn)
+        out = (True, "") if ev["fresh"] else (False, ev["note"])
     except Exception:
-        pass
-    # 非交易时段：日线/指数**任一**到最近交易日即可放行（2026-08-24 放宽——
-    # 盘前/休市问最近交易日数据属正常，个股或指数任一方有当日快照即可答；两者都缺才拦截）
-    try:
-        latest_bars = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()[0] or ""
-        latest_idx = conn.execute("SELECT MAX(date) FROM index_bars").fetchone()[0] or ""
-    except Exception:
-        return _set((True, ""))
-    stale = [k for k, v in (("日线", latest_bars), ("指数", latest_idx)) if v < exp]
-    if len(stale) == 2:
-        latest = max(latest_bars, latest_idx) or "无"
-        return _set((False, (f"数据截至 {latest}（日线/指数均未到最近交易日 {exp}），"
-                             f"数据滞后暂不提供数据与结论，请稍后重试")))
-    return _set((True, ""))
+        out = (True, "")
+    _fresh_cache[db] = (now, out)
+    return out
 
 
-def cross_validate(conn, obj: str, obj_type: str = "industry") -> dict:
+def query_evidence(conn: sqlite3.Connection, evidence_id: str = "") -> dict:
+    """按 EVID-YYYYMMDD-xxxx 查事实卡证据：摘要/来源/所属卡。"""
+    eid = (evidence_id or "").strip()
+    if not eid:
+        return {"error": "请提供证据编号（EVID-YYYYMMDD-xxxx）"}
+    from invest.evidence.factcards import lookup_evidence
+
+    found = lookup_evidence(conn, eid)
+    if found is None:
+        return {"error": f"未找到证据 {eid}"}
+    return found
+
+
+def cross_validate(conn, obj: str, obj_type: str = "industry", as_of: str | None = None) -> dict:
     """多源交叉验证（A-Stock-Skills 多源校验思想，2026-08-16）。
 
     对 obj（行业名或个股代码）一次性汇总四个独立维度的最新信号：
@@ -802,18 +857,21 @@ def cross_validate(conn, obj: str, obj_type: str = "industry") -> dict:
     - linkage:   高相关联动板块（相关度≥0.7）；
     - valuation: 估值分位（PE/PB）与拥挤度（行业）；
     返回 {obj, dimensions: {...}, n_dimensions, summary}。
+    as_of 有值时只取该日及之前的最新截面，不偷看后续数据。
     """
+    extra = " AND run_date<=?" if as_of else ""
+    extra_p: tuple = (as_of,) if as_of else ()
     out: dict = {}
     if obj_type == "stock":
         # 个股：强度 + 资金 + 行业维度（不覆盖个股自身维度）
         try:
             rows = _query(
                 conn,
-                """SELECT obj, rs, trend_stage FROM quant_strength
+                f"""SELECT obj, rs, trend_stage FROM quant_strength
                    WHERE obj_type='stock' AND period='short' AND obj=?
                      AND run_date = (SELECT MAX(run_date) FROM quant_strength
-                                     WHERE obj_type='stock' AND period='short' AND obj=?)""",
-                (obj, obj),
+                                     WHERE obj_type='stock' AND period='short' AND obj=?{extra})""",
+                (obj, obj, *extra_p),
             )
             out["strength"] = rows[0] if rows else None
         except Exception:
@@ -821,11 +879,11 @@ def cross_validate(conn, obj: str, obj_type: str = "industry") -> dict:
         try:
             rows = _query(
                 conn,
-                """SELECT fund_type, style, confidence FROM quant_capital
+                f"""SELECT fund_type, style, confidence FROM quant_capital
                    WHERE obj_type='stock' AND obj=?
                      AND run_date = (SELECT MAX(run_date) FROM quant_capital
-                                     WHERE obj_type='stock' AND obj=?)""",
-                (obj, obj),
+                                     WHERE obj_type='stock' AND obj=?{extra})""",
+                (obj, obj, *extra_p),
             )
             out["capital"] = rows[0] if rows else None
         except Exception:
@@ -835,26 +893,28 @@ def cross_validate(conn, obj: str, obj_type: str = "industry") -> dict:
             from invest.data.industry_map import industry_of
             ind = industry_of(conn, obj)
             if ind:
-                out["industry"] = {"name": ind, **_industry_dimensions(conn, ind)}
+                out["industry"] = {"name": ind, **_industry_dimensions(conn, ind, as_of=as_of)}
         except Exception:
             pass
     else:
-        out.update(_industry_dimensions(conn, obj))
+        out.update(_industry_dimensions(conn, obj, as_of=as_of))
     n = sum(1 for v in out.values() if v is not None and v != {})
     return {"obj": obj, "obj_type": obj_type, "dimensions": out, "n_dimensions": n}
 
 
-def _industry_dimensions(conn, industry: str) -> dict:
+def _industry_dimensions(conn, industry: str, as_of: str | None = None) -> dict:
     """行业四维度：强度/资金/联动/估值。"""
+    extra = " AND run_date<=?" if as_of else ""
+    extra_p: tuple = (as_of,) if as_of else ()
     res: dict = {}
     try:
         rows = _query(
             conn,
-            """SELECT obj, rs, rs5, rs10, rs20, momentum, trend_stage FROM quant_strength
+            f"""SELECT obj, rs, rs5, rs10, rs20, momentum, trend_stage FROM quant_strength
                WHERE obj_type='industry' AND period='short' AND obj=?
                  AND run_date = (SELECT MAX(run_date) FROM quant_strength
-                                 WHERE obj_type='industry' AND period='short')""",
-            (industry,),
+                                 WHERE obj_type='industry' AND period='short'{extra})""",
+            (industry, *extra_p),
         )
         res["strength"] = rows[0] if rows else None
     except Exception:
@@ -862,11 +922,11 @@ def _industry_dimensions(conn, industry: str) -> dict:
     try:
         rows = _query(
             conn,
-            """SELECT fund_type, style, confidence FROM quant_capital
+            f"""SELECT fund_type, style, confidence FROM quant_capital
                WHERE obj_type='industry' AND obj=?
                  AND run_date = (SELECT MAX(run_date) FROM quant_capital
-                                 WHERE obj_type='industry' AND obj=?)""",
-            (industry, industry),
+                                 WHERE obj_type='industry' AND obj=?{extra})""",
+            (industry, industry, *extra_p),
         )
         res["capital"] = rows[0] if rows else None
     except Exception:
@@ -874,10 +934,11 @@ def _industry_dimensions(conn, industry: str) -> dict:
     try:
         rows = _query(
             conn,
-            """SELECT a, b, corr, lead FROM quant_linkage
-               WHERE run_date = (SELECT MAX(run_date) FROM quant_linkage)
+            f"""SELECT a, b, corr, lead FROM quant_linkage
+               WHERE run_date = (SELECT MAX(run_date) FROM quant_linkage
+                                 WHERE 1=1{extra})
                  AND (a=? OR b=?) AND corr>=0.7 ORDER BY corr DESC LIMIT 5""",
-            (industry, industry),
+            (*extra_p, industry, industry),
         )
         res["linkage"] = rows
     except Exception:
@@ -885,10 +946,11 @@ def _industry_dimensions(conn, industry: str) -> dict:
     try:
         rows = _query(
             conn,
-            """SELECT pe_pct, pb_pct, crowding, crowding_state FROM quant_valuation
+            f"""SELECT pe_pct, pb_pct, crowding, crowding_state FROM quant_valuation
                WHERE obj=?
-                 AND run_date = (SELECT MAX(run_date) FROM quant_valuation WHERE obj=?)""",
-            (industry, industry),
+                 AND run_date = (SELECT MAX(run_date) FROM quant_valuation
+                                 WHERE obj=?{extra})""",
+            (industry, industry, *extra_p),
         )
         res["valuation"] = rows[0] if rows else None
     except Exception:
@@ -926,8 +988,9 @@ TOOL_SCHEMAS = [
     {"type": "function", "function": {"name": "request_attribution", "description": "交易→投研：归因请求单", "parameters": {"type": "object", "properties": {"obj": {"type": "string"}, "reason": {"type": "string"}}, "required": ["obj", "reason"]}}},
     {"type": "function", "function": {"name": "cross_validate", "description": "多源交叉验证：对某行业或个股汇总四维度最新信号（强度RS/趋势 / 资金风格 / 高相关联动 / 估值PE/PB分位与拥挤度），用于确认方向是否多维度共振", "parameters": {"type": "object", "properties": {"obj": {"type": "string"}, "obj_type": {"type": "string", "enum": ["industry", "stock"], "description": "默认 industry"}}, "required": ["obj"]}}},
     {"type": "function", "function": {"name": "query_stock_daily", "description": "查询任意个股日线数据（最近收盘价/1/5/20日涨跌幅/窗口内高低/最近5条K线）。本地有历史时用三源实时接口拼当日（收盘后=收盘价，不等晚间历史接口）；本地完全无该股时按需联网拉取（akshare 东财→新浪）。周期决定 days：短线/游资视角=60；中线=250；长线=500。分析个股时优先用这个工具拿收盘数据，再配 cross_validate 看多维度；**查实时价/涨跌幅用 query_realtime_quote**", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "6位股票代码，如 600519"}, "days": {"type": "integer", "description": "交易日数：短线60/中线250/长线500，默认60"}}, "required": ["symbol"]}}},
-    {"type": "function", "function": {"name": "query_realtime_quote", "description": "实时报价（2026-08-25）：个股/指数/ETF 三源实时快照——盘中=现价、收盘后=收盘价。查'XX 现在多少/实时/今天涨跌'用这个，不受日线新鲜度守卫约束（实时即最新）", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "个股代码（obj_type=stock 时）"}, "obj_type": {"type": "string", "enum": ["stock", "index", "etf"], "description": "默认 stock"}, "symbols": {"type": "array", "items": {"type": "string"}, "description": "批量代码（obj_type=etf 时可选）"}}, "required": []}}},
+    {"type": "function", "function": {"name": "query_realtime_quote", "description": "实时报价：个股/指数/ETF 快照。pct 是小数 ratio（0.0035=+0.35%），pct_percent 是百分数（0.35=+0.35%），pct_unit 恒为 ratio。ETF 另含 amount/vol_ratio/main_net/super_net。不受日线新鲜度守卫约束", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "个股代码（obj_type=stock 时）"}, "obj_type": {"type": "string", "enum": ["stock", "index", "etf"], "description": "默认 stock"}, "symbols": {"type": "array", "items": {"type": "string"}, "description": "批量代码（obj_type=etf 时可选）"}}, "required": []}}},
     {"type": "function", "function": {"name": "query_lhb", "description": "查询个股龙虎榜（2026-08-25）：本地 dragon_tiger 表按股票代码/名称查最近 N 次（日期/买入/卖出/净额）。问'XX 的龙虎榜/谁在买卖 XX'用这个（本地数据已采集）；查最新榜单 TOP 用 run_section d15", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "6位股票代码，如 002083"}, "name": {"type": "string", "description": "股票名称（symbol 缺失时用）"}, "n": {"type": "integer", "description": "最近 N 次，默认5"}}, "required": []}}},
+    {"type": "function", "function": {"name": "query_evidence", "description": "按证据编号 EVID-YYYYMMDD-xxxx 查询事实卡证据：摘要/来源/所属卡。飞书推送或比价卡里出现编号时用这个核对，不要凭印象复述", "parameters": {"type": "object", "properties": {"evidence_id": {"type": "string", "description": "证据编号，如 EVID-20260827-0001"}}, "required": ["evidence_id"]}}},
     {"type": "function", "function": {"name": "xueqiu_fetch_user", "description": "抓雪球用户主页动态（2026-08-25，Playwright 真实浏览器过 WAF）：返回该大V 最近文章列表（标题+URL），并自动建/更新 big_v_profile 画像。问'某雪球大V 最近发了什么'用这个；拿到文章 URL 后再用 xueqiu_fetch_article 抓正文", "parameters": {"type": "object", "properties": {"user_id": {"type": "string", "description": "雪球用户 ID（数字）或主页 URL，如 6192813830"}, "limit": {"type": "integer", "description": "动态条数，默认10"}}, "required": ["user_id"]}}},
     {"type": "function", "function": {"name": "xueqiu_fetch_article", "description": "抓雪球文章正文（2026-08-25，Playwright 过 WAF）：返回标题/时间/作者/正文，并按 url 去重写入 big_v_opinion（需先 xueqiu_fetch_user 建画像）。搜到/拿到雪球文章链接后要读全文用这个（web_fetch 抓不了雪球，WAF 保护）", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "雪球文章链接，如 https://xueqiu.com/6192813830/366009201"}, "profile_id": {"type": "string", "description": "大V 画像 id（xq_xxx，可选；提供则入库）"}}, "required": ["url"]}}},
     {"type": "function", "function": {"name": "query_data_freshness", "description": "数据新鲜度总览：daily_bars/index_bars/quant 最新时点 vs 最近交易日。回答涉及具体行情/板块/个股数据的问题前必须先调用；fresh=false 时说明数据截至时间再回答", "parameters": {"type": "object", "properties": {}, "required": []}}},
@@ -957,6 +1020,7 @@ _IMPLEMENTATIONS = {
     "query_stock_daily": query_stock_daily,
     "query_realtime_quote": query_realtime_quote,
     "query_lhb": query_lhb,
+    "query_evidence": query_evidence,
     "xueqiu_fetch_user": xueqiu_fetch_user,
     "xueqiu_fetch_article": xueqiu_fetch_article,
     "query_data_freshness": query_data_freshness,

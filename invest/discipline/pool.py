@@ -24,6 +24,12 @@ def add_to_pool(
     falsify_condition: str = "",
 ) -> dict:
     """入池；校验关注度级别与容量上限。已入池则更新级别/行业/理由。"""
+    from invest.data.quotes import normalize_symbol
+
+    norm = normalize_symbol(symbol, "stock")
+    if not norm:
+        raise ValueError(f"非法或未规范化代码: {symbol!r}")
+    symbol = norm
     if level not in LEVELS:
         raise ValueError(f"关注度级别必须为 {LEVELS}")
     active = _active_rows(conn)

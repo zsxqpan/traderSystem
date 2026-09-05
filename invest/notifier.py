@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+import urllib.error
 
 import requests
 
@@ -25,33 +26,62 @@ class Notifier:
     def enabled(self) -> bool:
         return bool(self.webhook)
 
-    def send_text(self, content: str, key: str = "", min_interval: float = 0.0,
-                  feishu: bool = True) -> bool:
+    def send_text(
+        self,
+        content: str,
+        key: str = "",
+        min_interval: float = 0.0,
+        feishu: bool = True,
+        return_results: bool = False,
+        message_kind: str = "text",
+        message_id: str = "",
+    ) -> bool | dict[str, bool]:
         """发送文本消息到所有已配置通道；key 相同且未到间隔则跳过。
 
         feishu=False（2026-08-22）：跳过飞书通道（盘前报告走卡片时用，
         避免 text 与卡片重复推送）。
-        返回 True 表示至少一个通道成功；全部失败或全部未配置时返回 False。
+        默认返回聚合 bool，保持原调用兼容；return_results=True 时返回逐通道结果。
         """
+        results = {"wecom": False, "weixin": False}
+        if feishu:
+            results["feishu"] = False
+        from invest.delivery import deliver_channel, in_delivery_context
+
+        persistent_delivery = in_delivery_context()
+        stable_message_id = message_id or key or "text"
         if not content or not content.strip():
-            return False
+            return results if return_results else False
         if not self.enabled:
-            return False  # 禁用状态：不尝试任何通道
-        if key:
+            return results if return_results else False  # 禁用状态：不尝试任何通道
+        if key and not persistent_delivery:
             last = _LAST_SEND.get(key, 0.0)
             if time.time() - last < min_interval:
-                return False
+                return results if return_results else False
 
-        results: list[bool] = []
-        results.append(self._send_wecom(content))
+        results["wecom"] = deliver_channel(
+            "wecom",
+            lambda: self._send_wecom(content),
+            message_kind=message_kind,
+            message_id=stable_message_id,
+        )
         if feishu:
-            results.append(self._send_feishu(content, key=key))
-        results.append(self._send_weixin(content, key=key))
+            results["feishu"] = deliver_channel(
+                "feishu",
+                lambda: self._send_feishu(content, key=key),
+                message_kind=message_kind,
+                message_id=stable_message_id,
+            )
+        results["weixin"] = deliver_channel(
+            "weixin",
+            lambda: self._send_weixin(content, key=key),
+            message_kind=message_kind,
+            message_id=stable_message_id,
+        )
 
-        ok = any(results)
-        if ok and key:
+        ok = any(results.values())
+        if ok and key and not persistent_delivery:
             _LAST_SEND[key] = time.time()
-        return ok
+        return results if return_results else ok
 
     # --- 通道实现 ---------------------------------------------------------
 
@@ -70,6 +100,13 @@ class Notifier:
             if not ok:
                 logger.warning("企业微信推送失败: HTTP %s", resp.status_code)
             return ok
+        except requests.RequestException as exc:
+            logger.warning("企业微信推送失败: %s", exc)
+            from invest.delivery import in_delivery_context
+
+            if in_delivery_context():
+                raise
+            return False
         except Exception as exc:
             logger.warning("企业微信推送失败: %s", exc)
             return False
@@ -79,6 +116,13 @@ class Notifier:
             from invest.push.feishu_push import send_text as fs_send
 
             return fs_send(content, key=key)
+        except requests.RequestException as exc:
+            logger.warning("飞书群推送失败: %s", exc)
+            from invest.delivery import in_delivery_context
+
+            if in_delivery_context():
+                raise
+            return False
         except Exception as exc:
             logger.warning("飞书群推送失败: %s", exc)
             return False
@@ -88,6 +132,13 @@ class Notifier:
             from invest.push.weixin_push import send_text as wx_send
 
             return wx_send(content, key=key)
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            logger.warning("微信推送失败: %s", exc)
+            from invest.delivery import in_delivery_context
+
+            if in_delivery_context():
+                raise
+            return False
         except Exception as exc:
             logger.warning("微信推送失败: %s", exc)
             return False

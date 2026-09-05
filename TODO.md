@@ -1,9 +1,17 @@
-## 📋 完成度与测试覆盖追踪（2026-08-15 盘点）
+## 📋 完成度与测试覆盖追踪
+
+### 2026-08-28 可靠性与证据驾驶舱
+- 介绍与用法已重写：`docs/SYSTEM_GUIDE.md`（飞书 / 中期比价 / 报告 / 任务）、`docs/OPERATIONS.md`（补偿 / 账本 / 排障）。
+- 部署默认 **ticker-only**；OS 计划任务 **13** 个（与 `JOB_FUNCS` / `install_os_tasks.ps1` 校验一致），盘中轮询 **10 秒**。
+- 晚间只发 **22:00 evening_report** 一份（已合并原 16:00 日报 / 21:35 P2 简报 / 22:00 复盘）；16:00 after_close 不再推送日报。
+- 仪表盘 **9** 页（含中期比价）；空 as_of 落到最新已落库事实卡时点。
+- 行为评测：`tests/test_eval_e2e.py`（工具计划 / 数字可追溯 / 实时覆盖 / 报告送达 / 静默失败）。
+- 盘中 10s ticker 真实交易时段仍未在周末实测；阶段 1 季度闭环 / BCS 季度核验仍属 [C]。
 
 ### 总体进度
-- 总项 83 | ✅ 已完成 73 | ⬜ 未完成 10（[B] 需用户执行 8 + [C] 时间/运行依赖 2）
+- 本隔离工作树（`reliability-evidence-cockpit`）做任务 1–6 可靠性/证据驾驶舱改造；完成度以本工作树改造项与 `pytest` 为准，不再沿用 2026-08-15 盘点的精确勾选计数（曾与 `SYSTEM_GUIDE` 互相打架）。
 - [A] 类「代码可做 12 项」已于 2026-08-15 全部落地（含代码侧完成、数据源仍待接入的项）
-- pytest 全量（排除需外部 key 的 test_data/test_agent/test_api）: **153 passed**
+- pytest 全量：以本机 `pytest tests/` 为准（不再沿用 2026-08-15 的 153 passed 过时计数）
 - 真实数据闭环 E2E（scripts/e2e_phase1.py）：对象池→因子→卡片→风控→计划 ✅
 
 ### 已完成且有单元测试的模块（61 项中的主体）
@@ -36,14 +44,14 @@
 ### 已勾选但无测试覆盖或测试被排除的项（诚实标注）
 | 项 | 实际状态 |
 |---|---|
-| 仪表盘 Streamlit 6 页面（2026-08-04） | test_dashboard.py (6) 存在但未纳入全量 pytest（依赖窗口环境，未验证） |
+| 仪表盘 Streamlit **9** 页面（含中期比价；2026-08-04 初版为 6 页） | test_dashboard.py 存在但未纳入全量 pytest（依赖窗口环境，未验证） |
 | 企业微信推送 / 飞书通道 | test_pipeline.py 覆盖 mock 逻辑；**真实推送未做端到端验证**（需 webhook） |
 | 龙虎榜/两融/宏观采集（2026-08-04） | 真实库已验证入库，但 test_data.py (28) 被排除（依赖真实网络/慢） |
 | 收盘扫描 P1 推送（scan.py） | 快照逻辑有测试；**推送发送链路未真实触发**（无变化时静默） |
-| scheduler 8 jobs | test_pipeline.py 断言 job 注册；**盘中 4 秒 ticker 未在真实交易时段跑过**（周六无法验证） |
+| scheduler 例行任务 | test_pipeline / test_reliable_jobs 断言 13 个 JOB_FUNCS + OS 清单；**盘中 10 秒 ticker 未在真实交易时段跑过** |
 | 行业估值采集（2026-08-15 修复） | 真实采集 293 行入库验证；无独立单测（依赖网络） |
 
-### ⬜ 未完成 10 项分类明细
+### ⬜ 仍开放项（历史分类，数量以当前清单为准）
 
 **[A] 代码可做（12 项）— 已于 2026-08-15 全部完成**
 1. ✅ 行业 PE/PB 估值分位：代码就绪（pb 列 + compute_pb_percentile + pipeline 合并）；数据源接入仍属 [B]
@@ -53,7 +61,7 @@
 5. ✅ 榜单降级为「发现器」（mispricing_necessary + check_and_add require_mispricing）
 6. ✅ 执行留痕：计划/成交偏差 + 周期漂移检测（records.py detect_cycle_drift）
 7. ✅ 复盘 v1：周度纪律+持仓卡片复评；月度环境质量检查
-8. ✅ hermes-agent P2 例行简报（pipeline.notify_p2_brief + 调度器 21:35）
+8. ✅ hermes-agent P2 例行简报（历史 21:35）→ **2026-08-18 已并入 22:00 evening_report，不再单独调度**
 9. ✅ 快照重建（scan.py rebuild_snapshot/rebuild_pool/rebuild_ratings/rebuild_quant）
 10. ✅ 历史行业归属/成分/ST 状态按历史时点保存（v1：universe.py 每日快照 + 回溯；全量回填待评估）
 11. ✅ 因子与价差计算自动化（auto.py 四套周期镜像全标的自动打分）
@@ -129,7 +137,7 @@
 - [x] 执行留痕（2026-08-15）：计划/成交偏差 + 周期漂移检测（records.py detect_cycle_drift/drift_report，CYCLE_MAX_DAYS 按周期上限），已挂入周度复盘
 - [x] 复盘 v1（2026-08-15）：周度纪律检查 + 持仓卡片复评（weekly.py position_card_review：破止损/近止损/近目标）+ 月度环境质量检查（monthly.py environment_quality：评级稳定性/数据质量）
 ### 1.6 自动化最小集
-- [x] hermes-agent P2 例行简报（2026-08-15）：pipeline.notify_p2_brief（每日榜单 + 宏观仪表盘），挂入调度器 21:35（行业刷新后、复盘前）
+- [x] hermes-agent P2 例行简报（2026-08-15 曾挂 21:35）→ **已并入 22:00 evening_report，不再作为现行自动化**（原 pipeline.notify_p2_brief 每日榜单 + 宏观仪表盘）
 - [x] 因子快照存档（2026-08-15）：invest/scan.py 每日收盘快照 JSON（阶段 2 PIT 化前置）
 
 ### 阶段 1 退出标准
@@ -223,7 +231,7 @@
 - [x] 群成员开放 + 限额 + 省 token + OS 计划任务（2026-08-18）：① 非管理员艾特可获取**公开版**盘中报告（intraday_report public=True，无持仓警戒），每日 token 限额 100 万（FEISHU_NONADMIN_DAILY_TOKEN_LIMIT，llm_usage job='group' 记账，超限回额度提示）；② 周报消息面改**大模型提炼**（财联社电报为素材 + LLM 挑讨论度/重要性最高的 5 条并给理由，失败回退直列）；③ 盘中报告**去指数/风格**，新增 板块异动+情绪人气+龙虎榜龙头（纯 DB 零 token）；Agent prompt 加省 token 规则（近60日/关键字段/工具≤3次/单观点≤80字）+ max_turns 5→4；④ **OS 计划任务**：scripts/run_job.py 单任务入口 + scripts/install_os_tasks.ps1 注册 9 个 Windows 任务（schtasks /XML，StartWhenAvailable 错过补跑）+ run_service.py --ticker-only（10s 轮询仍需常驻）；tests 新增 public/限额/ticker_only 用例
 - [x] 盘中降频 + 边沿告警 + 语义触发（2026-08-18）：① 周末周报改**周日 20:00**（原周六 09:00），weekly_report 新增**消息面**（财联社电报 stock_info_global_cls 近 7 日 TOP6）；② 盘中轮询 4s→**10s**，异动推送限频 P0: 600→**180s**、P1: 1800s 不变（intraday.py _PUSH_POLICY）；③ P0 数据失效告警改**边沿触发**（失效通知一次、恢复再通知一次，状态存 data/monitor_state.json，monitor.py）；④ 飞书盘中报告**去关键词触发，纯 LLM 语义识别**（feishu_ws._is_report_request 纯语义，LLM 失败→False；tests/test_feishu_ws.py 更新）；tests/test_monitor.py 边沿触发用例
 - [x] 网关稳定性 + 去 Hermes 化（2026-08-18）：① 根因分析（docs/GATEWAY_STABILITY_ANALYSIS.md）——Hermes 与本项目共用同一飞书应用长连接导致消息随机分流（最大根因），叠加纯 LLM 意图判定单点静默、无 @ 识别、无 token 缓存/重试；② feishu_ws 加固：@ 提及识别（MentionEvent/UserId 对象兼容）、关键词规则+LLM 双保险、管理员 ack、30s 限频、非管理员权限提示；③ feishu_push：tenant token 2h 缓存 + 发送重试 1 次；④ 微信推送去 Hermes：context-tokens 迁入 data/weixin/（migrate_context_tokens 一次性迁移），默认不再读 E 盘 Hermes 目录；⑤ scripts/disable_hermes_feishu.ps1（停用 Hermes 同应用飞书连接）；⑥ 去 Hermes 迁移记录 + 不可替代清单（docs/HERMES_FREE_MIGRATION.md）
-- [x] 调度器（2026-08-04）、企业微信推送（2026-08-04）、仪表盘 Streamlit 6 页面（2026-08-04）
+- [x] 调度器（2026-08-04）、企业微信推送（2026-08-04）、仪表盘 Streamlit（初版 6 页，现 **9** 页含中期比价）
 - [x] 复盘引擎（周/月/年，2026-08-04）
 - [x] 工程：依赖安装、.env 密钥、pytest.ini（2026-08-03/04）
 - [x] 实时行情三源直连轮询（2026-08-15）：新浪 hq.sinajs.cn / 腾讯 qt.gtimg.cn / 东财 push2 多域名容灾；批量取核心池；自动切换；延迟/新鲜度监控留痕（invest/data/realtime.py、intraday.py 重构、tests/test_realtime.py）

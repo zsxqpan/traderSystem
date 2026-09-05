@@ -26,23 +26,23 @@ def test_pool_capacity():
     p = _tmp_db()
     conn = connect(p)
     for i in range(10):
-        pool.add_to_pool(conn, f"C{i:03d}", level="core")
+        pool.add_to_pool(conn, f"60000{i}", level="core")
     for i in range(9):
-        pool.add_to_pool(conn, f"S{i:03d}")
+        pool.add_to_pool(conn, f"{i+1:06d}")
     assert len(pool.list_pool(conn)) == 19
     try:
-        pool.add_to_pool(conn, "C999", level="core")
+        pool.add_to_pool(conn, "600010", level="core")
         raise AssertionError("should reject 11th core")
     except ValueError as e:
         assert "核心关注已满" in str(e)
-    pool.add_to_pool(conn, "S999")
+    pool.add_to_pool(conn, "000010")
     assert len(pool.list_pool(conn)) == 20
     try:
-        pool.add_to_pool(conn, "S998")
+        pool.add_to_pool(conn, "000011")
         raise AssertionError("should reject 21st")
     except ValueError as e:
         assert "候选池已满" in str(e)
-    pool.remove_from_pool(conn, "C000")
+    pool.remove_from_pool(conn, "600000")
     assert len(pool.list_pool(conn)) == 19
     conn.close()
     print("test_pool_capacity OK")
@@ -66,24 +66,24 @@ def test_plan_validations():
     p = _tmp_db()
     conn = connect(p)
     try:
-        plans.create_plan(conn, "X1", stop_loss=9.0)
+        plans.create_plan(conn, "600001", stop_loss=9.0)
         raise AssertionError("should require pool membership")
     except ValueError as e:
         assert "候选池" in str(e)
-    pool.add_to_pool(conn, "X1")
+    pool.add_to_pool(conn, "600001")
     try:
-        plans.create_plan(conn, "X1")
+        plans.create_plan(conn, "600001")
         raise AssertionError("should require stop loss")
     except ValueError as e:
         assert "止损" in str(e)
     rating.set_rating(conn, "macro", "收紧")
     rating.set_rating(conn, "market", "防守")
     try:
-        plans.create_plan(conn, "X1", stop_loss=9.0, target_position=0.5)
+        plans.create_plan(conn, "600001", stop_loss=9.0, target_position=0.5)
         raise AssertionError("should exceed position cap")
     except ValueError as e:
         assert "仓位上限" in str(e)
-    plan = plans.create_plan(conn, "X1", stop_loss=9.0, target_position=0.05)
+    plan = plans.create_plan(conn, "600001", stop_loss=9.0, target_position=0.05)
     assert plan["status"] == "active"
     assert len(plans.list_active_plans(conn)) == 1
     conn.close()
@@ -95,8 +95,8 @@ def test_risk_checks():
     conn = connect(p)
     rating.set_rating(conn, "macro", "宽松")
     rating.set_rating(conn, "market", "进攻")
-    pool.add_to_pool(conn, "X1")
-    plan = plans.create_plan(conn, "X1", stop_loss=9.0, target_position=0.05)
+    pool.add_to_pool(conn, "600001")
+    plan = plans.create_plan(conn, "600001", stop_loss=9.0, target_position=0.05)
     pid = plan["plan_id"]
     violations = risk.check_position(conn, proposed=0.20, total_position=0.60, industry_position=0.20)
     assert any("单票" in v for v in violations)
@@ -112,8 +112,8 @@ def test_risk_checks():
 def test_records_deviation():
     p = _tmp_db()
     conn = connect(p)
-    pool.add_to_pool(conn, "X1")
-    plan = plans.create_plan(conn, "X1", stop_loss=9.0, buy_range="10.0,10.5")
+    pool.add_to_pool(conn, "600001")
+    plan = plans.create_plan(conn, "600001", stop_loss=9.0, buy_range="10.0,10.5")
     pid = plan["plan_id"]
     r1 = records.record_trade(conn, pid, "buy", 10.2, 1000)
     assert r1["actual_vs_plan"] == "in_range"

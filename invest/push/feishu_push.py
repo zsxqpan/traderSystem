@@ -76,6 +76,13 @@ def _post_message(token: str, receive_id: str, receive_id_type: str, body: dict)
             timeout=10,
         )
         return r.json()
+    except requests.RequestException as exc:
+        logger.warning("飞书推送异常: %s", exc)
+        from invest.delivery import in_delivery_context
+
+        if in_delivery_context():
+            raise
+        return None
     except Exception as exc:
         logger.warning("飞书推送异常: %s", exc)
         return None

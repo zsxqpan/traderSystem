@@ -1,6 +1,7 @@
 """调度/推送/流水线单元测试。用法: python tests/test_pipeline.py"""
 from __future__ import annotations
 
+import datetime as dt
 import os
 import sys
 import tempfile
@@ -48,15 +49,13 @@ def test_scheduler_jobs():
     # 2026-08-18 合并盘后报告：nightly/p2_brief → evening_report（数据滞后时跳过并推送原因）
     assert {"premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend",
             "intraday_tick", "monthly", "yearly", "industry_refresh", "daily_refresh",
-            "evening_report", "pool_trap_scan"} <= ids
+            "factcard_refresh", "evening_report", "pool_trap_scan", "compensation_scan"} <= ids
     assert "p2_brief" not in ids and "nightly" not in ids
     print("test_scheduler_jobs OK")
 
 
 def test_auction_window():
     """竞价窗口判定：交易日 9:25:30-9:29:30 内为 True；窗口外/周末为 False。"""
-    import datetime as dt
-
     from invest.scheduler import _in_auction_window
 
     assert _in_auction_window(dt.datetime(2026, 8, 24, 9, 26, 0)) is True    # 周一 9:26
@@ -68,14 +67,23 @@ def test_auction_window():
 
 def test_ticker_only_and_job_funcs():
     """OS 计划任务模式：ticker_only 只留 10s 轮询；JOB_FUNCS 覆盖全部可迁移任务。"""
-    from invest.scheduler import JOB_FUNCS, build_scheduler
+    from invest.scheduler import (
+        JOB_COMPENSATION_WINDOWS,
+        JOB_FUNCS,
+        JOB_SLOTS,
+        build_scheduler,
+    )
 
     sched = build_scheduler(ticker_only=True)
-    assert {j.id for j in sched.get_jobs()} == {"intraday_tick"}
+    assert {j.id for j in sched.get_jobs()} == {"intraday_tick", "compensation_scan"}
+    compensation = sched.get_job("compensation_scan")
+    assert compensation.next_run_time is not None
+    assert compensation.trigger.interval == dt.timedelta(minutes=1)
     assert set(JOB_FUNCS) == {
         "premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend", "monthly",
-        "yearly", "industry_refresh", "daily_refresh", "evening_report", "pool_trap_scan",
+        "yearly", "industry_refresh", "daily_refresh", "factcard_refresh", "evening_report", "pool_trap_scan",
     }
+    assert set(JOB_COMPENSATION_WINDOWS) == set(JOB_SLOTS) == set(JOB_FUNCS)
     print("test_ticker_only_and_job_funcs OK")
 
 
@@ -122,8 +130,9 @@ def test_data_freshness_and_snapshot_close():
 
     p = _tmp_db()
     conn = connect(p)
-    # 空库 → 数据滞后
-    f = query_data_freshness(conn)
+    # 空库 → 数据滞后（非交易时段口径，避免盘中 probe 干扰）
+    with mock.patch("invest.intraday._in_trading_window", return_value=False):
+        f = query_data_freshness(conn)
     assert f["fresh"] is False
     # 写入最近交易日日线/指数 → 新鲜
     exp = latest_trading_day(dt.date.today()).isoformat()
@@ -137,7 +146,8 @@ def test_data_freshness_and_snapshot_close():
         {"run_date": exp, "obj_type": "industry", "obj": "A", "period": "short",
          "rs": 0.1, "calc_version": "v1"},
     ]))
-    assert query_data_freshness(conn)["fresh"] is True
+    with mock.patch("invest.intraday._in_trading_window", return_value=False):
+        assert query_data_freshness(conn)["fresh"] is True
     conn.close()
 
     # snapshot_close：交易日 + mock 行情/指数源

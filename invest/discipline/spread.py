@@ -244,21 +244,32 @@ def price_spread(
     symbol: str,
     years: int = 3,
     check_breaks: bool = True,
+    as_of: str | None = None,
 ) -> dict:
     """个股价格主价差（前复权近似：用收盘价序列，标注 qfq 假设）。
 
     check_breaks=True（默认）时做结构断点检查（如送转/重大重组前后价格口径变化）。
+    as_of 有值时只使用该日及之前的日线，截止日用 as_of 而不是当前时间。
     """
-    rows = conn.execute(
-        """SELECT date, close FROM daily_bars
-           WHERE symbol=? AND close IS NOT NULL ORDER BY date""",
-        (symbol,),
-    ).fetchall()
+    if as_of:
+        rows = conn.execute(
+            """SELECT date, close FROM daily_bars
+               WHERE symbol=? AND close IS NOT NULL AND date<=? ORDER BY date""",
+            (symbol, as_of),
+        ).fetchall()
+        end = pd.Timestamp(as_of)
+    else:
+        rows = conn.execute(
+            """SELECT date, close FROM daily_bars
+               WHERE symbol=? AND close IS NOT NULL ORDER BY date""",
+            (symbol,),
+        ).fetchall()
+        end = pd.Timestamp.now()
     if not rows:
         return {"ok": False, "note": f"{symbol} 无日线数据"}
     df = pd.DataFrame([dict(r) for r in rows])
     df["date"] = pd.to_datetime(df["date"], format="mixed", errors="coerce")
-    cutoff = pd.Timestamp.now() - pd.DateOffset(years=years)
+    cutoff = end - pd.DateOffset(years=years)
     hist = df[df["date"] >= cutoff]
     if hist.empty:
         return {"ok": False, "note": f"{symbol} 近 {years} 年无数据"}

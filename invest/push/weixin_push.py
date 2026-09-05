@@ -17,6 +17,7 @@ import secrets
 import shutil
 import struct
 import time
+import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
@@ -150,6 +151,13 @@ def send_text(text: str, key: str = "", min_interval: float = 0.0,
                 _LAST_SEND[key] = time.time()
             return True
         logger.warning("微信推送被拒: %s", data)
+        return False
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        logger.warning("微信推送异常: %s", exc)
+        from invest.delivery import in_delivery_context
+
+        if in_delivery_context():
+            raise
         return False
     except Exception as exc:
         logger.warning("微信推送异常: %s", exc)

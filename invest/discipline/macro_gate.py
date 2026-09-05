@@ -11,8 +11,12 @@
 """
 from __future__ import annotations
 
+import calendar
 import datetime as dt
+import re
 import sqlite3
+
+_CN_MONTH = re.compile(r"(\d{4})年(\d{1,2})月")
 
 # 环境减法系数（宏观只做减法，不给方向加分，v3 6.2）
 ENV_FACTOR = {"宽松": 1.00, "中性": 1.00, "收紧": 0.70}
@@ -45,8 +49,54 @@ def env_factor(env: str) -> float:
     return ENV_FACTOR.get(env, 1.00)
 
 
-def _latest_macro(conn: sqlite3.Connection, indicator: str) -> dict | None:
-    """macro_series 最新一条指标（按日期字符串倒序取最新；月度口径已统一格式）。"""
+def _comparable_macro_date(date_str: str) -> str | None:
+    """macro_series.date → YYYY-MM-DD，供 as_of 截断；中文月份落到当月最后一天。"""
+    s = str(date_str or "").strip()
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    found = _CN_MONTH.match(s)
+    if found:
+        year, month = int(found.group(1)), int(found.group(2))
+        last = calendar.monthrange(year, month)[1]
+        return f"{year:04d}-{month:02d}-{last:02d}"
+    return None
+
+
+def _pick_macro(
+    conn: sqlite3.Connection,
+    indicator: str,
+    *,
+    before: str | None = None,
+    on_or_before: str | None = None,
+) -> dict | None:
+    rows = conn.execute(
+        "SELECT date, value FROM macro_series WHERE indicator=? AND value IS NOT NULL",
+        (indicator,),
+    ).fetchall()
+    picked = None
+    picked_key: str | None = None
+    before_key = _comparable_macro_date(before) if before else None
+    for row in rows:
+        key = _comparable_macro_date(row["date"])
+        if key is None:
+            continue
+        if on_or_before and key > on_or_before:
+            continue
+        if before_key and key >= before_key:
+            continue
+        if picked_key is None or key > picked_key:
+            picked, picked_key = row, key
+    return {"date": picked["date"], "value": float(picked["value"])} if picked else None
+
+
+def _latest_macro(
+    conn: sqlite3.Connection,
+    indicator: str,
+    as_of: str | None = None,
+) -> dict | None:
+    """macro_series 最新一条指标。as_of 有值时按可比日期截断，不偷看之后的点。"""
+    if as_of:
+        return _pick_macro(conn, indicator, on_or_before=as_of)
     row = conn.execute(
         "SELECT date, value FROM macro_series WHERE indicator=? AND value IS NOT NULL "
         "ORDER BY date DESC LIMIT 1",
@@ -55,8 +105,15 @@ def _latest_macro(conn: sqlite3.Connection, indicator: str) -> dict | None:
     return {"date": row["date"], "value": float(row["value"])} if row else None
 
 
-def _prev_macro(conn: sqlite3.Connection, indicator: str, date: str) -> dict | None:
+def _prev_macro(
+    conn: sqlite3.Connection,
+    indicator: str,
+    date: str,
+    as_of: str | None = None,
+) -> dict | None:
     """该指标在 date 之前的最近一条（用于环比/周变动）。"""
+    if as_of:
+        return _pick_macro(conn, indicator, before=date, on_or_before=as_of)
     row = conn.execute(
         "SELECT date, value FROM macro_series WHERE indicator=? AND value IS NOT NULL "
         "AND date < ? ORDER BY date DESC LIMIT 1",
@@ -65,17 +122,18 @@ def _prev_macro(conn: sqlite3.Connection, indicator: str, date: str) -> dict | N
     return {"date": row["date"], "value": float(row["value"])} if row else None
 
 
-def check_env_retrigger(conn: sqlite3.Connection) -> dict:
+def check_env_retrigger(conn: sqlite3.Connection, as_of: str | None = None) -> dict:
     """环境重评触发检查（[B]8）：返回触发列表与提示。
 
     任一条件触发即建议人工复核宏观评级；不自动改评级（宏观只做减法）。
+    as_of 有值时只看该日及之前的 macro_series，历史回放不得偷看最新点。
     返回 {triggers: [...], n: int, data: {...}}。
     """
     triggers: list[str] = []
     data: dict = {}
 
     # 1) ERP 跨分位（用全A中位PE近10年分位作代理：高=贵=ERP低）
-    pe_pct = _latest_macro(conn, "全A中位PE近10年分位")
+    pe_pct = _latest_macro(conn, "全A中位PE近10年分位", as_of=as_of)
     if pe_pct:
         data["pe_pct"] = pe_pct["value"]
         if pe_pct["value"] < ERP_PCT_LO:
@@ -90,10 +148,10 @@ def check_env_retrigger(conn: sqlite3.Connection) -> dict:
         data["pe_pct"] = None
 
     # 2) 社融拐点：最新较上月转负（增量下降）
-    sf = _latest_macro(conn, "社会融资规模增量")
+    sf = _latest_macro(conn, "社会融资规模增量", as_of=as_of)
     if sf:
         data["social_fin"] = sf
-        prev_sf = _prev_macro(conn, "社会融资规模增量", sf["date"])
+        prev_sf = _prev_macro(conn, "社会融资规模增量", sf["date"], as_of=as_of)
         if prev_sf and sf["value"] < prev_sf["value"]:
             triggers.append(
                 f"社融拐点：社融增量 {prev_sf['value']:.0f} → {sf['value']:.0f} 亿元（环比转负，评估信用环境收紧）"
@@ -102,14 +160,13 @@ def check_env_retrigger(conn: sqlite3.Connection) -> dict:
         data["social_fin"] = None
 
     # 3) 10Y 利率周变动 > 20bp
-    y10 = _latest_macro(conn, "中国国债收益率10年")
+    y10 = _latest_macro(conn, "中国国债收益率10年", as_of=as_of)
     if y10:
         data["bond_10y"] = y10
         prev_y10 = None
         try:
-            from datetime import timedelta
-            _week_ago = (dt.date.fromisoformat(y10["date"]) - timedelta(days=7)).isoformat()
-            prev_y10 = _prev_macro(conn, "中国国债收益率10年", y10["date"])
+            dt.date.fromisoformat(y10["date"])
+            prev_y10 = _prev_macro(conn, "中国国债收益率10年", y10["date"], as_of=as_of)
         except ValueError:
             prev_y10 = None
         if prev_y10:

@@ -3,15 +3,20 @@
 替代旧方案（Hermes 桌面端 gateway.log 轮询 / Hermes 飞书连接）。功能（2026-08-18 v4）：
 1) **私聊（p2p）**：任何消息都由 Agent 回应（报告/提问/闲聊），非管理员计入每日限额；
 2) **群内 @机器人**（管理员或其他人 @）：任意消息都由 Agent 回应，不再只回报告；
-3) 管理员群内不 @ 的发言：仅识别为要实时报告才触发（2026-08-21 起两级意图识别：
-   关键词快速判定优先、未命中再走 LLM 语义兜底，绝大多数报告请求零 token）；
+3) 管理员群内不 @ 的发言：一律不回应（2026-08-25：群聊仅被 @ 才回）；
 4) 非管理员（群内 @ 或私聊）每日 token 限额 `FEISHU_NONADMIN_DAILY_TOKEN_LIMIT`（默认 100 万，
    记入 llm_usage job='group'），超限只回额度提示、不再消耗 token；
-5) 机器人自己的消息 → 忽略。
+5) 机器人自己的消息 → 忽略；
+6) **长连接静默失活看门狗（2026-08-29）**：lark-oapi 1.7.2 对"半开连接"（网络路径静默断掉、
+   出方向仍能发包、入方向收不到任何帧）无检测——ping 失败只 WARN 不重连、recv() 无限阻塞，
+   曾致 8-29 20:27 群 @ 与私聊事件全部丢失约 8 小时（21:20 检测到断连重连后才恢复），
+   且飞书 WS 不补发断线期间事件。看门狗记录最近一次收到任意 WS 帧（含 PONG）的时间，
+   超过 10 分钟无帧 → 强制断开触发 SDK 自动重连（健康连接下服务器约每 120s 回 PONG，
+   安静时段不误触发）。
 
 回复分流（_agent_reply）：
 - 识别为要实时报告 → 盘中实时报告（非管理员=公开版，无持仓警戒）；LLM 失败/超时 → 不生成；
-  **意图识别（2026-08-21）**：群聊=关键词优先+LLM 兜底；私聊 p2p=始终 LLM 语义判断（不走关键词）；
+  **意图识别（2026-08-28）**：私聊与群聊一致，本地规则优先（盘中报告/实时报价/系统状态/问答）；本地已判 chat 不再 LLM 二次判报告；限频给明确反馈；
 - 问候/求助（在吗/你好/help…，本地判定零 token）→ 帮助提示；
 - 其他 → 会话 Agent（run_chat，带系统数据工具）回答，max_turns=3 控制成本；
   **按需求路由 Skill**（产业链/基本面→Serenity；短线/异动/游资→youzi；五步法→stock_analysis），
@@ -78,6 +83,12 @@ REPLY_MIN_INTERVAL = 120.0  # 同一发送者两次报告回复的最小间隔�
 CHAT_MIN_INTERVAL = 10.0   # 同一发送者两次 Agent 会话回复的最小间隔（秒）
 _CHAT_MAX_LEN = 6000       # Agent 会话回复最大长度（2026-08-27 由 2000 提：全能 Agent 分析可展开）
 
+_last_report_result = None  # 最近一次盘中报告 JobResult（限频/数据不足可观察）
+
+
+def _invest_db() -> str:
+    return str(ROOT / "data" / "invest.db")
+
 _GREETING_KEYWORDS = ("在吗", "在不在", "你好", "您好", "hello", "hi", "help", "帮助", "你是谁", "你会什么", "怎么用")
 
 # 意图判定第一级负向词（2026-08-21）：明确非"当前实时报告"意图 → 直接 no，省一次 LLM
@@ -96,6 +107,82 @@ _HELP_TEXT = (
 _bot_open_id_cache: str = ""
 _last_reply_at: dict[str, float] = {}
 _last_skill_ack = 0.0
+
+# ---- 长连接静默失活看门狗（2026-08-29）----
+# 背景见模块 docstring 第 6 条。机制：帧级活动钩子刷新 _last_frame_at（含 PONG/控制帧），
+# 看门狗线程发现超过 _NO_FRAME_TIMEOUT 无任何帧 → 强制 _disconnect() 触发 SDK 自动重连。
+_NO_FRAME_TIMEOUT = 600.0   # 超过该秒数未收到任何帧 → 判定连接失活
+_WATCHDOG_INTERVAL = 60.0   # 看门狗检查间隔（秒）
+_last_frame_at = 0.0        # 最近一次收到任意 WS 帧的 monotonic 时间；0=尚未收到
+_current_cli = None         # 当前 lark ws.Client（看门狗强制断开用）
+_current_loop = None        # 客户端所在事件循环（lark_oapi.ws.client 模块级 loop）
+_watchdog_started = False   # 看门狗线程只起一次（run() 可能被 worker 循环多次调用）
+
+
+def _mark_frame() -> None:
+    """记录最近一次收到任意 WS 帧（含 PONG/控制帧）。"""
+    global _last_frame_at
+    _last_frame_at = time.monotonic()
+
+
+def _frame_stale(now: float | None = None) -> bool:
+    """是否已超过 _NO_FRAME_TIMEOUT 未收到任何帧；无帧记录（0）视为未失活。"""
+    if not _last_frame_at:
+        return False
+    return (now if now is not None else time.monotonic()) - _last_frame_at > _NO_FRAME_TIMEOUT
+
+
+def _install_frame_hook(cli) -> bool:
+    """挂帧级活动钩子：任何收到的帧都刷新 _last_frame_at。
+
+    依赖 lark-oapi 私有方法 _handle_message（1.7.2 实测可用）；挂载失败时降级返回 False，
+    看门狗退化为不可用（不影响原有收发）。
+    """
+    try:
+        orig = cli._handle_message
+
+        async def _wrapped(msg: bytes) -> None:
+            _mark_frame()
+            await orig(msg)
+
+        cli._handle_message = _wrapped  # type: ignore[assignment, attr-defined]
+        return True
+    except Exception as exc:
+        logger.warning("挂载 WS 帧活动钩子失败（看门狗不可用）: %s", exc)
+        return False
+
+
+def _watchdog_body() -> None:
+    """看门狗线程：连接超过 _NO_FRAME_TIMEOUT 无任何帧 → 强制断开触发 SDK 自动重连。"""
+    global _last_frame_at
+    last_alive_log = 0.0
+    while True:
+        time.sleep(_WATCHDOG_INTERVAL)
+        try:
+            cli = _current_cli
+            loop = _current_loop
+            if cli is None or loop is None or not _last_frame_at:
+                continue
+            if _frame_stale():
+                age = time.monotonic() - _last_frame_at
+                logger.error(
+                    "飞书长连接疑似静默失活：%.0f 秒未收到任何帧，强制断开触发重连", age,
+                )
+                _last_frame_at = time.monotonic()  # 防止连续触发
+                try:
+                    loop.call_soon_threadsafe(
+                        lambda _cli=cli, _loop=loop: _loop.create_task(_cli._disconnect())
+                    )
+                except Exception as exc:
+                    logger.warning("看门狗强制断开失败: %s", exc)
+            elif time.monotonic() - last_alive_log > 1800:
+                last_alive_log = time.monotonic()
+                logger.info(
+                    "飞书长连接活动正常（最近帧 %.0f 秒前）",
+                    time.monotonic() - _last_frame_at,
+                )
+        except Exception:
+            logger.exception("飞书长连接看门狗异常")
 
 
 def _bot_open_id() -> str:
@@ -225,13 +312,23 @@ def _is_report_request(text: str, track_job: str | None = None, keyword: bool = 
     - 第一级 `_keyword_report_request`：零 token 快速判定，命中即返回（绝大多数
       "来一份盘中报告/现在行情怎么样" 类请求不再消耗 LLM）；
     - 未决（None）才走 LLM 语义识别（保留对多样表达的语义能力）；
-    - keyword=False（**私聊 p2p，2026-08-21**）：跳过关键词第一级，始终 LLM 语义判断
-      （私聊对话上下文更随意，避免关键词误判/漏判）；
+    - 2026-08-28：先走 classify_intent（私聊/群聊同一套本地规则）；
+      chat/greeting/报价/状态本地已决则不再 LLM 二次判报告；keyword 仅 classify 失败时兜底；
     - 负向词/LLM 说 no → False；LLM 失败/超时/无 key → False
       （此时 @ 场景仍会回帮助提示，不会完全静默）；
     - track_job 非空（非管理员）：LLM 兜底调用带 conn，用量记入 llm_usage(job=track_job)，
       供每日 token 限额核算。
     """
+    try:
+        from invest.agent.agents import classify_intent
+
+        intent = classify_intent(text)
+        if intent == "intraday_report":
+            return True
+        if intent in ("realtime_quote", "system_status", "greeting", "chat"):
+            return False
+    except Exception:
+        pass
     if keyword:
         kw = _keyword_report_request(text)
         if kw is not None:
@@ -290,17 +387,32 @@ def _nonadmin_budget_exceeded() -> bool:
 
 
 def _build_intraday_report(public: bool = False, brief: bool = True) -> dict:
-    """生成盘中实时报告结构（2026-08-22：经 Skill Runner 调 b1_intraday，结构化输出）。
+    """生成盘中实时报告：先冻结快照并做完整性检查，再叙事。
 
     失败返回含错误文本的节（调用方按卡片/纯文本统一发送）。
     """
     try:
-        from invest.skills.runner import run_structured
+        from invest.skills.contract import check_completeness, get_manifest
+        from invest.skills.reports.b1_intraday import render
+        from invest.skills.snapshot import freeze_snapshot
 
-        db = str(ROOT / "data" / "invest.db")
-        return run_structured("b1_intraday", db_path=db, public=public, brief=brief)
+        db = _invest_db()
+        snap = freeze_snapshot("b1_intraday", db)
+        gate = check_completeness(get_manifest("b1_intraday"), snap)
+        if not gate.ok:
+            return {
+                "title": "盘中报告",
+                "sections": [{"type": "text", "text": f"数据不足：{gate.detail}"}],
+                "completeness": {"status": gate.status, "detail": gate.detail},
+            }
+        return render(db, public=public, brief=brief, snapshot=snap)
     except Exception as exc:
-        return {"sections": [{"type": "text", "text": f"[报告生成失败: {type(exc).__name__}: {exc}]"}]}
+        detail = f"{type(exc).__name__}: {exc}"
+        return {
+            "title": "盘中报告",
+            "sections": [{"type": "text", "text": f"[报告生成失败: {detail}]"}],
+            "completeness": {"status": "generate_failed", "detail": detail},
+        }
 
 
 def _persist_intraday_views(views: dict) -> None:
@@ -346,20 +458,56 @@ def _send_report(chat_id: str, struct: dict) -> bool:
     return send_message(chat_id, "chat_id", plain)
 
 
+def _send_intraday_with_receipt(chat_id: str, struct: dict) -> bool:
+    """盘中发送走任务1回执；失败回退直接发送。"""
+    import datetime as dt
+
+    from invest.delivery import deliver_channel, delivery_context
+    from invest.scheduler import JobResult
+
+    global _last_report_result
+
+    def _do() -> bool:
+        return _send_report(chat_id, struct)
+
+    db = _invest_db()
+    today = dt.date.today().isoformat()
+    hhmm = dt.datetime.now().strftime("%H:%M")
+    # 按需盘中按会话区分；计划槽回执仍走 job+date+slot，不改任务1语义
+    slot = f"{hhmm}:{chat_id}" if chat_id else hhmm
+    try:
+        with delivery_context(db, "intraday_report", today, slot):
+            ok = deliver_channel(
+                "feishu", _do,
+                message_kind="report", message_id="b1_intraday",
+            )
+    except Exception:
+        ok = _do()
+    if ok:
+        _persist_intraday_views(struct.get("views") or {})
+    _last_report_result = (
+        JobResult.ok("盘中报告投递成功", artifact="b1_intraday")
+        if ok else
+        JobResult("send_failed", "发送失败", artifact="b1_intraday")
+    )
+    return ok
+
+
 def _is_greeting(text: str) -> bool:
     """问候/求助类短消息 → 直接回帮助提示（本地判定，不耗 LLM token）。"""
     t = text.strip().lower()
     return len(t) <= 20 and any(k in t for k in _GREETING_KEYWORDS)
 
 
-def _agent_chat(text: str, nonadmin: bool = False, chat_id: str = "") -> str:
+def _agent_chat(text: str, nonadmin: bool = False, chat_id: str = "",
+                sender_id: str = "") -> str:
     """会话 Agent 回复（2026-08-18：Skill 由大模型语义自选并在回复中自标注）。
 
     2026-08-24：chat_id 传入 run_chat，启用多轮对话记忆（读/写 chat_history）。
     非管理员计入 job='group' 限额。
     """
     try:
-        from invest.agent.agents import run_chat
+        from invest.agent.agents import CHAT_INPUT_MAX, run_chat
         from invest.db import connect
 
         conn = connect(str(ROOT / "data" / "invest.db"))
@@ -368,11 +516,12 @@ def _agent_chat(text: str, nonadmin: bool = False, chat_id: str = "") -> str:
             # 并启用数据新鲜度硬门禁——数据滞后时数据工具返回原因而非旧数据（对话结束复位）
             from invest.agent.tools import set_current_user_text, set_freshness_gate
 
-            set_current_user_text(text[:1000])
+            clipped = text[:CHAT_INPUT_MAX]
+            set_current_user_text(clipped)
             set_freshness_gate(True)
             try:
-                out = run_chat(conn, text[:1000], job="group" if nonadmin else "feishu_chat",
-                               chat_id=chat_id)
+                out = run_chat(conn, clipped, job="group" if nonadmin else "feishu_chat",
+                               chat_id=chat_id, sender_id=sender_id)
             finally:
                 set_freshness_gate(False)
                 set_current_user_text("")  # 复位，避免 thread-local 残留影响后续（含测试）
@@ -398,10 +547,12 @@ def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False
     分流：识别为要实时报告 → 盘中实时报告（非管理员=公开版，不计 Agent token）；
           问候/求助 → 帮助提示（本地判定，零 token）；
           其他 → 会话 Agent（run_chat）回答。
-    意图识别（2026-08-21）：群聊（group）关键词优先 + LLM 兜底；私聊（p2p）始终 LLM 语义判断。
+    意图识别（2026-08-28）：私聊与群聊一致，本地规则优先（盘中报告/实时报价/系统状态/问答）。
     非管理员：任何 LLM 调用都计入 job='group'，受 FEISHU_NONADMIN_DAILY_TOKEN_LIMIT（100万/日）约束。
     """
     from invest.push.feishu_push import send_message
+
+    global _last_report_result
 
     if nonadmin and _nonadmin_budget_exceeded():
         send_message(chat_id, "chat_id",
@@ -413,20 +564,60 @@ def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False
         send_message(chat_id, "chat_id",
                      "⏳ 收到，正在用 UZI 深度分析，约 5-20 分钟（完成后自动发送报告摘要与路径）。")
 
-    want_report = _is_report_request(
-        text, track_job="group" if nonadmin else None, keyword=chat_type != "p2p")
+    from invest.agent.agents import classify_intent
+
+    intent = classify_intent(text)
+    want_report = intent == "intraday_report"
     if want_report:
         if _rate_limited(sender_id):
-            logger.info("报告请求限频跳过（120s 内重复）: %s", text[:30])
+            logger.info("报告请求限频（120s 内重复）: %s", text[:30])
+            send_message(chat_id, "chat_id",
+                         "请求过于频繁，请稍后再试（报告间隔 120 秒）。")
+            from invest.skills.report_pipeline import deliver_report
+
+            _last_report_result = deliver_report(
+                "b1_intraday", _invest_db(), rate_limited=True,
+            )
             return
         # 2026-08-22：默认完整版；说"简洁/简短/精简"才发简洁版（只留客观盘面）
         brief = any(k in text for k in ("简洁", "简短", "精简", "简版", "简略"))
         logger.info("盘中报告请求（nonadmin=%s brief=%s）: %s", nonadmin, brief, text[:40])
         send_message(chat_id, "chat_id", "⏳ 收到，正在生成盘中实时报告…")
-        report = _build_intraday_report(public=nonadmin, brief=brief)
-        ok = _send_report(chat_id, report)
-        # 2026-08-22：盘中观点落库（source='intraday_report'），供盘后日报点2 复盘
-        _persist_intraday_views(report.get("views") or {})
+        try:
+            report = _build_intraday_report(public=nonadmin, brief=brief)
+        except Exception as exc:
+            from invest.scheduler import JobResult
+
+            _last_report_result = JobResult(
+                "generate_failed", f"{type(exc).__name__}: {exc}",
+                artifact="b1_intraday",
+            )
+            send_message(
+                chat_id, "chat_id",
+                f"报告生成失败：{type(exc).__name__}: {exc}",
+            )
+            logger.info("盘中报告生成异常，未发送完整报告")
+            return
+        gate = (report.get("completeness") or {})
+        if gate.get("status") in ("data_insufficient", "generate_failed"):
+            send_message(
+                chat_id, "chat_id",
+                (
+                    f"数据不足，暂不发送完整报告：{gate.get('detail') or ''}"
+                    if gate.get("status") == "data_insufficient" else
+                    f"报告生成失败：{gate.get('detail') or ''}"
+                ),
+            )
+            from invest.scheduler import JobResult
+
+            _last_report_result = JobResult(
+                gate["status"],
+                gate.get("detail") or gate["status"],
+                artifact="b1_intraday",
+            )
+            logger.info("盘中报告%s，未发送完整报告", gate["status"])
+            return
+        ok = _send_intraday_with_receipt(chat_id, report)
         logger.info("盘中报告回复完成 ok=%s", ok)
         return
 
@@ -437,12 +628,14 @@ def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False
     now = time.time()
     last = _last_reply_at.get("chat:" + sender_id, 0.0)
     if now - last < CHAT_MIN_INTERVAL:
-        logger.info("Agent 会话限频跳过（%ss 内重复）: %s", int(CHAT_MIN_INTERVAL), text[:30])
+        logger.info("Agent 会话限频（%ss 内重复）: %s", int(CHAT_MIN_INTERVAL), text[:30])
+        send_message(chat_id, "chat_id",
+                     f"请求过于频繁，请稍后再试（会话间隔 {int(CHAT_MIN_INTERVAL)} 秒）。")
         return
     _last_reply_at["chat:" + sender_id] = now
 
-    logger.info("Agent 会话回复（nonadmin=%s）: %s", nonadmin, text[:40])
-    reply = _agent_chat(text, nonadmin=nonadmin, chat_id=chat_id)
+    logger.info("Agent 会话回复（nonadmin=%s intent=%s）: %s", nonadmin, intent, text[:40])
+    reply = _agent_chat(text, nonadmin=nonadmin, chat_id=chat_id, sender_id=sender_id)
     # Skill 由大模型语义自选并在回复文本末尾自标注（"↘ 已使用 Skill：xxx"），原样发送
     ok = send_message(chat_id, "chat_id", reply)
     logger.info("Agent 回复完成 ok=%s len=%d", ok, len(reply))
@@ -683,6 +876,22 @@ def run() -> bool:
         event_handler=handler,
         log_level=lark.LogLevel.INFO,
     )
+    # 静默失活看门狗：帧级活动钩子 + 无帧超时强制重连（2026-08-29）
+    _install_frame_hook(cli)
+
+    global _current_cli, _current_loop, _watchdog_started
+    _current_cli = cli
+    try:
+        from lark_oapi.ws import client as _ws_client
+
+        _current_loop = _ws_client.loop
+    except Exception as exc:
+        logger.warning("获取飞书 WS 事件循环失败（看门狗不可用）: %s", exc)
+        _current_loop = None
+    if not _watchdog_started:
+        _watchdog_started = True
+        threading.Thread(target=_watchdog_body, name="feishu-ws-watchdog", daemon=True).start()
+
     print(
         f"[feishu_ws] 飞书长连接启动，目标群={settings.feishu_chat_id}，"
         f"@机器人触发盘中实时报告（项目本体直连，零 Hermes 依赖）"

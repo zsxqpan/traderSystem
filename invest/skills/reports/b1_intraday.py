@@ -32,59 +32,71 @@ SKILL = {
         "db_path": "str, required",
         "public": "bool, optional, default False",
         "brief": "bool, optional, default False（2026-08-22：默认完整版，简洁版需显式）",
+        "snapshot": "optional, 冻结快照；缺省则 render 内 freeze",
     },
 }
 
 
 # ---------- 数据组装 ----------
 
-def _index_table() -> tuple[list[list[str]], str]:
-    """盘面总览：指数实时表格行 + 结构分化文字。失败返回 ([], "")。"""
-    try:
-        from invest.data.index_realtime import fetch_index_realtime
+_INDEX_ORDER = ("000001", "399001", "000300", "000905", "000852", "000688", "399006", "899050")
 
-        idx = fetch_index_realtime()
-    except Exception:
-        return [], ""
-    if not idx:
-        return [], ""
-    order = ("000001", "399001", "000300", "000905", "000852", "000688", "399006", "899050")
+
+def _pct_txt(pct: float | None) -> str:
+    if pct is None:
+        return "—"
+    return f"{pct:+.2%}"
+
+
+def _index_table(results=None) -> tuple[list[list[str]], str, list]:
+    """盘面总览：指数实时表格行 + 结构分化文字 + QuoteResult 列表。"""
+    from invest.data.quotes import INDEX_UNIVERSE, get_quotes, status_label
+
+    if results is None:
+        try:
+            results = get_quotes(list(INDEX_UNIVERSE), obj_type="index")
+        except Exception:
+            return [], "", []
+    by = {r.ref.symbol: r for r in results}
     rows: list[list[str]] = []
-    for code in order:
-        d = idx.get(code)
-        if d:
-            rows.append([d["name"], f"{d['price']:.2f}", f"{d['pct']:+.2f}%"])
-    small, large = idx.get("000852"), idx.get("000300")
+    for code in _INDEX_ORDER:
+        r = by.get(code)
+        if r is None:
+            continue
+        price_txt = f"{r.price:.2f}" if r.price is not None else "—"
+        rows.append([r.ref.name or code, price_txt, _pct_txt(r.pct), status_label(r)])
+    small, large = by.get("000852"), by.get("000300")
     struct = ""
-    if small and large and small["pct"] is not None and large["pct"] is not None:
-        diff = small["pct"] - large["pct"]
+    if small and large and small.pct is not None and large.pct is not None:
+        diff = (small.pct - large.pct) * 100.0
+        sp, lp = small.pct * 100.0, large.pct * 100.0
         if diff >= 0.3:
-            struct = (f"结构: **小盘强于大盘**（中证1000 {small['pct']:+.2f}% "
-                      f"vs 沪深300 {large['pct']:+.2f}%，差 {diff:+.2f}%）")
+            struct = (f"结构: **小盘强于大盘**（中证1000 {sp:+.2f}% "
+                      f"vs 沪深300 {lp:+.2f}%，差 {diff:+.2f}%）")
         elif diff <= -0.3:
-            struct = (f"结构: **大盘强于小盘**（沪深300 {large['pct']:+.2f}% "
-                      f"vs 中证1000 {small['pct']:+.2f}%，差 {diff:+.2f}%）")
+            struct = (f"结构: **大盘强于小盘**（沪深300 {lp:+.2f}% "
+                      f"vs 中证1000 {sp:+.2f}%，差 {diff:+.2f}%）")
         else:
-            struct = f"结构: 大小盘均衡（中证1000 {small['pct']:+.2f}% / 沪深300 {large['pct']:+.2f}%）"
-    return rows, struct
+            struct = f"结构: 大小盘均衡（中证1000 {sp:+.2f}% / 沪深300 {lp:+.2f}%）"
+    return rows, struct, results
 
 
-def _index_etf_text() -> str:
-    """指数 ETF 大资金信号（公共函数，invest/data/etf）。"""
+def _index_etf_text(quotes=None) -> str:
+    """指数 ETF 大资金信号：只消费冻结 quotes，不现场拉 akshare。"""
     try:
         from invest.data.etf import index_etf_signal_text
 
-        return index_etf_signal_text()
+        return index_etf_signal_text(quotes)
     except Exception:
         return ""
 
 
-def _sector_etf_text() -> str:
-    """全部重要板块 ETF 数据行（公共函数，invest/data/etf）。"""
+def _sector_etf_text(quotes=None) -> str:
+    """板块 ETF 数据行：只消费冻结 quotes，不现场拉 akshare。"""
     try:
         from invest.data.etf import sector_etf_text
 
-        return sector_etf_text()
+        return sector_etf_text(quotes)
     except Exception:
         return ""
 
@@ -188,44 +200,41 @@ def _ladder_text(conn, n: int = 8) -> str:
         return ""
 
 
-def _core_quotes(db_path: str) -> tuple[list[list[str]], str]:
+def _rows_from_core_results(results: list) -> tuple[list[list[str]], str, list]:
+    from invest.data.quotes import status_label
+
+    rows, lines = [], []
+    for r in results:
+        label = status_label(r)
+        if r.price is None:
+            rows.append([r.ref.symbol, "—", "—", label])
+            lines.append(f"{r.ref.symbol} —（{label}）")
+            continue
+        pct = _pct_txt(r.pct)
+        if r.fallback_level == "last_close":
+            pct = f"{pct}（收盘）" if r.pct is not None else "—(收盘)"
+        rows.append([r.ref.symbol, f"{r.price:.2f}", pct, label])
+        lines.append(f"{r.ref.symbol} {r.price:.2f} ({pct} {label})")
+    return rows, "；".join(lines), results
+
+
+def _core_quotes(db_path: str, results=None) -> tuple[list[list[str]], str, list]:
+    if results is not None:
+        return _rows_from_core_results(results)
     conn = connect(db_path)
     try:
         core = [r["symbol"] for r in conn.execute(
             "SELECT symbol FROM candidate_pool WHERE level IN ('core','track') "
             "AND out_date IS NULL ORDER BY level"
         )]
-        # 2026-08-26：实时失败回退收盘价（表格不空白；盘中报告核心关注必须可见）
-        fallback = {r["symbol"]: float(r["close"]) for r in conn.execute(
-            """SELECT d.symbol, d.close FROM daily_bars d
-               JOIN (SELECT symbol, MAX(REPLACE(date,'-','')) md FROM daily_bars
-                     WHERE symbol IN (%s) GROUP BY symbol) m
-               ON d.symbol=m.symbol AND REPLACE(d.date,'-','')=m.md""" % ",".join("?" * len(core)),
-            core,
-        )} if core else {}
     finally:
         conn.close()
     if not core:
-        return [], ""
-    try:
-        from invest.report import _live_quotes
+        return [], "", []
+    from invest.data.quotes import get_quotes
 
-        live, pct_map = _live_quotes(db_path, core)
-    except Exception:
-        live, pct_map = {}, {}
-    rows, lines = [], []
-    for sym in core:
-        price = live.get(sym)
-        pct = pct_map.get(sym)
-        if price is None and sym in fallback:
-            # 实时不可用 → 收盘价回退（标注来源，防止误当实时）
-            price, pct = fallback[sym], None
-        if price is None:
-            continue
-        pct_txt = f"{pct:+.2%}" if pct is not None else "—(收盘)"
-        rows.append([sym, f"{price:.2f}", pct_txt])
-        lines.append(f"{sym} {price:.2f} ({pct_txt})")
-    return rows, "；".join(lines)
+    results = get_quotes(core, obj_type="stock", db_path=db_path)
+    return _rows_from_core_results(results)
 
 
 def _core_industry(conn, symbols: list[str]) -> str:
@@ -279,24 +288,29 @@ def _read_plan(conn) -> str:
 
 # ---------- 组装 ----------
 
-def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
+def render(db_path: str, public: bool = False, brief: bool = False, snapshot=None) -> dict:
     from invest.skills.sections import _intraday_llm
+    from invest.skills.snapshot import freeze_snapshot
 
     sections: list[dict] = []
     views: dict = {}
+    snap = snapshot or freeze_snapshot("b1_intraday", db_path)
     now = dt.datetime.now()
+    as_of = snap.as_of
 
-    # ---- 1) 盘面总览（指数表格 + 结构 + 指数ETF大资金信号） ----
+    # ---- 1) 盘面总览（冻结快照：指数/ETF/核心共享 as_of） ----
     # 2026-08-24：去掉 index_bars 图表——表格已含全部指数涨跌幅，重复展示
-    idx_rows, struct = _index_table()
+    idx_quotes = list(getattr(snap.blocks.get("index_quotes"), "quotes", None) or [])
+    idx_rows, struct, idx_results = _index_table(idx_quotes)
     if idx_rows:
         sections.append({
             "type": "table", "title": "盘面总览",
-            "columns": ["指数", "点位", "涨跌幅"], "rows": idx_rows,
+            "columns": ["指数", "点位", "涨跌幅", "状态"], "rows": idx_rows,
         })
         if struct:
             sections.append({"type": "text", "text": struct})
-        etf_sig = _index_etf_text()
+        etf_quotes = list(getattr(snap.blocks.get("etf_quotes"), "quotes", None) or [])
+        etf_sig = _index_etf_text(etf_quotes)
         if etf_sig:
             sections.append({
                 "type": "text",
@@ -306,7 +320,16 @@ def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
     else:
         sections.append({"type": "text", "text": "（指数实时暂不可用）"})
 
-    # ---- 2) 情绪判断 + 盘面预测（LLM，失败回退规则） ----
+    core_quotes = list(getattr(snap.blocks.get("core_quotes"), "quotes", None) or [])
+    _core_rows, core_lines, core_results = _core_quotes(db_path, results=core_quotes)
+    from invest.data.quotes import coverage_text, degrade_alert_text, report_should_degrade
+
+    degrade, cov_info = report_should_degrade(idx_results, core_results)
+    sections.append({"type": "text", "text": coverage_text(idx_results, core_results)})
+    if degrade:
+        sections.append({"type": "text", "text": degrade_alert_text(cov_info)})
+
+    # ---- 2) 情绪判断 + 盘面预测（覆盖不足时禁止 LLM） ----
     conn = connect(db_path)
     try:
         temp_row = conn.execute(
@@ -320,7 +343,7 @@ def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
     finally:
         conn.close()
 
-    mood = _intraday_llm.mood_llm(db_path, {
+    mood = {} if degrade else _intraday_llm.mood_llm(db_path, {
         "temp_text": temp_text, "emotion_text": emo_text,
         "limit_up_text": lu_text, "temp_hist": temp_hist,
     })
@@ -332,7 +355,7 @@ def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
             lines.append(f"**短线博弈**: {mood['short_term']}")
         sections.append({"type": "text", "text": "**【情绪与预测】**\n" + "\n".join(lines)})
         views["mood"] = mood
-    elif not brief:
+    elif not brief and not degrade:
         parts = [f"温度 {temp_text}"]
         if emo_text:
             parts.append(emo_text)
@@ -340,20 +363,37 @@ def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
             parts.append(f"盘中 {lu_text}")
         sections.append({"type": "text", "text": "**【情绪与预测】**\n" + "；".join(parts)})
 
-    # ---- 3) 日内主线（LLM：原因/内部/ETF/推荐股/龙头/推演；失败回退直列） ----
+    # ---- 3) 日内主线（覆盖不足时禁止 LLM 主线结论） ----
+    eod_block = snap.blocks.get("sector_eod")
+    eod = getattr(eod_block, "payload", None) or {}
     conn = connect(db_path)
     try:
-        sector_top = _sector_top(conn)
-        fund_top = _fund_top(conn)
+        # 快照已种 EOD 块（含空串）则不回源；仅缺块时才查库
+        if eod_block is not None:
+            sector_top = eod.get("sector_top") or ""
+            fund_top = eod.get("fund_top") or ""
+        else:
+            sector_top = _sector_top(conn)
+            fund_top = _fund_top(conn)
         ladder = _ladder_text(conn)
     finally:
         conn.close()
-    _core_rows, core_lines = _core_quotes(db_path)
-    etf_sector = _sector_etf_text()
-    mainline = _intraday_llm.mainline_llm(db_path, {
-        "sector_top": sector_top, "fund_top": fund_top,
-        "ladder": ladder, "core": core_lines, "etf_sector": etf_sector,
-    })
+    etf_quotes = list(getattr(snap.blocks.get("etf_quotes"), "quotes", None) or [])
+    etf_sector = _sector_etf_text(etf_quotes)
+    if sector_top:
+        sector_top = sector_top + "\n（收盘参考·非实时）"
+    candidates = [
+        {"symbol": r.ref.symbol, "name": r.ref.name or r.ref.symbol}
+        for r in core_results if getattr(r, "ref", None) and r.ref.symbol
+    ]
+    if degrade:
+        mainline = {}
+    else:
+        mainline = _intraday_llm.mainline_llm(db_path, {
+            "sector_top": sector_top, "fund_top": fund_top,
+            "ladder": ladder, "core": core_lines, "etf_sector": etf_sector,
+            "candidates": candidates,
+        })
     lines: list[str] = []
     for ml in (mainline.get("main_lines") or []):
         lines.append(f"**{ml.get('direction', '')}**")
@@ -369,15 +409,17 @@ def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
             lines.append(f"  · {ld.get('role', '')} {ld.get('name', '')}：{ld.get('analysis', '')}")
         if ml.get("outlook"):
             lines.append(f"  → 推演: {ml['outlook']}")
-    if lines:
+    if degrade:
+        pass  # 覆盖不足：禁止日内主线完整结论（含规则回退）
+    elif lines:
         sections.append({"type": "text", "text": "**【日内主线】**\n" + "\n".join(lines)})
         views["mainline"] = mainline.get("main_lines")
     elif not brief and (sector_top or fund_top):
         blocks = []
         if fund_top:
-            blocks.append("资金主线(实时):\n" + fund_top)
+            blocks.append("资金主线(收盘参考·非实时):\n" + fund_top)
         if sector_top:
-            blocks.append("板块涨幅(收盘参考):\n" + sector_top)
+            blocks.append("板块涨幅(收盘参考·非实时):\n" + sector_top)
         if ladder:
             blocks.append("连板梯队:\n" + ladder)
         if etf_sector:
@@ -396,7 +438,7 @@ def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
     if _core_rows:
         sections.append({
             "type": "table", "title": "核心关注实时行情",
-            "columns": ["标的", "现价", "涨跌幅"], "rows": _core_rows,
+            "columns": ["标的", "现价", "涨跌幅", "状态"], "rows": _core_rows,
         })
         # 核心关注所在板块：若点3 未覆盖则补一句客观数据
         if core_inds and brief:
@@ -426,7 +468,13 @@ def render(db_path: str, public: bool = False, brief: bool = False) -> dict:
     if not brief:
         sections.append({
             "type": "text",
-            "text": "（数据失效即防守：行情不新鲜时不作 P0 决策）· " + now.strftime("%H:%M"),
+            "text": "（数据失效即防守：行情不新鲜时不作 P0 决策）· " + now.strftime("%H:%M")
+                    + f" · as_of {as_of}",
         })
+    from invest.skills.contract import check_completeness, get_manifest
+
+    gate = check_completeness(get_manifest("b1_intraday"), snap)
     return {"title": f"A股投资系统 · 盘中报告 {now.strftime('%H:%M')}",
-            "sections": sections, "views": views}
+            "sections": sections, "views": views, "as_of": as_of,
+            "completeness": {"status": gate.status, "detail": gate.detail,
+                             "degrade": gate.degrade}}

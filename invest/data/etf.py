@@ -125,15 +125,44 @@ def big_money_signal(etf: dict) -> str | None:
     return "；".join(hints) if hints else None
 
 
-def index_etf_signal_text() -> str:
-    """指数 ETF 大资金信号文本（量比放大/超大单进出≈国家队/大资金动作）。"""
-    try:
-        quotes = fetch_etf_quotes(list(INDEX_ETFS))
-    except Exception:
-        return ""
+def quotes_to_etf_map(quotes) -> dict[str, dict]:
+    """QuoteResult 列表或 {code: dict} → etf_line 用的 dict。不拉网。"""
+    if isinstance(quotes, dict):
+        return quotes
+    out: dict[str, dict] = {}
+    for r in quotes or []:
+        ref = getattr(r, "ref", None)
+        if ref is None:
+            continue
+        extras = getattr(r, "extras", None) or {}
+        pct = getattr(r, "pct", None)
+        if pct is not None and abs(pct) <= 1.0:
+            pct = pct * 100.0  # QuoteResult 小数 → 百分数
+        out[ref.symbol] = {
+            "name": getattr(ref, "name", "") or ref.symbol,
+            "price": getattr(r, "price", None),
+            "pct": pct,
+            "amount": extras.get("amount"),
+            "turnover": extras.get("turnover"),
+            "vol_ratio": extras.get("vol_ratio"),
+            "main_net": extras.get("main_net"),
+            "super_net": extras.get("super_net"),
+        }
+    return out
+
+
+def index_etf_signal_text(quotes=None) -> str:
+    """指数 ETF 大资金信号。传入 quotes 则只消费冻结快照，不再拉 akshare。"""
+    if quotes is None:
+        try:
+            data = fetch_etf_quotes(list(INDEX_ETFS))
+        except Exception:
+            return ""
+    else:
+        data = quotes_to_etf_map(quotes)
     lines = []
     for code in ("510300", "510050", "510500", "512100", "159915", "588000"):
-        q = quotes.get(code)
+        q = data.get(code)
         if not q:
             continue
         sig = big_money_signal(q)
@@ -142,18 +171,21 @@ def index_etf_signal_text() -> str:
     return "\n".join(lines)
 
 
-def sector_etf_text() -> str:
-    """全部重要板块 ETF 数据行（纯度高于板块指数，体现方向真实强度）。"""
-    try:
-        all_codes = [c for v in SECTOR_ETFS.values() for c in v]
-        quotes = fetch_etf_quotes(all_codes)
-    except Exception:
-        return ""
+def sector_etf_text(quotes=None) -> str:
+    """板块 ETF 数据行。传入 quotes 则只消费冻结快照，不再拉 akshare。"""
+    if quotes is None:
+        try:
+            all_codes = [c for v in SECTOR_ETFS.values() for c in v]
+            data = fetch_etf_quotes(all_codes)
+        except Exception:
+            return ""
+    else:
+        data = quotes_to_etf_map(quotes)
     lines = []
     for sector, codes in SECTOR_ETFS.items():
         parts = []
         for c in codes:
-            q = quotes.get(c)
+            q = data.get(c)
             if q:
                 parts.append(etf_line(q))
         if parts:

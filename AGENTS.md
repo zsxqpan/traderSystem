@@ -37,6 +37,15 @@
 - 新浪接口 GBK；腾讯指数 `~` 分割 `[2]=代码 [3]=现价`
 - **Windows PowerShell 5.1 读 .ps1 需 UTF-8 BOM**（否则中文引号解析崩）
 - `run_service.py` **默认 ticker-only**（`--full` 才完整 APScheduler）；单实例用 msvcrt 锁
+- **飞书长连接"半开连接"静默失活（2026-08-29 20:27 事故）**：lark-oapi 1.7.2 的 WS 客户端
+  对"网络路径静默断掉、出方向仍能发包、入方向收不到帧"无检测——ping 失败只 WARN 不重连、
+  recv() 无限阻塞，可数小时收不到任何事件（群 @ + 私聊全丢，飞书不补发），直到服务端
+  最终关连接才触发重连（本机实测连接生命周期约 19-20h，05:00/00:23/21:20 均出现过）。
+  修复：`feishu_ws` **静默失活看门狗**——帧级钩子（wrap `cli._handle_message`）记录最近收到
+  任意帧（含 PONG）的时间，超 `_NO_FRAME_TIMEOUT`（600s）无帧 → `loop.call_soon_threadsafe`
+  强制 `cli._disconnect()` 触发 SDK 自动重连；健康连接下服务器约每 120s 回 PONG，安静不误触发。
+  **依赖私有 API**（`_handle_message`/`_disconnect`/模块级 `loop`），lark-oapi 升级需回归
+  `tests/test_feishu_ws.py` 看门狗用例；挂载失败自动降级（看门狗不可用，不影响收发）。
 - Python 语法：关键字参数位置不能裸 walrus（`user=(x := ...)` 需括号）；try/with/finally 配对别写错
 - 涨停判断：主板 ≥9.8%、20cm 板 ≥19.8%；两市成交额=上证+深成指，别加创业板/科创50（子集重复）
 

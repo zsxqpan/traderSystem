@@ -166,20 +166,20 @@ def test_card_lifecycle():
 def test_card_capacity():
     p = _tmp_db()
     conn = connect(p)
-    # 候选池上限 20：入池 20 个标的
+    # 候选池上限 20：入池 20 个标的（须为合法 6 位代码，pool 入池有规范化校验）
     for i in range(20):
-        sym = f"C{i:04d}"
+        sym = f"6000{i:02d}"
         _seed_daily(conn, sym)
         check_and_add(conn, sym, level="track")
     # 建 20 张卡
     for i in range(20):
-        sym = f"C{i:04d}"
+        sym = f"6000{i:02d}"
         create_card(conn, sym, level="B", thesis=f"标的 {sym} 投资逻辑说明文本，验证充分",
                     falsify="x", entry_range="9,11", stop_loss=8.0, target=12.0)
     assert len(list_cards(conn)) == 20
     # 第 21 张（同一标的再建一张）-> 拒绝（容量满）
     try:
-        create_card(conn, "C0000", level="B", thesis="标的 C0000 投资逻辑说明文本，验证充分",
+        create_card(conn, "600000", level="B", thesis="标的 600000 投资逻辑说明文本，验证充分",
                     falsify="x", entry_range="9,11", stop_loss=8.0, target=12.0)
         raise AssertionError("容量满应拒绝")
     except ValueError as e:

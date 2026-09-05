@@ -39,16 +39,13 @@ def _bare_symbol(sym: str) -> str:
 
 
 def fetch_current_price(symbol: str) -> float | None:
-    """取单只最新价：三源直连轮询，失败返回 None（保持旧接口签名）。"""
-    from invest.data.realtime import RealtimeQuoter, _to_market_symbol
+    """取单只最新价：统一行情契约，失败返回 None（保持旧接口签名）。"""
+    from invest.data.quotes import get_quotes
     try:
-        with RealtimeQuoter() as q:
-            quotes = q.fetch([symbol])
-        if not quotes:
+        results = get_quotes([symbol], obj_type="stock")
+        if not results or results[0].price is None:
             return None
-        msym = _to_market_symbol(symbol)
-        qq = quotes.get(msym) or next(iter(quotes.values()))
-        return qq.price if qq else None
+        return float(results[0].price)
     except Exception:
         return None
 
@@ -67,24 +64,34 @@ def fetch_batch_prices(
     导致盘中报告「核心关注」表格空白。非交易时段接受最近 12 小时内的行情
     （收盘后=收盘价，即最新可得）。
     """
-    from invest.data.realtime import RealtimeQuoter, is_fresh, log_realtime_health
+    from invest.data.quotes import get_quotes
+    from invest.data.realtime import log_realtime_health
+    _ = max_lag  # 新鲜度由统一契约按交易时段判定；保留参数兼容旧调用
     symbols = list(dict.fromkeys(symbols))
     if not symbols:
         return {}
     try:
-        with RealtimeQuoter() as q:
-            quotes = q.fetch(symbols)
+        results = get_quotes(symbols, obj_type="stock", db_path=db_path)
     except Exception:
         return {}
     if db_path:
-        log_realtime_health(db_path, quotes, q.source_failures)
-    # 交易时段严格 10s；非交易时段放宽到 12h（收盘价/上一交易时段行情即最新）
-    effective_lag = max_lag if _in_trading_window() else 12 * 3600.0
+        from invest.data.realtime import Quote
+
+        quotes = {
+            r.ref.symbol: Quote(symbol=r.ref.symbol, price=r.price, ts=r.ts, src=r.src)
+            for r in results if r.price
+        }
+        log_realtime_health(db_path, quotes, {})
+    trading = _in_trading_window()
     out: dict[str, float] = {}
-    for sym, qq in quotes.items():
-        if qq.price is None or not is_fresh(qq, max_lag=effective_lag):
+    for r in results:
+        if r.price is None:
             continue
-        out[_bare_symbol(sym)] = qq.price
+        if trading:
+            if r.status == "live" and r.freshness == "live":
+                out[r.ref.symbol] = r.price
+        elif r.status in ("live", "fallback") or r.src:
+            out[r.ref.symbol] = r.price
     return out
 
 
