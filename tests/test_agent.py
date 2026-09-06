@@ -610,6 +610,7 @@ def test_big_v_tables_created():
     names = table_names(p)
     assert "big_v_profile" in names and "big_v_opinion" in names
     assert "chat_history" in names
+    assert "trade_signals" in names and "auction_snapshots" in names
     print("test_big_v_tables_created OK")
 
 

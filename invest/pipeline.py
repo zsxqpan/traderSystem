@@ -550,6 +550,12 @@ def notify_after_close(db_path: str, agent_text: str = "") -> bool:
     struct = run_structured("a3_daily", db_path=db_path, agent_text=agent_text)
     # 2026-08-22：明日预案落库（source='plan'，供 B1 对照/次日复盘）
     _persist_plan(struct.get("plan_data") or {})
+    try:
+        from invest.signals.scan import scan_db
+
+        scan_db(db_path, "close", persist=True)
+    except Exception:
+        logger.warning("收盘信号落库失败", exc_info=True)
     return _send_structured(struct, key="after_close")
 
 
@@ -578,6 +584,13 @@ def notify_auction(
         return any(results.values())
 
     result = deliver_report("a7_auction", db_path, send_fn=send_fn)
+    # 2026-09-03：竞价信号落库（trade_signals persist=True；报告失败也照常记账，失败静默）
+    try:
+        from invest.signals.scan import scan_db
+
+        scan_db(db_path, "auction", persist=True)
+    except Exception:
+        logger.warning("竞价信号落库失败", exc_info=True)
     if result.status == "ok":
         _persist_auction_views(
             (captured.get("struct") or {}).get("views") or {},

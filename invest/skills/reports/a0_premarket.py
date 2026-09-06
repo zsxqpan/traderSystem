@@ -24,7 +24,7 @@ SKILL = {
     "description": "盘前报告（A1+A2 合并）：外围详情+LLM解读/温度仓位/风格/今日关注/涨停异动监控/消息汇总",
     "uses": ["d3_style", "d8_temp_guide", "d9_rating_guide", "d21_freshness", "d22_ratings",
              "d24_global_snapshot", "d25_overnight_analysis", "d26_market_watch",
-             "d27_news_digest"],
+             "d27_news_digest", "d32_trade_signals"],
     "params": {
         "db_path": "str, required",
     },
@@ -108,6 +108,18 @@ def render(db_path: str) -> dict:
     focus = _read_agent_focus()
     if focus:
         sections.append({"type": "text", "text": "**【今日关注】**\n" + focus})
+    try:
+        from invest.signals.format import undigested_actions
+
+        conn_u = connect(db_path)
+        try:
+            undig = undigested_actions(conn_u)
+        finally:
+            conn_u.close()
+        if undig:
+            sections.append({"type": "text", "text": "**【昨日信号】** " + undig})
+    except Exception:
+        pass
 
     # 8) 涨停异动监控（表格：停牌 + 风险提示/异动监控/暴雷）
     d = digest(db_path)

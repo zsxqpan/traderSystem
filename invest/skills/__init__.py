@@ -4,7 +4,7 @@
 - registry.py：显式注册表（get / list_skills / validate_all）
 - runner.py：按名调用（最小职责，异常原样上抛）
 - reports/：7 个报告 skill（A1-A6、B1）
-- sections/：23 个小节 skill（D1-D23）
+- sections/：32 个小节 skill（D1-D32）
 
 `import invest.skills` 即完成全部注册（reports/sections 子包 import 时 register）。
 """

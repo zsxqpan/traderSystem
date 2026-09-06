@@ -1,0 +1,30 @@
+"""短线交易信号阈值（实盘两周后再校准）。"""
+
+# 竞价保量：竞价量 / 昨全天量
+KEEP_VOL_ZT = 0.03
+KEEP_VOL_WATCH = 0.02
+KEEP_AMOUNT = 20_000_000  # 竞价额（元）并列条件
+SHRINK_DIVERGE = 0.015    # 高开但低于此视为缩量分歧
+
+# 盘中极致缩量 / 高位放量（时间修正量比）
+SHRINK_EXTREME = 0.40
+HIGH_VOL_RATIO = 2.0
+HIGH_NEAR = 0.03          # 现价在 20 日高 3% 内
+RET5_HIGH = 0.15
+LIANBAN_HIGH = 2
+
+# 板块集体 / 偏离
+COLLECTIVE_MIN = 3
+COLLECTIVE_SHARE = 0.60
+COLLECTIVE_VR = 1.8
+OUTLIER_PCT = 4.0
+OUTLIER_PCT_20CM = 6.0
+
+# 空间
+LADDER_OPEN_STRONG = 0.80
+LADDER_OPEN_WEAK = 0.40
+BREADTH_SHIFT = 0.30      # 涨停家数相对 3 日均
+ZHABAN_HOT = 0.40
+
+SKIP_BEFORE = (9, 35)
+DISPLAY_LIMIT = 8

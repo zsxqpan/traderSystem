@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 SCHEMA_SQL = """
 -- ============ 行情 ============
@@ -547,6 +547,34 @@ CREATE TABLE IF NOT EXISTS comparison_records (
     created_at     TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_comparison_as_of ON comparison_records(as_of);
+
+-- ============ 短线交易信号（2026-09-03） ============
+CREATE TABLE IF NOT EXISTS trade_signals (
+    date         TEXT NOT NULL,
+    session      TEXT NOT NULL,            -- auction / intraday / close
+    signal_id    TEXT NOT NULL,
+    subject_type TEXT NOT NULL,            -- stock / sector / market / etf
+    subject      TEXT NOT NULL,
+    severity     TEXT NOT NULL,            -- info / watch / action
+    name         TEXT,
+    hint         TEXT,
+    evidence     TEXT,                     -- JSON
+    src          TEXT NOT NULL DEFAULT 'signals',
+    PRIMARY KEY (date, session, signal_id, subject)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_signals_date ON trade_signals(date, session);
+
+CREATE TABLE IF NOT EXISTS auction_snapshots (
+    date   TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    name   TEXT,
+    price  REAL,
+    pct    REAL,
+    vol    REAL,
+    amount REAL,
+    src    TEXT NOT NULL DEFAULT 'tencent',
+    PRIMARY KEY (date, symbol)
+);
 """
 
 

@@ -130,6 +130,8 @@ def auto_factor_score(
         pct = spread["pct_rank"]
         score = max(0.0, min(5.0, 5.0 * (1 - pct / 0.3))) if pct < 0.3 else 0.0
         factors.append({"name": "主价差低估", "score": round(score, 2), "role": "错价"})
+    overlays = _signal_overlays(conn, symbol)
+    factors.extend(overlays)
     if not factors:
         return {"ok": False, "symbol": symbol, "cycle": cycle, "note": "无可用信号"}
     result = factor_score(factors)
@@ -143,10 +145,33 @@ def auto_factor_score(
         "spread": {k: spread[k] for k in ("ok", "current", "median", "pct_rank", "z_score", "anchor_range") if k in spread},
         "factors": result["per_factor"],
         "factor_result": result,
+        "overlays": overlays,
         "eligible": bool(eligible),
         "cheap_pct": cheap_pct,
         "note": f"{cycle}镜像：{'具备错价必要条件' if eligible else '未达错价必要条件（分位偏高或不可用）'}",
     }
+
+
+def _signal_overlays(conn: sqlite3.Connection, symbol: str) -> list[dict]:
+    """短线交易信号旁路（背景因子，权重 0），不改主价差分。失败返回 []。"""
+    try:
+        rows = conn.execute(
+            """SELECT name, hint, severity FROM trade_signals
+               WHERE subject=? AND date=(
+                   SELECT MAX(date) FROM trade_signals WHERE subject=?
+               )
+               ORDER BY CASE severity WHEN 'action' THEN 0 WHEN 'watch' THEN 1 ELSE 2 END
+               LIMIT 4""",
+            (symbol, symbol),
+        ).fetchall()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        label = r["name"] or "交易信号"
+        out.append({"name": f"信号:{label}", "score": 0.0, "role": "背景",
+                    "hint": r["hint"] or ""})
+    return out
 
 
 def run_pool_automation(

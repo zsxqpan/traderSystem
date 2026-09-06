@@ -336,7 +336,9 @@ def test_pipeline_quant():
 def test_notify_messages_no_crash():
     from invest.pipeline import notify_after_close, notify_morning_brief, notify_weekend
     p = _tmp_db()
-    with mock.patch("invest.notifier.Notifier") as m:
+    with mock.patch("invest.notifier.Notifier") as m, \
+         mock.patch("invest.data.auction.fetch_industries", return_value={}), \
+         mock.patch("invest.data.auction.fetch_batch_quotes", return_value={}):
         m.return_value.send_text.return_value = True
         assert notify_after_close(p, "test") is True
         assert notify_weekend(p, "test") is True

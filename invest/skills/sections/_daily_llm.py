@@ -56,7 +56,8 @@ def intraday_review_llm(db_path: str, ctx: dict) -> dict:
         try:
             out = _llm(conn, _SYSTEM,
                        f"以下是今日竞价报告与盘中报告给出的观点（预测/操作建议/短线判断，来源已标注）：\n{ctx.get('views_text') or '（今日无观点）'}\n\n"
-                       f"以下是当日实际表现：\n{ctx.get('actual_text') or '暂无'}\n\n"
+                       f"以下是当日实际表现：\n{ctx.get('actual_text') or '暂无'}\n"
+                       f"规则算出的当日信号（禁止编造，只能引用）：\n{ctx.get('signals_text') or '无'}\n\n"
                        "请输出 JSON：\n"
                        '{"verdict": "逐条判断观点对错（对/错/部分对；竞价预判与盘中判断分别点评，50字内）",\n'
                        '"wrong_reasons": ["错误原因（数据/逻辑/突发，每条20字内）"],\n'
@@ -83,7 +84,8 @@ def board_analysis_llm(db_path: str, ctx: dict) -> dict:
                        f"各方向ETF:\n{ctx.get('etf_sector') or '暂无'}\n\n"
                        f"板块涨幅TOP:\n{ctx.get('sector_top') or '暂无'}\n"
                        f"连板梯队:\n{ctx.get('ladder') or '暂无'}\n"
-                       f"异动个股:\n{ctx.get('stock_moves') or '暂无'}\n\n"
+                       f"异动个股:\n{ctx.get('stock_moves') or '暂无'}\n"
+                       f"规则交易信号（集体放量/偏离等，禁止编造只能引用）:\n{ctx.get('signals_text') or '无'}\n\n"
                        "请覆盖分析以下方向（AI硬件/AI软件/机器人/金融/金属/新能源/旧能源/内需），输出 JSON：\n"
                        '{"boards": [{"name": "方向名",'
                        '"active": true或false（当天是否有明显异动）,'
@@ -112,6 +114,7 @@ def plan_gen_llm(db_path: str, ctx: dict) -> dict:
                        "以下是关注/持仓股（用户指定，多为持仓；系统推荐仅为迭代验证）：\n"
                        + (ctx.get("holdings") or "暂无") + "\n\n"
                        "以下是最近几天预案质量复盘（若有）：\n" + (ctx.get("plan_history") or "暂无") + "\n\n"
+                       "规则算出的当日信号（禁止编造，只能引用）：\n" + (ctx.get("signals_text") or "无") + "\n\n"
                        "请输出明日预案 JSON：\n"
                        '{"direction": "明日主线方向判断（25字内）",\n'
                        '"picks": [{"name": "明日可介入股票名", "reason": "介入理由（结合今日主线/ETF，20字内）",'

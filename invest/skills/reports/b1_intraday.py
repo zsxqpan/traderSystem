@@ -27,7 +27,7 @@ SKILL = {
     "kind": "report",
     "description": "盘中实时报告：盘面总览(含ETF)/情绪判断+预测/日内主线(ETF+推荐股)/核心关注与预案对照",
     "uses": ["d8_temp_guide", "d9_rating_guide", "d11_emotion", "d12_limit_up_ladder",
-             "d13_fund_line", "d21_freshness", "d29_sector_resonance"],
+             "d13_fund_line", "d21_freshness", "d29_sector_resonance", "d32_trade_signals"],
     "params": {
         "db_path": "str, required",
         "public": "bool, optional, default False",
@@ -329,7 +329,23 @@ def render(db_path: str, public: bool = False, brief: bool = False, snapshot=Non
     if degrade:
         sections.append({"type": "text", "text": degrade_alert_text(cov_info)})
 
-    # ---- 2) 情绪判断 + 盘面预测（覆盖不足时禁止 LLM） ----
+    # ---- 1b) 交易信号（缩量/高位放量/集体/空间；2026-09-03；简洁版也保留） ----
+    sigs: list = []
+    sig_text = ""
+    try:
+        from invest.signals.format import format_signals, signal_section
+        from invest.signals.scan import scan_db
+
+        sigs = scan_db(db_path, "intraday")  # 行情由 scan 自取（快照架构无 all_quotes）
+        sig_text = format_signals(sigs)
+        blk = signal_section(sigs)
+        if blk:
+            sections.append(blk)
+    except Exception:
+        sigs = []
+        sig_text = ""
+
+    # ---- 2) 情绪判断 + 盘面预测（LLM，失败回退规则） ----
     conn = connect(db_path)
     try:
         temp_row = conn.execute(
@@ -345,7 +361,7 @@ def render(db_path: str, public: bool = False, brief: bool = False, snapshot=Non
 
     mood = {} if degrade else _intraday_llm.mood_llm(db_path, {
         "temp_text": temp_text, "emotion_text": emo_text,
-        "limit_up_text": lu_text, "temp_hist": temp_hist,
+        "limit_up_text": lu_text, "temp_hist": temp_hist, "signals_text": sig_text,
     })
     if mood.get("mood"):
         lines = [f"**情绪判断**: {mood.get('mood', '')}"]
@@ -392,7 +408,7 @@ def render(db_path: str, public: bool = False, brief: bool = False, snapshot=Non
         mainline = _intraday_llm.mainline_llm(db_path, {
             "sector_top": sector_top, "fund_top": fund_top,
             "ladder": ladder, "core": core_lines, "etf_sector": etf_sector,
-            "candidates": candidates,
+            "candidates": candidates, "signals_text": sig_text,
         })
     lines: list[str] = []
     for ml in (mainline.get("main_lines") or []):
@@ -436,9 +452,21 @@ def render(db_path: str, public: bool = False, brief: bool = False, snapshot=Non
     finally:
         conn.close()
     if _core_rows:
+        cols = ["标的", "现价", "涨跌幅", "状态"]
+        rows = [list(r) for r in _core_rows]
+        try:
+            from invest.signals.format import tags_for as _tags
+
+            tagged = [_tags(sigs, r[0]) or "-" for r in rows]
+            if any(t != "-" for t in tagged):  # 有信号才加列，避免空「信号」列
+                cols.append("信号")
+                for row, tag in zip(rows, tagged):
+                    row.append(tag)
+        except Exception:
+            pass
         sections.append({
             "type": "table", "title": "核心关注实时行情",
-            "columns": ["标的", "现价", "涨跌幅", "状态"], "rows": _core_rows,
+            "columns": cols, "rows": rows,
         })
         # 核心关注所在板块：若点3 未覆盖则补一句客观数据
         if core_inds and brief:

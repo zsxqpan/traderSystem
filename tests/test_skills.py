@@ -84,13 +84,14 @@ def _fresh_db():
 # ---------- 注册表完整性 ----------
 
 def test_registry_complete():
-    """38 个 skill 全注册：7 报告 + 31 小节；元数据与 uses 引用全合法。"""
+    """39 个 skill 全注册：7 报告 + 32 小节；元数据与 uses 引用全合法。"""
     ids = registry.list_skills()
-    assert len(ids) == 38, f"期望 38 个 skill，实际 {len(ids)}"
+    assert len(ids) == 39, f"期望 39 个 skill，实际 {len(ids)}"
     reports = registry.list_skills("report")
     sections = registry.list_skills("section")
     assert len(reports) == 7
-    assert len(sections) == 31
+    assert len(sections) == 32
+    assert "d32_trade_signals" in sections
     assert set(reports) == {"a0_premarket", "a3_daily", "a4_weekly", "a5_monthly",
                             "a6_yearly", "a7_auction", "b1_intraday"}
     assert registry.validate_all() == []  # 元数据合法 + uses 引用存在
@@ -151,6 +152,7 @@ def test_a3_structured(monkeypatch):
                    "turnover": 2.1, "vol_ratio": 1.8, "main_net": 5e8, "super_net": 3e8}})
     monkeypatch.setattr("invest.data.etf.index_etf_signal_text", lambda: "沪深300ETF 量比1.80（明显放量）")
     monkeypatch.setattr("invest.data.etf.sector_etf_text", lambda: "[AI硬件] 半导体ETF +1.2% 成交80亿")
+    monkeypatch.setattr("invest.data.auction.fetch_industries", lambda symbols=None: {})
     # 2026-08-23 d28 社区热议：mock 搜索为空（全 mock 不联网），d29 纯规则无影响
     monkeypatch.setattr("invest.agent.web_tools.web_search", lambda query, n=5: [])
     # 预案历史（质量复盘输入）
@@ -194,6 +196,8 @@ def test_b1_structured(monkeypatch):
         "000852": {"name": "中证1000", "price": 7601.8, "pct": 0.9},
     })
     monkeypatch.setattr("invest.data.etf.fetch_etf_quotes", lambda codes=None: {})
+    # 2026-09-03：交易信号 scan 自取行情，测试里 mock 掉避免联网
+    monkeypatch.setattr("invest.data.auction.fetch_batch_quotes", lambda symbols=None: {})
     with mock.patch("invest.report._live_quotes", return_value=({"600519": 105.0}, {"600519": 0.05})), \
          mock.patch("invest.data.realtime.RealtimeQuoter._fetch_merged", side_effect=RuntimeError("down")):
         struct = run_structured("b1_intraday", db_path=p)
@@ -373,6 +377,9 @@ def test_a7_auction_structured(monkeypatch):
             return out
 
     monkeypatch.setattr("invest.data.realtime.RealtimeQuoter", _LiveQuoter)
+    # 2026-09-03：交易信号热门板块核心会调 fetch_industries，测试里 mock 避免联网
+    monkeypatch.setattr("invest.data.auction.fetch_industries",
+                        lambda symbols=None: {s: "半导体" for s in (symbols or [])})
     # 关键股票：mock 热门板块核心股（避免依赖 industry_map 数据）
     monkeypatch.setattr("invest.skills.reports.a7_auction._hot_core_stocks",
                         lambda conn: [{"block": "半导体", "count": 2,
@@ -400,6 +407,8 @@ def test_a7_auction_structured(monkeypatch):
     # views 元数据（情绪预判 + 模块解析，供落库复盘）
     assert struct.get("views", {}).get("mood", {}).get("mood")
     assert struct.get("views", {}).get("analysis", {}).get("index")
+    # 交易信号节：连板全高开 → 至少有高开率信号
+    assert "交易信号" in texts
 
 
 # ---------- 错误路径 ----------

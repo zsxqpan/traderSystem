@@ -72,7 +72,8 @@ def mood_llm(db_path: str, ctx: dict) -> dict:
                 f"- 市场温度: {ctx.get('temp_text') or '暂无'}\n"
                 f"- 情绪周期(收盘口径): {ctx.get('emotion_text') or '暂无'}\n"
                 f"- 今日盘中连板: {ctx.get('limit_up_text') or '暂无'}\n"
-                f"- 近20日温度: {' → '.join(str(v) for v in (ctx.get('temp_hist') or [])[-20:])}\n\n"
+                f"- 近20日温度: {' → '.join(str(v) for v in (ctx.get('temp_hist') or [])[-20:])}\n"
+                f"- 规则交易信号（禁止编造保量/缩量，只能引用）: {ctx.get('signals_text') or '无'}\n\n"
                 "请输出 JSON：\n"
                 '{"mood": "整体情绪判断一句话（含温度/连板/炸板解读）",\n'
                 '"prediction": "结合当天+前面多天数据的盘面预测与操作建议（如已滞涨小心回落、'
@@ -104,7 +105,8 @@ def auction_llm(db_path: str, ctx: dict) -> dict:
                        f"指数竞价:\n{ctx.get('index_text') or '暂无'}\n"
                        f"竞价高开榜TOP:\n{ctx.get('gainers') or '暂无'}\n"
                        f"竞价量比榜TOP:\n{ctx.get('vol_ratio') or '暂无'}\n"
-                       f"昨日连板今日竞价:\n{ctx.get('ladder') or '暂无'}\n\n"
+                       f"昨日连板今日竞价:\n{ctx.get('ladder') or '暂无'}\n"
+                       f"规则交易信号（禁止编造保量/缩量，只能引用）:\n{ctx.get('signals_text') or '无'}\n\n"
                        "请输出竞价情绪预判 JSON：\n"
                        '{"mood": "竞价情绪强弱判断（高开家数/连板承接/量比放大，30字内）",\n'
                        '"style": "风格预判（大小盘/题材方向，25字内）",\n'
@@ -133,7 +135,8 @@ def section_analysis_llm(db_path: str, ctx: dict) -> dict:
                        f"高开放量榜:\n{ctx.get('boards_text') or '暂无'}\n"
                        f"昨日连板竞价:\n{ctx.get('ladder_text') or '暂无'}\n"
                        f"市场关键股票竞价:\n{ctx.get('key_text') or '暂无'}\n"
-                       f"核心关注竞价:\n{ctx.get('core_text') or '暂无'}\n\n"
+                       f"核心关注竞价:\n{ctx.get('core_text') or '暂无'}\n"
+                       f"规则交易信号（禁止编造，只能引用）:\n{ctx.get('signals_text') or '无'}\n\n"
                        "请对每个模块给一句简要竞价解析（原因/影响，30字内；该模块竞价无特别消息写'无'，"
                        "不要强行解析），输出 JSON：\n"
                        '{"index": "指数竞价解析", "boards": "高开放量榜解析", "ladder": "连板竞价解析",'
@@ -318,6 +321,7 @@ def mainline_llm(db_path: str, ctx: dict) -> dict:
                 f"板块ETF(纯度高于板块指数,体现方向真实强度):\n{ctx.get('etf_sector') or '暂无'}\n"
                 f"核心关注实时行情:\n{ctx.get('core') or '暂无'}\n"
                 f"规则筛选候选股:\n{cand_text}\n\n"
+                f"规则交易信号（禁止编造保量/缩量，只能引用）:\n{ctx.get('signals_text') or '无'}\n\n"
                 "请输出 JSON（只分析 1-3 个最强方向）：\n"
                 '{"main_lines": [{"direction": "方向名",'
                 '"reason": "上涨原因（结合资金/连板，25字内）",'

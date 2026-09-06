@@ -23,7 +23,7 @@ SKILL = {
     "name": "竞价报告",
     "kind": "report",
     "description": "9:25 竞价报告：指数竞价/高开量比榜/连板竞价/核心关注竞价/情绪预判(LLM)",
-    "uses": ["d12_limit_up_ladder", "d21_freshness"],
+    "uses": ["d12_limit_up_ladder", "d21_freshness", "d32_trade_signals"],
     "params": {
         "db_path": "str, required",
         "snapshot": "optional, 冻结快照；缺省则 render 内 freeze",
@@ -94,49 +94,13 @@ def _yesterday_ladder(conn) -> list[str]:
 
 
 def _hot_core_stocks(conn) -> list[dict]:
-    """前一日热门板块核心股（2026-08-22 v2）：昨日涨停股按东财行业(f100)聚合 TOP3，
-    每板块选**成交量最大关注度最高**的 1-2 只（非连板最高——避免与「连板竞价」重合）。
-
-    返回 [{block, count, stocks: [{symbol, name, lianban, volume}]}]。
-    """
+    """前一日热门板块核心股：委托 signals.universe（每板块最多 2 只，与表格一致）。"""
     try:
-        rows = conn.execute(
-            """SELECT symbol, name, lianban FROM limit_up_pool
-               WHERE zhaban=0
-                 AND date=(SELECT MAX(date) FROM limit_up_pool WHERE date < ?)
-               ORDER BY lianban DESC LIMIT 50""",
-            (dt.date.today().strftime("%Y%m%d"),),
-        ).fetchall()
+        from invest.signals.universe import hot_sector_cores
+
+        return hot_sector_cores(conn, per_block=2)
     except Exception:
         return []
-    if not rows:
-        return []
-    from invest.data.auction import fetch_industries
-
-    # 昨日成交量（关注度代理：成交量大=关注度高）
-    vol_map: dict[str, float] = {}
-    try:
-        for r in rows:
-            row = conn.execute(
-                "SELECT volume FROM daily_bars WHERE symbol=? "
-                "ORDER BY REPLACE(date,'-','') DESC LIMIT 1", (r["symbol"],),
-            ).fetchone()
-            vol_map[r["symbol"]] = float(row["volume"]) if row and row["volume"] else 0.0
-    except Exception:
-        pass
-    ind_map = fetch_industries([r["symbol"] for r in rows])
-    blocks: dict[str, list] = {}
-    for r in rows:
-        ind = ind_map.get(r["symbol"]) or "其他"
-        item = dict(r)
-        item["volume"] = vol_map.get(r["symbol"], 0.0)
-        blocks.setdefault(ind, []).append(item)
-    top = sorted(blocks.items(), key=lambda kv: -len(kv[1]))[:3]
-    out = []
-    for ind, stocks in top:
-        stocks.sort(key=lambda s: -s.get("volume", 0.0))  # 成交量最大优先
-        out.append({"block": ind, "count": len(stocks), "stocks": stocks[:2]})
-    return out
 
 
 def _core_symbols(db_path: str) -> list[str]:
@@ -210,6 +174,24 @@ def render(db_path: str, snapshot=None) -> dict:
     if degrade:
         sections.append({"type": "text", "text": degrade_alert_text(cov_info)})
 
+    sigs: list = []
+    tags_for = None
+    try:
+        from invest.signals.format import tags_for as _tags_for
+        from invest.signals.scan import scan_db
+
+        tags_for = _tags_for
+        sigs = scan_db(db_path, "auction")  # 2026-09-03 合并：行情由 scan 自取（快照架构无 all_quotes）
+    except Exception:
+        sigs = []
+    sig_text = ""
+    try:
+        from invest.signals.format import format_signals
+
+        sig_text = format_signals(sigs)
+    except Exception:
+        pass
+
     # ========== 第二段：LLM 解析（各模块一次调用）+ 情绪预判（独立） ==========
     index_text = " ".join(f"{r[0]} {r[2]}" for r in idx_rows) if idx_rows else ""
     boards_text = "\n".join(
@@ -224,12 +206,12 @@ def render(db_path: str, snapshot=None) -> dict:
     else:
         analysis = _intraday_llm.section_analysis_llm(db_path, {
             "index_text": index_text, "boards_text": boards_text, "ladder_text": ladder_text,
-            "key_text": key_text, "core_text": core_text,
+            "key_text": key_text, "core_text": core_text, "signals_text": sig_text,
         })
         pred = _intraday_llm.auction_llm(db_path, {
             "index_text": index_text, "gainers": boards_text,
             "vol_ratio": "\n".join(f"  {g['name']} {g['pct']:+.2f}%" for g in vol_top),
-            "ladder": ladder_text,
+            "ladder": ladder_text, "signals_text": sig_text,
         })
 
     def _an(key: str) -> str:
@@ -251,6 +233,16 @@ def render(db_path: str, snapshot=None) -> dict:
             })
         if analysis:
             sections.append({"type": "text", "text": f"**指数竞价解析**: {_an('index')}"})
+
+    # 1b) 交易信号（保量/缩量分歧/连板高开率）
+    try:
+        from invest.signals.format import signal_section as _sig_sec
+
+        blk = _sig_sec(sigs)
+        if blk:
+            sections.append(blk)
+    except Exception:
+        pass
 
     # 2) 高开放量榜 + 解析
     if gainers:
@@ -305,9 +297,16 @@ def render(db_path: str, snapshot=None) -> dict:
 
     # 5) 核心关注竞价 + 解析
     if core_rows:
+        core_cols = ["代码", "名称", "竞价价", "竞价涨幅", "状态"]
+        if tags_for:
+            tags = [tags_for(sigs, row[0]) or "-" for row in core_rows]
+            if any(t != "-" for t in tags):  # 有信号才加「信号」列，避免空列
+                core_cols.append("信号")
+                for row, tag in zip(core_rows, tags):
+                    row.append(tag)
         sections.append({
             "type": "table", "title": "核心关注/持仓竞价",
-            "columns": ["代码", "名称", "竞价价", "竞价涨幅", "状态"], "rows": core_rows,
+            "columns": core_cols, "rows": core_rows,
         })
         if analysis:
             sections.append({"type": "text", "text": f"**核心关注竞价解析**: {_an('core')}"})

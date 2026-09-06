@@ -29,7 +29,8 @@ SKILL = {
     "kind": "report",
     "description": "盘后日报（盘中PLUS）：盘面总览(含ETF)/盘中观点复盘/重要板块总分析/明日预案+质量复盘",
     "uses": ["d1_news_block", "d16_card_alerts", "d17_pool_delta", "d21_freshness",
-             "d12_limit_up_ladder", "d13_fund_line", "d28_community_hot", "d29_sector_resonance"],
+             "d12_limit_up_ladder", "d13_fund_line", "d28_community_hot", "d29_sector_resonance",
+             "d32_trade_signals"],
     "params": {
         "db_path": "str, required",
         "agent_text": "str, optional, default ''（兼容旧调用，新结构未使用）",
@@ -314,6 +315,20 @@ def render(db_path: str, agent_text: str = "") -> dict:
         except Exception:
             pass
 
+    sigs: list = []
+    sig_text = ""
+    try:
+        from invest.signals.format import format_signals, signal_section
+        from invest.signals.scan import scan_db
+
+        sigs = scan_db(db_path, "close")
+        sig_text = format_signals(sigs)
+        blk = signal_section(sigs)
+        if blk:
+            sections.append(blk)
+    except Exception:
+        sigs, sig_text = [], ""
+
     # ---- 点2 盘中观点复盘（LLM） ----
     conn = connect(db_path)
     try:
@@ -322,7 +337,7 @@ def render(db_path: str, agent_text: str = "") -> dict:
     finally:
         conn.close()
     review = _daily_llm.intraday_review_llm(db_path, {
-        "views_text": views_text, "actual_text": actual_text,
+        "views_text": views_text, "actual_text": actual_text, "signals_text": sig_text,
     })
     if review.get("verdict"):
         lines = [f"**对错总结**: {review['verdict']}"]
@@ -364,7 +379,7 @@ def render(db_path: str, agent_text: str = "") -> dict:
         etf_sector = ""
     boards = _daily_llm.board_analysis_llm(db_path, {
         "etf_sector": etf_sector, "sector_top": sector_top,
-        "ladder": ladder, "stock_moves": moves,
+        "ladder": ladder, "stock_moves": moves, "signals_text": sig_text,
     })
     blines = []
     for b in (boards.get("boards") or []):
@@ -391,6 +406,7 @@ def render(db_path: str, agent_text: str = "") -> dict:
     plan = _daily_llm.plan_gen_llm(db_path, {
         "summary": summary, "holdings": holdings,
         "plan_history": json.dumps(history, ensure_ascii=False)[:800],
+        "signals_text": sig_text,
     })
     if plan.get("direction") or plan.get("picks") or plan.get("plans"):
         plines = [f"**明日主线**: {plan.get('direction', '')}"]

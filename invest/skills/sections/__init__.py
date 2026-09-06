@@ -1,4 +1,4 @@
-"""小节 skill（31 个）：D1-D23 + D24-D27（2026-08-22 盘前报告新增）+ D28-D31（2026-08-23 角度 skill 复用）。
+"""小节 skill（32 个）：D1-D23 + D24-D27 + D28-D31 + D32 交易信号。
 
 render 输出规则：
 - 返回 str 的小节：原样返回（逐字节一致）；
@@ -44,6 +44,7 @@ from . import (
     d29_sector_resonance,
     d30_cycle_position,
     d31_pool_trap_alerts,
+    d32_trade_signals,
 )
 
 _SECTION_MODULES = (
@@ -54,6 +55,7 @@ _SECTION_MODULES = (
     d20_entry_timing, d21_freshness, d22_ratings, d23_breadth,
     d24_global_snapshot, d25_overnight_analysis, d26_market_watch, d27_news_digest,
     d28_community_hot, d29_sector_resonance, d30_cycle_position, d31_pool_trap_alerts,
+    d32_trade_signals,
 )
 
 for _mod in _SECTION_MODULES:
