@@ -73,30 +73,32 @@ JOB_SLOTS = {
     "auction": "09:26",
     "snapshot_close": "15:01",
     "after_close": "16:00",
-    "pool_trap_scan": "17:10",
+    "pool_trap_scan": "16:20",
     "weekend": "20:00",
     "monthly": "09:30",
     "yearly": "09:30",
-    "industry_refresh": "21:30",
-    "daily_refresh": "21:40",
-    "factcard_refresh": "21:50",
-    "evening_report": "22:00",
+    "industry_refresh": "16:30",
+    "daily_refresh": "16:40",
+    "factcard_refresh": "16:50",
+    "evening_report": "17:00",
 }
 # 同日补偿窗口。开始前不处理；窗口内复用正常执行链路；结束后只记 missed。
+# 2026-09-07：配合"机器仅 08:30-17:30 唤醒"电源策略，全部压缩到 17:29:59 前，
+# 晚于窗口的槽位记 missed 不再执行（机器已允许休眠）。
 JOB_COMPENSATION_WINDOWS = {
     "premarket": (dt.time(8, 30), dt.time(8, 39, 59)),
     "morning_brief": (dt.time(8, 40), dt.time(9, 24, 59)),
     "auction": (dt.time(9, 25, 30), dt.time(9, 29, 30)),
-    "snapshot_close": (dt.time(15, 1), dt.time(21, 39, 59)),
-    "after_close": (dt.time(16, 0), dt.time(21, 29, 59)),
-    "pool_trap_scan": (dt.time(17, 10), dt.time(21, 59, 59)),
+    "snapshot_close": (dt.time(15, 1), dt.time(17, 29, 59)),
+    "after_close": (dt.time(16, 0), dt.time(17, 29, 59)),
+    "pool_trap_scan": (dt.time(16, 20), dt.time(17, 29, 59)),
     "weekend": (dt.time(20, 0), dt.time(23, 59, 59)),
     "monthly": (dt.time(9, 30), dt.time(23, 59, 59)),
     "yearly": (dt.time(9, 30), dt.time(23, 59, 59)),
-    "industry_refresh": (dt.time(21, 30), dt.time(21, 39, 59)),
-    "daily_refresh": (dt.time(21, 40), dt.time(21, 59, 59)),
-    "factcard_refresh": (dt.time(21, 50), dt.time(21, 59, 59)),
-    "evening_report": (dt.time(22, 0), dt.time(23, 59, 59)),
+    "industry_refresh": (dt.time(16, 30), dt.time(17, 29, 59)),
+    "daily_refresh": (dt.time(16, 40), dt.time(17, 29, 59)),
+    "factcard_refresh": (dt.time(16, 50), dt.time(17, 29, 59)),
+    "evening_report": (dt.time(17, 0), dt.time(17, 29, 59)),
 }
 TRADING_DAY_JOBS = {
     "premarket",
@@ -628,7 +630,7 @@ def _after_close(db: str, conn) -> JobResult:
     if not collected.success:
         return collected
     pl.quant(db)
-    # Agent 复盘/观点仲裁落库（不推送；晚间盘后报告统一在 22:00 推送，见 _evening_report）
+    # Agent 复盘/观点仲裁落库（不推送；晚间盘后报告统一在 17:00 推送，见 _evening_report）
     try:
         pl.agent_after_close(db)
         pl.arbitrate_all(db)
@@ -865,8 +867,7 @@ def _intraday_tick_job(
 
 
 def _industry_refresh(db: str, conn) -> JobResult:
-    """21:30 行业数据刷新：同花顺当天板块数据晚间才发布，
-    刷新后 22:00 每日复盘即为当天板块涨幅/强度。"""
+    """16:30 行业数据刷新：快照收盘后补行业数据，17:00 盘后报告即可含当天板块强度。"""
     import invest.pipeline as pl
     collected = _collection_result(
         pl.collect_industry(db),
@@ -880,11 +881,11 @@ def _industry_refresh(db: str, conn) -> JobResult:
 
 
 def _daily_refresh(db: str, conn) -> JobResult:
-    """21:40 日线/指数补采（2026-08-17 修复数据滞后）。
+    """16:40 日线/指数补采（2026-09-07 由 21:40 提前：配合机器 17:30 后休眠策略）。
 
-    新浪/东财当日日线与指数日线晚间才发布，16:00 收盘采集拿不到
-    当天数据（daily_bars/index_bars 滞后 1 个交易日）。此时补采
-    并用当天数据重算 quant，保证 22:00 每日复盘数据是当天的。
+    当日日线以 15:01 snapshot 快照（src='snapshot'）为准；本任务补采 akshare
+    历史权威数据（含昨日及更早，akshare 东财当日数据晚间才发布，故当日不覆盖），
+    并用当天数据重算 quant，保证 17:00 盘后报告数据是当天的。
     """
     import invest.pipeline as pl
     collected = _collection_result(
@@ -902,8 +903,8 @@ def _data_lag_reason(conn) -> str:
     """盘后数据新鲜度检查：daily_bars/index_bars 是否已更新到最近交易日。
 
     返回 "" = 数据新鲜可发报告；非空 = 滞后原因（此时不发报告，改为推送该原因）。
-    2026-08-18 新增：当日日线/指数数据源晚间才发布（21:40 daily_refresh 补采），
-    若补采未跑/失败，盘后报告拿到的就是上一交易日数据——必须先判断再发。
+    当日数据主要由 15:01 snapshot 快照写入；16:40 daily_refresh 补采历史权威数据。
+    若快照未跑/失败，盘后报告拿到的就是上一交易日数据——必须先判断再发。
     """
     import datetime as dt
 
@@ -919,13 +920,13 @@ def _data_lag_reason(conn) -> str:
         "AND date(started_at)=date('now','localtime')"
     ).fetchone()["n"]
     parts = [f"日线最新={latest_bars or '无'}，指数最新={latest_idx or '无'}，最近交易日={expected}"]
-    parts.append("今日 21:40 日线补采任务未执行" if not ran else "今日 21:40 日线补采已执行但未取到当日数据")
-    parts.append("当日日线/指数数据源通常晚间才发布；补采未跑或失败时只能拿到上一交易日数据")
+    parts.append("今日 15:01 收盘快照/16:40 补采任务未执行" if not ran else "今日 16:40 补采已执行但未取到当日数据")
+    parts.append("当日日线以收盘快照为准；快照未跑或失败时只能拿到上一交易日数据")
     return "；".join(parts)
 
 
 def _snapshot_close(db: str, conn) -> JobResult:
-    """16:10 收盘快照落库（2026-08-20）：实时源直接写当日收盘价，不必等晚间日线发布。"""
+    """15:01 收盘快照落库（2026-08-20 初版 16:10；08-24 提前到 15:01）：实时源直接写当日收盘价，不必等晚间日线发布。"""
     import invest.pipeline as pl
     counts = pl.snapshot_close(db)
     if not isinstance(counts, dict):
@@ -943,7 +944,7 @@ def _snapshot_close(db: str, conn) -> JobResult:
 
 
 def _evening_report(db: str, conn) -> JobResult:
-    """22:00 晚间盘后报告（合并原 16:00 盘后日报 / 21:35 P2 简报 / 22:00 每日复盘，只发一份）。
+    """17:00 晚间盘后报告（2026-09-07 由 22:00 提前：合并盘后日报/复盘统计，配合机器休眠策略）。
 
     数据新鲜度门禁（2026-08-18）：
     - 日线/指数已更新到最近交易日 → 正常生成并推送合并报告（daily_report + 复盘统计 + 数据质量）；
@@ -1029,7 +1030,7 @@ def _evening_report(db: str, conn) -> JobResult:
             else {"delivery": bool(raw_result)}
         )
     if not any(channels.values()):
-        logger.warning("22:00 盘后报告推送失败或未配置 webhook")
+        logger.warning("17:00 盘后报告推送失败或未配置 webhook")
         return JobResult.failed(
             "盘后报告推送失败或未配置 webhook",
             artifact="a3_daily",
@@ -1043,7 +1044,7 @@ def _evening_report(db: str, conn) -> JobResult:
 
 
 def _pool_trap_scan(db: str, conn) -> JobResult:
-    """17:10 候选池/持仓杀猪盘 8 信号扫描（2026-08-23，d31_pool_trap_alerts 复用）。
+    """16:20 候选池/持仓杀猪盘 8 信号扫描（2026-08-23，d31_pool_trap_alerts 复用）。
 
     写 pool_trap_alerts 表（全部结果留痕）+ 有 ≥🟡 预警推送飞书（1h 限频）。
     """
@@ -1088,7 +1089,7 @@ def _pool_trap_scan(db: str, conn) -> JobResult:
 
 
 def _factcard_refresh(db: str, conn) -> JobResult:
-    """21:50 行业事实卡重建；仅推送相对上一时点发生重要变化的摘要+证据编号。"""
+    """16:50 行业事实卡重建；仅推送相对上一时点发生重要变化的摘要+证据编号。"""
     from invest.evidence.factcards import run_factcard_refresh
 
     return run_factcard_refresh(db, conn, push=True)
@@ -1349,8 +1350,8 @@ def build_scheduler(ticker_only: bool = False) -> BackgroundScheduler:
     # 东财 clist 批量接口 15:00 收盘后立即返回全市场当日 OHLCV，15:01 落库 src='snapshot'，
     # 不必等晚间 akshare 日线（约 21 点）；晚间权威数据写入后自动删当日 snapshot 行
     sched.add_job(_wrap("snapshot_close", _snapshot_close), CronTrigger(day_of_week="mon-fri", hour=15, minute=1), id="snapshot_close", misfire_grace_time=7200)
-    # 候选池杀猪盘扫描（2026-08-23）：17:10 全 8 信号扫描候选池/持仓，≥🟡 推送
-    sched.add_job(_wrap("pool_trap_scan", _pool_trap_scan), CronTrigger(day_of_week="mon-fri", hour=17, minute=10), id="pool_trap_scan", misfire_grace_time=7200)
+    # 候选池杀猪盘扫描（2026-08-23）：16:20 全 8 信号扫描候选池/持仓，≥🟡 推送
+    sched.add_job(_wrap("pool_trap_scan", _pool_trap_scan), CronTrigger(day_of_week="mon-fri", hour=16, minute=20), id="pool_trap_scan", misfire_grace_time=7200)
     # 周末周报（2026-08-18 改）：周日 20:00（原周六 09:00）——晚间数据齐备后发，
     # 内容含消息面（财联社电报近7日）+ 周度复盘（纪律/周期漂移/持仓卡片复评）
     sched.add_job(_wrap("weekend", _weekend), CronTrigger(day_of_week="sun", hour=20, minute=0), id="weekend", misfire_grace_time=21600)
@@ -1365,11 +1366,12 @@ def build_scheduler(ticker_only: bool = False) -> BackgroundScheduler:
         coalesce=True,
         misfire_grace_time=60,
     )
-    sched.add_job(_wrap("industry_refresh", _industry_refresh), CronTrigger(day_of_week="mon-fri", hour=21, minute=30), id="industry_refresh", misfire_grace_time=3600)
-    # 日线/指数补采（2026-08-17）：当日日线晚间才发布，收盘采集拿不到当天数据
-    sched.add_job(_wrap("daily_refresh", _daily_refresh), CronTrigger(day_of_week="mon-fri", hour=21, minute=40), id="daily_refresh", misfire_grace_time=3600)
-    sched.add_job(_wrap("factcard_refresh", _factcard_refresh), CronTrigger(day_of_week="mon-fri", hour=21, minute=50), id="factcard_refresh", misfire_grace_time=3600)
-    # 晚间盘后报告（2026-08-18 合并 daily_report/P2简报/每日复盘）：22:00 只发一份；
-    # 数据滞后时跳过并推送原因（_data_lag_reason 门禁）
-    sched.add_job(_wrap("evening_report", _evening_report), CronTrigger(hour=22, minute=0), id="evening_report", misfire_grace_time=7200)
+    sched.add_job(_wrap("industry_refresh", _industry_refresh), CronTrigger(day_of_week="mon-fri", hour=16, minute=30), id="industry_refresh", misfire_grace_time=3600)
+    # 日线/指数补采（2026-08-17 原始 21:40 晚间权威版；2026-09-07 提前到 16:40，
+    # 当日以 15:01 snapshot 快照为准，akshare 晚间数据不再等待——机器 17:30 后休眠）
+    sched.add_job(_wrap("daily_refresh", _daily_refresh), CronTrigger(day_of_week="mon-fri", hour=16, minute=40), id="daily_refresh", misfire_grace_time=3600)
+    sched.add_job(_wrap("factcard_refresh", _factcard_refresh), CronTrigger(day_of_week="mon-fri", hour=16, minute=50), id="factcard_refresh", misfire_grace_time=3600)
+    # 晚间盘后报告（2026-08-18 合并 daily_report/P2简报/每日复盘；2026-09-07 由 22:00 提前到 17:00，
+    # 随机器休眠策略改为交易日下午发）：数据滞后时跳过并推送原因（_data_lag_reason 门禁）
+    sched.add_job(_wrap("evening_report", _evening_report), CronTrigger(day_of_week="mon-fri", hour=17, minute=0), id="evening_report", misfire_grace_time=7200)
     return sched

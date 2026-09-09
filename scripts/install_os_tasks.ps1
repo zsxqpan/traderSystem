@@ -11,14 +11,17 @@
         TraderSystem_auction            交易日 09:26
         TraderSystem_snapshot_close     交易日 15:01
         TraderSystem_after_close        交易日 16:00
-        TraderSystem_pool_trap_scan     交易日 17:10
+        TraderSystem_pool_trap_scan     交易日 16:20
+        TraderSystem_industry_refresh   交易日 16:30
+        TraderSystem_daily_refresh      交易日 16:40
+        TraderSystem_factcard_refresh   交易日 16:50
+        TraderSystem_evening_report     交易日 17:00
         TraderSystem_weekend            周日   20:00
         TraderSystem_monthly            每月1日 09:30
         TraderSystem_yearly             每年1/1 09:30
-        TraderSystem_industry_refresh   交易日 21:30
-        TraderSystem_daily_refresh      交易日 21:40
-        TraderSystem_factcard_refresh   交易日 21:50
-        TraderSystem_evening_report     每日   22:00
+    电源策略任务（2026-09-07：机器仅 08:30-17:30 唤醒，其余时间允许休眠省电）：
+        TraderSystem_power_on           交易日 08:25（唤醒机器 + 插电永不休眠，需管理员）
+        TraderSystem_power_off          交易日 17:35（恢复插电 25 分钟休眠，需管理员）
 
     用法（在【你自己的】PowerShell 里运行）：
         powershell -ExecutionPolicy Bypass -File "C:\Users\狐狸怂\Documents\Codex\2026-08-01\la\traderSystem\scripts\install_os_tasks.ps1"
@@ -41,14 +44,14 @@ $jobs = @(
     @{ Name = "TraderSystem_auction";          Desc = "集合竞价报告 09:26";                Trigger = 'weekday'; Time = "09:26"; Job = "auction" },
     @{ Name = "TraderSystem_snapshot_close";   Desc = "收盘即日线快照 15:01";             Trigger = 'weekday'; Time = "15:01"; Job = "snapshot_close" },
     @{ Name = "TraderSystem_after_close";      Desc = "盘后采集/Agent/扫描/快照 16:00";    Trigger = 'weekday'; Time = "16:00"; Job = "after_close" },
-    @{ Name = "TraderSystem_pool_trap_scan";   Desc = "候选池杀猪盘扫描 17:10";            Trigger = 'weekday'; Time = "17:10"; Job = "pool_trap_scan" },
+    @{ Name = "TraderSystem_pool_trap_scan";   Desc = "候选池杀猪盘扫描 16:20";            Trigger = 'weekday'; Time = "16:20"; Job = "pool_trap_scan" },
     @{ Name = "TraderSystem_weekend";          Desc = "周日20:00 周报(大模型消息面+复盘)"; Trigger = 'sunday';  Time = "20:00"; Job = "weekend" },
     @{ Name = "TraderSystem_monthly";          Desc = "每月1日 月度复盘";                  Trigger = 'monthly'; Time = "09:30"; Job = "monthly" },
     @{ Name = "TraderSystem_yearly";           Desc = "每年1/1 年度复盘";                  Trigger = 'yearly';  Time = "09:30"; Job = "yearly" },
-    @{ Name = "TraderSystem_industry_refresh"; Desc = "21:30 行业数据刷新";                Trigger = 'weekday'; Time = "21:30"; Job = "industry_refresh" },
-    @{ Name = "TraderSystem_daily_refresh";    Desc = "21:40 日线/指数补采+quant";         Trigger = 'weekday'; Time = "21:40"; Job = "daily_refresh" },
-    @{ Name = "TraderSystem_factcard_refresh"; Desc = "21:50 行业事实卡/重要变化推送";       Trigger = 'weekday'; Time = "21:50"; Job = "factcard_refresh" },
-    @{ Name = "TraderSystem_evening_report";   Desc = "22:00 晚间盘后报告(含数据滞后门禁)"; Trigger = 'daily';   Time = "22:00"; Job = "evening_report" }
+    @{ Name = "TraderSystem_industry_refresh"; Desc = "16:30 行业数据刷新";                Trigger = 'weekday'; Time = "16:30"; Job = "industry_refresh" },
+    @{ Name = "TraderSystem_daily_refresh";    Desc = "16:40 日线/指数补采+quant";         Trigger = 'weekday'; Time = "16:40"; Job = "daily_refresh" },
+    @{ Name = "TraderSystem_factcard_refresh"; Desc = "16:50 行业事实卡/重要变化推送";       Trigger = 'weekday'; Time = "16:50"; Job = "factcard_refresh" },
+    @{ Name = "TraderSystem_evening_report";   Desc = "17:00 晚间盘后报告(含数据滞后门禁)"; Trigger = 'weekday'; Time = "17:00"; Job = "evening_report" }
 )
 
 function New-TriggerXml([string]$kind, [string]$time) {
@@ -121,10 +124,69 @@ function New-TaskXml([string]$name, [string]$desc, [string]$triggerXml, [string]
 "@
 }
 
+function New-PowerTaskXml([string]$name, [string]$desc, [string]$time, [string]$execLimit, [string]$action) {
+    # 电源策略任务：工作日到点唤醒机器。
+    # - power_on：启动 keep_awake.py（pythonw，持有 ES_SYSTEM_REQUIRED 至 17:30，
+    #   阻止"唤醒任务结束后自动复睡"——08-26:56 复睡导致 premarket 漏跑事故，2026-09-08 改）
+    # - power_off：恢复插电 25 分钟休眠。
+    # 需以管理员注册（RunLevel=HighestAvailable）+ WakeToRun 唤醒睡眠中的机器。
+    $boundary = "2026-09-07T$time" + ":00"
+    return @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>$desc</Description></RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>$boundary</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByWeek><DaysOfWeek><Monday/><Tuesday/><Wednesday/><Thursday/><Friday/></DaysOfWeek><WeeksInterval>1</WeeksInterval></ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>true</WakeToRun>
+    <ExecutionTimeLimit>$execLimit</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>$action</Arguments>
+      <WorkingDirectory>C:\Windows\System32</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"@
+}
+
+$pyw = Join-Path $root "myenv\Scripts\pythonw.exe"
+$keepAwake = Join-Path $root "scripts\keep_awake.py"
+$powerJobs = @(
+    @{ Name = "TraderSystem_power_on";  Desc = "工作日08:25 唤醒+keep_awake保活至17:30"; Time = "08:25"; ExecLimit = "PT10H";
+       Action = "/c `"$pyw`" `"$keepAwake`" --until 17:30" },
+    @{ Name = "TraderSystem_power_off"; Desc = "工作日17:35 恢复插电25分钟休眠";          Time = "17:35"; ExecLimit = "PT10M";
+       Action = "/c powercfg /change standby-timeout-ac 25" }
+)
+
 if ($Uninstall) {
     foreach ($j in $jobs) {
         & schtasks /Delete /TN $j.Name /F 2>$null | Out-Null
         Write-Host "已删除: $($j.Name)"
+    }
+    foreach ($p in $powerJobs) {
+        & schtasks /Delete /TN $p.Name /F 2>$null | Out-Null
+        Write-Host "已删除: $($p.Name)"
     }
     exit 0
 }
@@ -148,6 +210,24 @@ foreach ($j in $jobs) {
     }
 }
 Write-Host ""
+Write-Host "=== 电源策略任务（08:25 唤醒+keep_awake 保活 / 17:35 恢复休眠；需管理员注册）==="
+foreach ($p in $powerJobs) {
+    $xml = New-PowerTaskXml $p.Name $p.Desc $p.Time $p.ExecLimit $p.Action
+    $xmlFile = Join-Path $tmpDir ("task_" + $p.Name + ".xml")
+    [System.IO.File]::WriteAllText($xmlFile, $xml, ([System.Text.Encoding]::Unicode))
+    if ($DryRun) {
+        Write-Host ("[DRYRUN] {0}  ->  {1}" -f $p.Name, $xmlFile)
+        continue
+    }
+    & schtasks /Create /TN $p.Name /XML $xmlFile /F | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host ("[OK] {0}  {1}" -f $p.Name, $p.Desc)
+    } else {
+        Write-Host ("[FAIL] {0} (exit={1})，请用管理员 PowerShell 运行本脚本" -f $p.Name, $LASTEXITCODE)
+    }
+}
+Write-Host ""
 Write-Host "下一步：把常驻服务改为仅 ticker（10s 轮询仍需常驻）："
 Write-Host "    myenv\Scripts\python.exe -u scripts\run_service.py --ticker-only"
 Write-Host "验证：schtasks /Query /TN TraderSystem_evening_report"
+Write-Host "     schtasks /Query /TN TraderSystem_power_on /v /fo LIST   (WakeToRun 应为 True)"

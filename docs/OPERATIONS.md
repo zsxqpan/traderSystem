@@ -57,11 +57,13 @@ myenv\Scripts\python.exe scripts\init_db.py
 
 与 `JOB_FUNCS` / `install_os_tasks.ps1` 一致：
 
-`premarket` 08:30 · `morning_brief` 08:40 · `auction` 09:26 · `snapshot_close` 15:01 · `after_close` 16:00（不推日报）· `pool_trap_scan` 17:10 · `industry_refresh` 21:30 · `daily_refresh` 21:40 · `factcard_refresh` 21:50 · `evening_report` **每日 22:00** · `weekend` 周日 20:00 · `monthly` 每月 1 日 09:30 · `yearly` 每年 1 月 1 日 09:30。
+`premarket` 08:30 · `morning_brief` 08:40 · `auction` 09:26 · `snapshot_close` 15:01 · `after_close` 16:00（不推日报）· `pool_trap_scan` 16:20 · `industry_refresh` 16:30 · `daily_refresh` 16:40 · `factcard_refresh` 16:50 · `evening_report` 交易日 **17:00** · `weekend` 周日 20:00 · `monthly` 每月 1 日 09:30 · `yearly` 每年 1 月 1 日 09:30。
 
 盘中 10s ticker **只能**由常驻服务跑。
 
-晚报：OS / `--full` 都是每天 22:00 触发；**补偿扫描按交易日**，周末、节假日不补发。
+晚报：OS / `--full` 都是交易日 17:00 触发（2026-09-07 由 22:00 提前，配合机器 17:30 后休眠）；**补偿扫描按交易日**，周末、节假日不补发。当日日线以 15:01 `snapshot_close` 快照为准，16:40 `daily_refresh` 只补历史权威数据（akshare 当日数据晚间才发布）。
+
+电源策略（2026-09-08 起）：`TraderSystem_power_on` 交易日 08:25 唤醒并启动 `scripts/keep_awake.py --until 17:30`（pythonw 持有 ES_SYSTEM_REQUIRED，阻止唤醒后无人值守复睡），同时设 `standby-timeout-ac 0`；`TraderSystem_power_off` 交易日 17:35 恢复 `standby-timeout-ac 25`。机器其余时间允许按现有 25 分钟闲置休眠省电。保活日志 `logs/keep_awake.log`。
 
 ### 4.2 补偿扫描
 
@@ -137,7 +139,7 @@ WAL 模式下同时留意 `-wal` / `-shm`。
 | 现象 | 处理 |
 |---|---|
 | 竞价没收到 | 确认 `TraderSystem_auction` 09:26；过窗只有 missed 告警，不会补发 |
-| 晚报没收到 | 看 21:40 `daily_refresh` 是否把日线补到最近交易日；滞后只推原因 |
+| 晚报没收到 | 看 15:01 `snapshot_close` / 16:40 `daily_refresh` 是否把日线补到最近交易日；滞后只推原因 |
 | 盘中报告有的票没价 | 看表上「状态」列（源失败/停牌/缺历史），不是静默丢行 |
 | 飞书群没反应 | 是否 @ 了机器人；是否被 120s/10s 限频；是否 Hermes 抢了长连接 |
 | 问现价却出了盘中报告 | 用「茅台现价」；「现在行情怎么样」+ 股票名应走报价，明确「盘中报告」才出报告 |

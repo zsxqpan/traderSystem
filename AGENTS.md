@@ -88,7 +88,7 @@
   深度报告仍走 `run_skill`（UZI deep-analysis），两者分工：日常快答 vs 报告级
 - 报告侧复用（2026-08-23 已落地，invest/skills/sections/）：`d28_community_hot`（社区热议→日报）/
   `d29_sector_resonance`（板块共振→日报+盘中，纯规则）/ `d30_cycle_position`（周期行业定位→周报，纯规则）/
-  `d31_pool_trap_alerts`（候选池杀猪盘 8 信号扫描→17:10 定时任务，写 pool_trap_alerts 表+≥🟡推送飞书）；
+  `d31_pool_trap_alerts`（候选池杀猪盘 8 信号扫描→16:20 定时任务，写 pool_trap_alerts 表+≥🟡推送飞书）；
   设计文档：`docs/superpowers/specs/2026-08-23-报告类复用角度skill接入-design.md`
 - **对话侧复用 D 组小节（2026-08-23）**：`run_section` 工具把 31 个报告小节 skill（d1-d31）暴露给
   日常对话——模型按语义调用现成分析文本（情绪/连板/板块/资金/宏观/外围/周期等），与角度 skill 互补；

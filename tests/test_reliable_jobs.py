@@ -401,7 +401,7 @@ def test_os_task_manifest_matches_job_funcs_and_required_times():
     assert set(jobs_to_times) == set(JOB_FUNCS)
     assert jobs_to_times["auction"] == "09:26"
     assert jobs_to_times["snapshot_close"] == "15:01"
-    assert jobs_to_times["pool_trap_scan"] == "17:10"
+    assert jobs_to_times["pool_trap_scan"] == "16:20"
     assert (ROOT / "scripts" / "install_os_tasks.ps1").read_bytes().startswith(b"\xef\xbb\xbf")
 
 
@@ -961,7 +961,7 @@ def test_daily_refresh_requires_main_bars_and_benchmark_index(db_path: str):
         ("premarket", dt.datetime(2026, 8, 24, 8, 35)),
         ("auction", dt.datetime(2026, 8, 24, 9, 27)),
         ("snapshot_close", dt.datetime(2026, 8, 24, 15, 30)),
-        ("evening_report", dt.datetime(2026, 8, 24, 22, 15)),
+        ("evening_report", dt.datetime(2026, 8, 24, 17, 10)),
     ],
 )
 def test_compensation_scan_retries_due_jobs_inside_business_window(

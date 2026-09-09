@@ -98,7 +98,7 @@ def main() -> None:
               f" + 每分钟任务补偿 + 飞书接收，"
               f"定时任务由 OS 计划任务承担；如需完整 APScheduler 请加 --full")
     else:
-        print(f"调度服务已启动(pid={os.getpid()})：完整 APScheduler 模式（--full）——盘前08:30 / 盘后16:00 / 周末周日20:00 / 夜间22:00")
+        print(f"调度服务已启动(pid={os.getpid()})：完整 APScheduler 模式（--full）——盘前08:30 / 盘后16:00 起 16:20-17:00 / 周末周日20:00")
     _start_feishu_ws()
     try:
         while True:
