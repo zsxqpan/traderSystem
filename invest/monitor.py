@@ -1,8 +1,8 @@
 """P0 监控：持仓证伪 / 风控触发 / 数据冲突（主动监控 + 推送）。
 
 2026-08-15 落地（TODO 2.5 P0 监控）：
-- 持仓证伪：active trade_plans 的证伪条件（invalid_condition）与止损位被实时价格
-  突破 → 推送 P0 告警并标记计划（falsify/stop_loss）；
+- 持仓证伪：active trade_plans + locked/review 卡片止损；两源都有止损时 plan 优先。
+  证伪条件 / 止损被实时价突破 → 推送 P0 告警；
 - 风控触发：data_guard 数据失效 + check_position 违规 → 推送降级告警；
 - 数据冲突：最近一次 realtime 留痕 stale>0 或三源全部失败 → 推送数据失效告警。
 
@@ -54,34 +54,49 @@ def _parse_stop(s: str) -> float | None:
         return None
 
 
-def check_position_falsify(db_path: str, price_map: dict[str, float]) -> list[dict]:
-    """持仓证伪监控：active 计划止损位被突破 / 证伪条件触发。
-
-    price_map: {裸代码: 最新价}（已过新鲜度过滤）。返回告警列表。
-    """
-    conn = connect(db_path)
+def _p0_universe(conn) -> tuple[list[dict], list[dict]]:
+    """active 计划 + locked/review 且有止损的卡片。"""
+    plans = [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM trade_plans WHERE status='active'"
+        ).fetchall()
+    ]
     try:
-        plans = [
+        cards = [
             dict(r) for r in conn.execute(
-                "SELECT * FROM trade_plans WHERE status='active'"
+                """SELECT * FROM cards
+                   WHERE status IN ('locked','review') AND stop_loss IS NOT NULL"""
             ).fetchall()
         ]
+    except Exception:
+        cards = []
+    return plans, cards
+
+
+def check_position_falsify(db_path: str, price_map: dict[str, float]) -> list[dict]:
+    """持仓证伪：active 计划 + locked/review 卡片止损。同标的两源都有止损时 plan 优先。"""
+    conn = connect(db_path)
+    try:
+        plans, cards = _p0_universe(conn)
     finally:
         conn.close()
     alerts: list[dict] = []
+    plan_with_stop: set[str] = set()
     for p in plans:
         sym = p["symbol"]
         price = price_map.get(sym)
         if price is None:
             continue  # 无新鲜报价：由 data_guard 处理，不误报
         sl = _parse_stop(p.get("stop_loss"))
-        if sl is not None and price <= sl:
-            alerts.append({
-                "kind": "stop_loss",
-                "symbol": sym,
-                "plan_id": p["id"],
-                "msg": f"[P0]【止损触发】{sym} 现价 {price:.2f} ≤ 止损位 {sl:.2f}（计划#{p['id']}）",
-            })
+        if sl is not None:
+            plan_with_stop.add(sym)
+            if price <= sl:
+                alerts.append({
+                    "kind": "stop_loss",
+                    "symbol": sym,
+                    "plan_id": p["id"],
+                    "msg": f"[P0]【止损触发】{sym} 现价 {price:.2f} ≤ 止损位 {sl:.2f}（计划#{p['id']}）",
+                })
         inv = (p.get("invalid_condition") or "").strip()
         if inv and inv.lower() in ("falsified", "证伪"):
             alerts.append({
@@ -89,6 +104,21 @@ def check_position_falsify(db_path: str, price_map: dict[str, float]) -> list[di
                 "symbol": sym,
                 "plan_id": p["id"],
                 "msg": f"[P0]【持仓证伪】{sym} 触发证伪条件（计划#{p['id']}）",
+            })
+    for c in cards:
+        sym = c["symbol"]
+        if sym in plan_with_stop:
+            continue
+        price = price_map.get(sym)
+        if price is None:
+            continue
+        sl = _parse_stop(c.get("stop_loss"))
+        if sl is not None and price <= sl:
+            alerts.append({
+                "kind": "stop_loss",
+                "symbol": sym,
+                "plan_id": None,
+                "msg": f"[P0]【止损触发】{sym} 现价 {price:.2f} ≤ 止损位 {sl:.2f}（卡片）",
             })
     return alerts
 
@@ -152,9 +182,10 @@ def run_p0_monitor(db_path: str) -> int:
         # 持仓证伪（仅交易时段，需要新鲜价格）
         conn = connect(db_path)
         try:
-            symbols = [r["symbol"] for r in conn.execute(
-                "SELECT symbol FROM trade_plans WHERE status='active'"
-            )]
+            plans, cards = _p0_universe(conn)
+            symbols = list(dict.fromkeys(
+                [p["symbol"] for p in plans] + [c["symbol"] for c in cards]
+            ))
         finally:
             conn.close()
         if symbols:

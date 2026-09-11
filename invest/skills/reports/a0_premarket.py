@@ -22,9 +22,10 @@ SKILL = {
     "name": "盘前报告",
     "kind": "report",
     "description": "盘前报告（A1+A2 合并）：外围详情+LLM解读/温度仓位/风格/今日关注/涨停异动监控/消息汇总",
-    "uses": ["d3_style", "d8_temp_guide", "d9_rating_guide", "d21_freshness", "d22_ratings",
+    "uses": ["d3_style", "d8_temp_guide", "d9_rating_guide", "d10_action_guide",
+             "d21_freshness", "d22_ratings",
              "d24_global_snapshot", "d25_overnight_analysis", "d26_market_watch",
-             "d27_news_digest", "d32_trade_signals"],
+             "d27_news_digest", "d32_trade_signals", "d33_daily_actions"],
     "params": {
         "db_path": "str, required",
     },
@@ -62,7 +63,7 @@ def render(db_path: str) -> dict:
         conn.close()
     sections.append({
         "type": "text",
-        "text": f"**【A股投资系统 · 盘前报告】**\n数据截至: {freshness}",
+        "text": f"**【A股投资系统 · 盘前报告】**\n\n数据截至: {freshness}",
     })
 
     # 2) 隔夜外围（表格，含日韩；韩国/日本失败自动省略）
@@ -109,6 +110,58 @@ def render(db_path: str) -> dict:
     if focus:
         sections.append({"type": "text", "text": "**【今日关注】**\n" + focus})
     try:
+        from invest.actions.format import action_table, pick_b1
+        from invest.actions.query import list_actions
+        from invest.actions.types import Action
+        from invest.report import _action_guide
+
+        conn_a = connect(db_path)
+        try:
+            raw = list_actions(conn_a)
+            if score is not None:
+                guide = _action_guide(conn_a, score)
+                if guide:
+                    sections.append({"type": "text", "text": f"📌 今日操作: {guide}"})
+        finally:
+            conn_a.close()
+        acts = [Action(
+            date=r.get("date") or "", symbol=r.get("symbol") or "",
+            verb=r.get("verb") or "hold", priority=int(r.get("priority") or 2),
+            source=r.get("source") or "", hint=r.get("hint") or "",
+            entry_lo=r.get("entry_lo"), entry_hi=r.get("entry_hi"),
+            stop_loss=r.get("stop_loss"), target=r.get("target"),
+            status=r.get("status") or "pending",
+        ) for r in raw]
+        show = pick_b1(acts) if len(acts) > 12 else acts
+        tbl = action_table(show, title="今日动作")
+        if tbl:
+            pool = set()
+            try:
+                conn_p = connect(db_path)
+                try:
+                    pool = {r["symbol"] for r in conn_p.execute(
+                        "SELECT symbol FROM candidate_pool "
+                        "WHERE level IN ('core','track') AND out_date IS NULL"
+                    )}
+                    pool |= {r["symbol"] for r in conn_p.execute(
+                        "SELECT symbol FROM cards WHERE status IN ('locked','review')"
+                    )}
+                finally:
+                    conn_p.close()
+            except Exception:
+                pool = set()
+            tbl = {
+                **tbl,
+                "columns": list(tbl["columns"]) + ["池"],
+                "rows": [
+                    list(row) + (["池内"] if row[1] in pool else ["池外"])
+                    for row in tbl["rows"]
+                ],
+            }
+            sections.append(tbl)
+    except Exception:
+        pass
+    try:
         from invest.signals.format import undigested_actions
 
         conn_u = connect(db_path)
@@ -118,6 +171,24 @@ def render(db_path: str) -> dict:
             conn_u.close()
         if undig:
             sections.append({"type": "text", "text": "**【昨日信号】** " + undig})
+    except Exception:
+        pass
+    try:
+        from invest.signals.format import format_market_opportunity, rows_to_signals
+        from invest.signals.query import list_signals
+
+        conn_m = connect(db_path)
+        try:
+            mid_rows = list_signals(conn_m, horizon="mid", session="daily")
+        finally:
+            conn_m.close()
+        opp = format_market_opportunity(rows_to_signals(mid_rows))
+        if opp:
+            title, _, rest = opp.partition("\n")
+            sections.append({
+                "type": "text",
+                "text": f"**{title}**\n{rest}" if rest else f"**{title}**",
+            })
     except Exception:
         pass
 

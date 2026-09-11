@@ -235,6 +235,14 @@ def quant(db_path: str) -> dict:
         upsert_df(conn, "quant_linkage", results["linkage"])
         upsert_df(conn, "quant_valuation", results["crowding"])
         upsert_df(conn, "quant_macro", results["macro"])
+        # 中线 daily persist：挂在 quant() 末尾。16:00 _after_close 已 quant，
+        # 22:00 evening_report→a3_daily 读得到。不要只写在 notify_after_close。
+        try:
+            from invest.signals.scan import scan as scan_signals
+
+            scan_signals(conn, "daily", persist=True, limit=10_000)
+        except Exception:
+            logger.warning("中线 daily 信号落库失败", exc_info=True)
     finally:
         conn.close()
     results.update(stock_results)
@@ -584,11 +592,15 @@ def notify_auction(
         return any(results.values())
 
     result = deliver_report("a7_auction", db_path, send_fn=send_fn)
-    # 2026-09-03：竞价信号落库（trade_signals persist=True；报告失败也照常记账，失败静默）
     try:
         from invest.signals.scan import scan_db
+        from invest.signals.thresholds import DISPLAY_A7
 
-        scan_db(db_path, "auction", persist=True)
+        meta = (captured.get("struct") or {}).get("signal_meta") or {}
+        scan_db(
+            db_path, "auction", persist=True, limit=DISPLAY_A7,
+            quotes=meta.get("quotes"), boards=meta.get("boards"),
+        )
     except Exception:
         logger.warning("竞价信号落库失败", exc_info=True)
     if result.status == "ok":
@@ -659,6 +671,9 @@ def _persist_plan(plan_data: dict) -> None:
 
         conn = _connect(str(Path(__file__).resolve().parents[1] / "data" / "invest.db"))
         try:
+            from invest.actions.persist import expire_active_plans
+
+            expire_active_plans(conn)
             conn.execute(
                 """INSERT INTO viewpoints(source, conclusion, period_tag, confidence,
                    evidence_json, invalid_condition, status, created_at, obj_type, obj)
@@ -673,6 +688,36 @@ def _persist_plan(plan_data: dict) -> None:
         import logging
 
         logging.getLogger(__name__).warning("明日预案落库失败", exc_info=True)
+
+
+def notify_action_digest(db_path: str, asof=None) -> bool:
+    """盘中动作 digest（阶段 C）：priority=1 或已 triggered，无 LLM。"""
+    import datetime as _dt
+
+    from invest.actions.digest import format_digest
+    from invest.actions.persist import update_statuses
+    from invest.actions.query import list_actions
+    from invest.notifier import Notifier
+
+    day = asof or _dt.date.today()
+    conn = connect(db_path)
+    try:
+        try:
+            from invest.intraday import fetch_batch_prices
+
+            rows = list_actions(conn, day)
+            symbols = [r["symbol"] for r in rows]
+            if symbols:
+                prices = fetch_batch_prices(symbols, db_path=db_path)
+                update_statuses(conn, day, prices)
+        except Exception:
+            logger.warning("digest 刷新现价失败", exc_info=True)
+        text = format_digest(list_actions(conn, day))
+    finally:
+        conn.close()
+    if not text:
+        return False
+    return Notifier().send_text(text, key="action_digest", min_interval=5400)
 
 
 def notify_weekend(

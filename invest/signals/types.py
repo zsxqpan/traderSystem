@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-SESSIONS = ("auction", "intraday", "close")
+SESSIONS = ("auction", "intraday", "close", "daily")
+HORIZONS = ("short", "mid")
+LAYERS = ("watch", "discovery", "market")
 SEVERITIES = ("info", "watch", "action")
 
 
@@ -17,3 +19,5 @@ class Signal:
     subject: str
     hint: str
     evidence: dict = field(default_factory=dict)
+    horizon: str = "short"
+    layer: str = "watch"

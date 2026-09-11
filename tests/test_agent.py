@@ -422,6 +422,21 @@ def test_run_section_covers_all_sections():
     print("test_run_section_covers_all_sections OK")
 
 
+def test_run_section_d32_horizon_in_schema():
+    """A7：run_section 描述含 d32/horizon，参数含 horizon/layer/daily。"""
+    from invest.agent.tools import TOOL_SCHEMAS
+
+    fn = next(t["function"] for t in TOOL_SCHEMAS if t["function"]["name"] == "run_section")
+    desc = fn["description"]
+    props = fn["parameters"]["properties"]
+    assert "d32" in desc
+    assert "horizon" in desc
+    assert "horizon" in props
+    assert "layer" in props
+    assert "daily" in (props.get("session") or {}).get("description", "") or "daily" in desc
+    print("test_run_section_d32_horizon_in_schema OK")
+
+
 def test_freshness_gate():
     """2026-08-23：对话守卫——数据滞后时数据工具返回原因而非旧数据；数据新/守卫关时正常。"""
     import datetime as dt
@@ -1732,6 +1747,7 @@ if __name__ == "__main__":
     test_run_skill_uzi_gate()
     test_run_section_tool()
     test_run_section_covers_all_sections()
+    test_run_section_d32_horizon_in_schema()
     test_query_realtime_quote()
     test_query_stock_daily_realtime_patch()
     test_query_lhb()

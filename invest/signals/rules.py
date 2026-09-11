@@ -6,10 +6,15 @@ import statistics
 
 from invest.signals.bars import is_20cm
 from invest.signals.thresholds import (
+    AUCTION_YOY,
+    BOARD_HIGH_OPEN_PCT,
+    BOARD_LOW_OPEN_PCT,
+    BOARD_TOP_N,
     BREADTH_SHIFT,
     COLLECTIVE_MIN,
     COLLECTIVE_SHARE,
     COLLECTIVE_VR,
+    FLOW_SPIKE,
     HIGH_NEAR,
     HIGH_VOL_RATIO,
     KEEP_AMOUNT,
@@ -21,6 +26,8 @@ from invest.signals.thresholds import (
     OUTLIER_PCT,
     OUTLIER_PCT_20CM,
     RET5_HIGH,
+    RS_LEADER_RANK,
+    RS_LEADER_UP,
     SHRINK_DIVERGE,
     SHRINK_EXTREME,
     ZHABAN_HOT,
@@ -123,6 +130,85 @@ def auction_volume_signals(
                 severity="watch", subject_type="stock", subject=sym,
                 hint=f"{names.get(sym, sym)} 高开{pct:+.2f}% 但竞价量/昨量仅{ratio:.1%}，虚高无量",
                 evidence={"ratio": round(ratio, 4), "pct": pct},
+            ))
+    return out
+
+
+def auction_keep_vol_yoy_signals(
+    session: str,
+    watch: list[str],
+    zt: list[dict],
+    quotes: dict[str, dict],
+    yoy_vols: dict[str, float],
+) -> list[Signal]:
+    """今竞价量 / 昨竞价快照量 ≥ AUCTION_YOY。无昨快照则跳过该票。"""
+    out: list[Signal] = []
+    zt_set = {r["symbol"] for r in zt}
+    universe = list(dict.fromkeys(list(watch) + list(zt_set)))
+    for sym in universe:
+        try:
+            yv = float(yoy_vols.get(sym) or 0)
+        except (TypeError, ValueError):
+            yv = 0.0
+        avol = _vol(quotes.get(sym))
+        if yv <= 0 or avol <= 0:
+            continue
+        ratio = avol / yv
+        if ratio >= AUCTION_YOY:
+            out.append(Signal(
+                id="auction_keep_vol_yoy", name="竞价同比保量", session=session,
+                severity="watch", subject_type="stock", subject=sym,
+                hint=f"今竞价量/昨竞价量 {ratio:.1%}",
+                evidence={"ratio": round(ratio, 4), "auction_vol": avol, "yday_auction_vol": yv},
+            ))
+    return out
+
+
+def board_open_vol_signals(session: str, boards: list[dict] | None) -> list[Signal]:
+    """高开/低开放量。boards=None 不出信号、不联网。"""
+    if not boards:
+        return []
+    vol_ranked = sorted(
+        [b for b in boards if isinstance(b, dict) and b.get("symbol")],
+        key=lambda b: float(b.get("vol") or 0),
+        reverse=True,
+    )
+    vol_set = {
+        b["symbol"] for b in vol_ranked[:BOARD_TOP_N] if float(b.get("vol") or 0) > 0
+    }
+    out: list[Signal] = []
+    seen: set[str] = set()
+    for b in boards:
+        if not isinstance(b, dict):
+            continue
+        sym = b.get("symbol")
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        try:
+            pct = float(b.get("pct") or 0)
+        except (TypeError, ValueError):
+            continue
+        try:
+            amount = float(b["amount"]) if b.get("amount") is not None else 0.0
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount < KEEP_AMOUNT and sym not in vol_set:
+            continue
+        name = b.get("name") or sym
+        if pct >= BOARD_HIGH_OPEN_PCT:
+            out.append(Signal(
+                id="board_high_open_vol", name="高开放量", session=session,
+                severity="watch", subject_type="stock", subject=sym, layer="discovery",
+                hint=f"{name} 高开{pct:+.2f}% 放量",
+                evidence={"pct": pct, "amount": amount, "vol": b.get("vol")},
+            ))
+        elif pct <= BOARD_LOW_OPEN_PCT:
+            out.append(Signal(
+                id="board_low_open_vol", name="低开放量", session=session,
+                severity="info", subject_type="stock", subject=sym, layer="discovery",
+                hint=f"{name} 低开{pct:+.2f}% 放量",
+                evidence={"pct": pct, "amount": amount, "vol": b.get("vol")},
             ))
     return out
 
@@ -424,4 +510,165 @@ def etf_signals(session: str, etf_quotes: dict[str, dict] | None) -> list[Signal
             hint=f"{line}（{sig}）",
             evidence={"code": code},
         ))
+    return out
+
+
+def sector_flow_spike_signals(conn) -> list[Signal]:
+    """当日主力净流入 >0 且 ≥ 近 5 日均值 × FLOW_SPIKE。只挂 daily。"""
+    try:
+        dates = [
+            r["date"]
+            for r in conn.execute(
+                "SELECT DISTINCT date FROM sector_fund_flow ORDER BY date DESC"
+            )
+        ]
+    except Exception:
+        return []
+    if not dates:
+        return []
+    today, prev = dates[0], dates[1:6]
+    if not prev:
+        return []
+    out: list[Signal] = []
+    try:
+        today_rows = conn.execute(
+            "SELECT industry, main_net FROM sector_fund_flow WHERE date=?", (today,),
+        ).fetchall()
+    except Exception:
+        return []
+    for r in today_rows:
+        try:
+            net = float(r["main_net"]) if r["main_net"] is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+        if net <= 0:
+            continue
+        prev_vals: list[float] = []
+        for d in prev:
+            try:
+                row = conn.execute(
+                    "SELECT main_net FROM sector_fund_flow WHERE date=? AND industry=?",
+                    (d, r["industry"]),
+                ).fetchone()
+            except Exception:
+                row = None
+            if row and row["main_net"] is not None:
+                try:
+                    prev_vals.append(float(row["main_net"]))
+                except (TypeError, ValueError):
+                    pass
+        if not prev_vals:
+            continue
+        mean = sum(prev_vals) / len(prev_vals)
+        if mean <= 0:
+            continue
+        if net >= mean * FLOW_SPIKE:
+            out.append(Signal(
+                id="sector_flow_spike", name="板块资金放大", session="daily",
+                severity="watch", subject_type="sector", subject=r["industry"],
+                horizon="short", layer="discovery",
+                hint=f"主力净流入{net / 1e8:.1f}亿 ≥ 近{len(prev_vals)}日均{mean / 1e8:.1f}亿×{FLOW_SPIKE:.0f}",
+                evidence={"main_net": net, "mean": round(mean, 2)},
+            ))
+    return out
+
+
+def lianban_ladder_signals(conn, session: str, asof: dt.date) -> list[Signal]:
+    """昨 n-1 今 n 未炸 → promote action；昨涨停今炸/未涨停 → fail watch。"""
+    from invest.signals.bars import compact
+
+    cut = compact(asof)
+    try:
+        today_d = conn.execute(
+            "SELECT MAX(date) AS d FROM limit_up_pool WHERE REPLACE(date,'-','') <= ?",
+            (cut,),
+        ).fetchone()["d"]
+        yday_d = None
+        if today_d:
+            yday_d = conn.execute(
+                "SELECT MAX(date) AS d FROM limit_up_pool WHERE REPLACE(date,'-','') < ?",
+                (compact(today_d),),
+            ).fetchone()["d"]
+        today_rows = conn.execute(
+            "SELECT symbol, name, lianban, zhaban FROM limit_up_pool WHERE date=?",
+            (today_d,),
+        ).fetchall() if today_d else []
+        yday_rows = conn.execute(
+            "SELECT symbol, name, lianban, zhaban FROM limit_up_pool WHERE date=?",
+            (yday_d,),
+        ).fetchall() if yday_d else []
+    except Exception:
+        return []
+    today_map = {r["symbol"]: r for r in today_rows}
+    out: list[Signal] = []
+    for y in yday_rows:
+        if y["zhaban"]:
+            continue
+        ylb = int(y["lianban"] or 0)
+        if ylb < 1:
+            continue
+        t = today_map.get(y["symbol"])
+        t_zb = bool(t and t["zhaban"])
+        t_lb = int(t["lianban"] or 0) if t else 0
+        t_zt = bool(t) and not t_zb
+        name = (t["name"] if t and t["name"] else None) or y["name"] or y["symbol"]
+        if t_zt and t_lb == ylb + 1:
+            out.append(Signal(
+                id="lianban_promote", name="连板晋级", session=session,
+                severity="action", subject_type="stock", subject=y["symbol"],
+                hint=f"{name} 昨{ylb}板→今{t_lb}板",
+                evidence={"from": ylb, "to": t_lb},
+            ))
+        elif t_zb or not t_zt:
+            out.append(Signal(
+                id="lianban_fail", name="连板断板", session=session,
+                severity="watch", subject_type="stock", subject=y["symbol"],
+                hint=f"{name} 昨{ylb}板今{'炸板' if t_zb else '未涨停'}",
+                evidence={"from": ylb, "zhaban": int(t_zb)},
+            ))
+    return out
+
+
+def rs_industry_leader_signals(conn) -> list[Signal]:
+    """短线行业 RS 最新 rank≤8 且较上一 run_date 上升 ≥ RS_LEADER_UP。挂 daily。"""
+    try:
+        dates = [
+            r["run_date"]
+            for r in conn.execute(
+                """SELECT DISTINCT run_date FROM quant_strength
+                   WHERE period='short' AND obj_type='industry'
+                   ORDER BY run_date DESC LIMIT 2"""
+            )
+        ]
+    except Exception:
+        return []
+    if len(dates) < 2:
+        return []
+    today_d, yday_d = dates[0], dates[1]
+
+    def _ranks(day: str) -> dict[str, int]:
+        rows = conn.execute(
+            """SELECT obj FROM quant_strength
+               WHERE period='short' AND obj_type='industry' AND run_date=?
+               ORDER BY rs DESC""",
+            (day,),
+        ).fetchall()
+        return {r["obj"]: i + 1 for i, r in enumerate(rows)}
+
+    today_r, yday_r = _ranks(today_d), _ranks(yday_d)
+    out: list[Signal] = []
+    for obj, rk in today_r.items():
+        if rk > RS_LEADER_RANK:
+            continue
+        prev = yday_r.get(obj)
+        if prev is None:
+            continue
+        if prev - rk >= RS_LEADER_UP:
+            out.append(Signal(
+                id="rs_industry_leader", name="行业RS跃升", session="daily",
+                severity="watch", subject_type="sector", subject=obj,
+                horizon="short", layer="discovery",
+                hint=f"短线RS名次 {prev}→{rk}，进入前{RS_LEADER_RANK}",
+                evidence={"rank": rk, "prev_rank": prev},
+            ))
     return out

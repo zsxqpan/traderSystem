@@ -28,9 +28,9 @@ SKILL = {
     "name": "盘后日报",
     "kind": "report",
     "description": "盘后日报（盘中PLUS）：盘面总览(含ETF)/盘中观点复盘/重要板块总分析/明日预案+质量复盘",
-    "uses": ["d1_news_block", "d16_card_alerts", "d17_pool_delta", "d21_freshness",
-             "d12_limit_up_ladder", "d13_fund_line", "d28_community_hot", "d29_sector_resonance",
-             "d32_trade_signals"],
+    "uses": ["d1_news_block", "d10_action_guide", "d16_card_alerts", "d17_pool_delta",
+             "d21_freshness", "d12_limit_up_ladder", "d13_fund_line", "d28_community_hot",
+             "d29_sector_resonance", "d32_trade_signals", "d33_daily_actions"],
     "params": {
         "db_path": "str, required",
         "agent_text": "str, optional, default ''（兼容旧调用，新结构未使用）",
@@ -174,15 +174,17 @@ def _today_actual_text(conn) -> str:
 
 
 def _holdings_text(db_path: str) -> str:
-    """关注/持仓股（cards + 候选池 core）最新收盘。"""
+    """关注/持仓股：代码 + 收盘 + cards 价位字段。"""
     conn = connect(db_path)
     try:
-        symbols = [r["symbol"] for r in conn.execute(
-            "SELECT symbol FROM cards WHERE status IN ('locked','review')"
-        ).fetchall()]
+        cards = {r["symbol"]: dict(r) for r in conn.execute(
+            "SELECT symbol, entry_range, stop_loss, target, falsify FROM cards "
+            "WHERE status IN ('locked','review')"
+        )}
+        symbols = list(cards)
         symbols += [r["symbol"] for r in conn.execute(
             "SELECT symbol FROM candidate_pool WHERE level='core' AND out_date IS NULL"
-        ).fetchall()]
+        )]
         symbols = list(dict.fromkeys(symbols))
         lines = []
         for s in symbols:
@@ -191,7 +193,17 @@ def _holdings_text(db_path: str) -> str:
                 "ORDER BY REPLACE(date,'-','') DESC LIMIT 1", (s,),
             ).fetchone()
             price = f"{row['close']:.2f}" if row and row["close"] is not None else "?"
-            lines.append(f"{s}({price})")
+            card = cards.get(s) or {}
+            bits = [price]
+            if card.get("entry_range"):
+                bits.append(f"入{card['entry_range']}")
+            if card.get("stop_loss") is not None:
+                bits.append(f"止{card['stop_loss']}")
+            if card.get("target") is not None:
+                bits.append(f"标{card['target']}")
+            if card.get("falsify"):
+                bits.append(f"证伪:{card['falsify']}")
+            lines.append(f"{s}({' '.join(bits)})")
         return " ".join(lines) if lines else ""
     finally:
         conn.close()
@@ -234,12 +246,14 @@ def _plan_history(conn) -> list[dict]:
             f"{p.get('name', '')}" + (f"({p.get('symbol', '')})" if p.get("symbol") else "")
             for p in picks
         ) or "无推荐"
-        # 次日实际：推荐股涨跌
+        # 次日实际：picks + plans 标的涨跌
         actual = []
-        for p in picks:
+        seen_sym: set[str] = set()
+        for p in list(picks) + list(plan.get("plans") or []):
             sym = (p.get("symbol") or "").strip()
-            if not sym or nxt is None:
+            if not sym or nxt is None or sym in seen_sym:
                 continue
+            seen_sym.add(sym)
             row = conn.execute(
                 "SELECT close FROM daily_bars WHERE symbol=? AND date=?", (sym, nxt.isoformat()),
             ).fetchone()
@@ -273,7 +287,7 @@ def render(db_path: str, agent_text: str = "") -> dict:
         conn.close()
     sections.append({
         "type": "text",
-        "text": f"**【A股投资系统 · 盘后日报】**\n数据截至: {freshness}",
+        "text": f"**【A股投资系统 · 盘后日报】**\n\n数据截至: {freshness}",
     })
 
     # ---- 点1 盘面总览（指数 + ETF 分析） ----
@@ -318,14 +332,35 @@ def render(db_path: str, agent_text: str = "") -> dict:
     sigs: list = []
     sig_text = ""
     try:
-        from invest.signals.format import format_signals, signal_section
+        from invest.signals.format import (
+            format_mid_quadrants,
+            format_signals,
+            rows_to_signals,
+            signal_section,
+        )
+        from invest.signals.query import list_signals
         from invest.signals.scan import scan_db
+        from invest.signals.thresholds import DISPLAY_A3
 
-        sigs = scan_db(db_path, "close")
-        sig_text = format_signals(sigs)
-        blk = signal_section(sigs)
+        sigs = scan_db(db_path, "close", persist=True, limit=DISPLAY_A3)
+        short_text = format_signals(sigs, limit=DISPLAY_A3)
+        blk = signal_section(sigs, limit=DISPLAY_A3)
         if blk:
             sections.append(blk)
+        conn_m = connect(db_path)
+        try:
+            mid_rows = list_signals(conn_m, horizon="mid", session="daily", limit=200)
+        finally:
+            conn_m.close()
+        mid_sigs = rows_to_signals(mid_rows)
+        quad = format_mid_quadrants(mid_sigs)
+        if quad:
+            title, _, rest = quad.partition("\n")
+            sections.append({
+                "type": "text",
+                "text": f"**{title}**\n{rest}" if rest else f"**{title}**",
+            })
+        sig_text = "\n".join(x for x in (short_text, quad) if x)
     except Exception:
         sigs, sig_text = [], ""
 
@@ -346,6 +381,17 @@ def render(db_path: str, agent_text: str = "") -> dict:
         for l in (review.get("lessons") or []):
             lines.append(f"  · 经验: {l}")
         sections.append({"type": "text", "text": "**【点2 盘中观点复盘】**\n" + "\n".join(lines)})
+        try:
+            from invest.actions.persist import persist_lessons
+
+            conn_r = connect(db_path)
+            try:
+                persist_lessons(conn_r, dt.date.today(), "intraday",
+                                list(review.get("lessons") or []))
+            finally:
+                conn_r.close()
+        except Exception:
+            pass
     elif views_text:
         sections.append({
             "type": "text",
@@ -393,21 +439,74 @@ def render(db_path: str, agent_text: str = "") -> dict:
     elif etf_sector:
         sections.append({"type": "text", "text": "**【点3 板块ETF数据】**\n" + etf_sector})
 
-    # ---- 点4 明日预案（推荐 + 操作预案 + 质量复盘） ----
+    # ---- 点4 明日动作表 + 预案专栏 + 质量复盘 ----
     summary = "\n".join(
         s.get("text", "") for s in sections if s.get("type") == "text"
     )[:1500]
     holdings = _holdings_text(db_path)
+    asof = dt.date.today()
+    for_date = _next_trading_day(asof) or (asof + dt.timedelta(days=1))
     conn = connect(db_path)
     try:
         history = _plan_history(conn)
+        from invest.actions.format import format_actions
+        from invest.actions.persist import list_lessons
+        from invest.report import _action_guide
+
+        draft_text = ""
+        lessons_txt = ""
+        try:
+            from invest.actions.compose import compose
+
+            draft = compose(conn, asof, for_date=for_date)
+            draft_text = format_actions(draft)
+        except Exception:
+            draft = []
+        lessons_txt = "；".join(x["body"] for x in list_lessons(conn, asof=asof))
+        score_row = conn.execute(
+            "SELECT score FROM quant_temperature ORDER BY run_date DESC LIMIT 1"
+        ).fetchone()
+        score = float(score_row["score"]) if score_row and score_row["score"] is not None else None
+        guide = _action_guide(conn, score)
+        if guide:
+            sections.append({"type": "text", "text": f"📌 今日操作: {guide}"})
     finally:
         conn.close()
     plan = _daily_llm.plan_gen_llm(db_path, {
         "summary": summary, "holdings": holdings,
         "plan_history": json.dumps(history, ensure_ascii=False)[:800],
         "signals_text": sig_text,
+        "actions_text": draft_text,
+        "lessons_text": lessons_txt,
     })
+    merged = []
+    try:
+        from invest.actions.compose import compose
+        from invest.actions.format import action_table
+        from invest.actions.persist import persist_actions
+
+        conn_a = connect(db_path)
+        try:
+            merged = compose(conn_a, asof, for_date=for_date, llm_plan=plan)
+            persist_actions(conn_a, merged, for_date)
+            try:
+                from invest.actions.watch import expire_due, maybe_open_from_actions
+
+                expire_due(conn_a, asof)
+                maybe_open_from_actions(conn_a, for_date)
+            except Exception:
+                pass
+        finally:
+            conn_a.close()
+        tbl = action_table(merged, title="明日动作（规则）")
+        if tbl:
+            sections.append(tbl)
+            sections.append({
+                "type": "text",
+                "text": "警戒=价位触达告警；动作表=明日清单",
+            })
+    except Exception:
+        merged = []
     if plan.get("direction") or plan.get("picks") or plan.get("plans"):
         plines = [f"**明日主线**: {plan.get('direction', '')}"]
         for p in (plan.get("picks") or []):
@@ -433,6 +532,16 @@ def render(db_path: str, agent_text: str = "") -> dict:
                 "type": "text",
                 "text": "**【预案质量复盘（近 N 日）】**（LLM 失败，直列）\n" + "\n".join(hlines),
             })
+        try:
+            from invest.actions.persist import persist_lessons
+
+            conn_l = connect(db_path)
+            try:
+                persist_lessons(conn_l, asof, "plan", list(pv.get("fixes") or []))
+            finally:
+                conn_l.close()
+        except Exception:
+            pass
 
     # ---- 尾部保留：持仓警戒 / 消息面 / 候选池变化 ----
     conn = connect(db_path)

@@ -49,7 +49,8 @@ def test_scheduler_jobs():
     # 2026-08-18 合并盘后报告：nightly/p2_brief → evening_report（数据滞后时跳过并推送原因）
     assert {"premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend",
             "intraday_tick", "monthly", "yearly", "industry_refresh", "daily_refresh",
-            "factcard_refresh", "evening_report", "pool_trap_scan", "compensation_scan"} <= ids
+            "factcard_refresh", "evening_report", "pool_trap_scan", "compensation_scan",
+            "action_digest_am", "action_digest_pm", "big_v_harvest"} <= ids
     assert "p2_brief" not in ids and "nightly" not in ids
     print("test_scheduler_jobs OK")
 
@@ -82,6 +83,7 @@ def test_ticker_only_and_job_funcs():
     assert set(JOB_FUNCS) == {
         "premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend", "monthly",
         "yearly", "industry_refresh", "daily_refresh", "factcard_refresh", "evening_report", "pool_trap_scan",
+        "action_digest", "action_digest_pm", "big_v_harvest",
     }
     assert set(JOB_COMPENSATION_WINDOWS) == set(JOB_SLOTS) == set(JOB_FUNCS)
     print("test_ticker_only_and_job_funcs OK")
@@ -355,6 +357,46 @@ def test_notify_messages_no_crash():
         assert notify_morning_brief(p) is True
         assert m2.return_value.send_text.call_args.kwargs.get("feishu") is False
     print("test_notify_messages_no_crash OK")
+
+
+def test_notify_auction_reuses_a7_quotes_boards():
+    """notify_auction 用 a7 已拉的 quotes/boards persist，避免二次空扫。"""
+    import importlib
+
+    from invest.pipeline import notify_auction
+    from invest.scheduler import JobResult
+
+    seen: dict = {}
+    scan_mod = importlib.import_module("invest.signals.scan")
+    fake_struct = {
+        "title": "竞价", "sections": [{"type": "text", "text": "ok"}], "views": {},
+        "signal_meta": {
+            "quotes": {"600519": {"vol": 1}},
+            "boards": [{"symbol": "600519", "pct": 4.0}],
+        },
+    }
+
+    def _scan(db_path, session, **kw):
+        seen["session"] = session
+        seen["persist"] = kw.get("persist")
+        seen["boards"] = kw.get("boards")
+        seen["quotes"] = kw.get("quotes")
+        return []
+
+    def _deliver(skill_id, db_path, send_fn=None, **kw):
+        if send_fn:
+            send_fn(fake_struct)
+        return JobResult.ok("ok", artifact="a7_auction")
+
+    with mock.patch("invest.skills.report_pipeline.deliver_report", side_effect=_deliver), \
+         mock.patch.object(scan_mod, "scan_db", side_effect=_scan), \
+         mock.patch("invest.pipeline._persist_auction_views"), \
+         mock.patch("invest.pipeline._send_structured", return_value=True):
+        assert notify_auction("/tmp/invest_auction_meta.db") is True
+    assert seen.get("session") == "auction"
+    assert seen.get("persist") is True
+    assert seen.get("boards")[0]["symbol"] == "600519"
+    assert "600519" in (seen.get("quotes") or {})
 
 
 

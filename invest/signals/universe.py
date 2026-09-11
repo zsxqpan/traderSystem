@@ -5,6 +5,12 @@ import datetime as dt
 import sqlite3
 
 from invest.signals.bars import compact
+from invest.signals.thresholds import (
+    DISCOVERY_STOCK_CAP,
+    LHB_DISCOVERY_CAP,
+    RS_CORE_PER_INDUSTRY,
+    RS_INDUSTRY_TOP,
+)
 
 
 def watch_symbols(conn: sqlite3.Connection) -> list[str]:
@@ -25,6 +31,24 @@ def watch_symbols(conn: sqlite3.Connection) -> list[str]:
     except Exception:
         pass
     return syms
+
+
+def assign_layer(
+    subject_type: str,
+    subject: str,
+    watch: set[str],
+    discovery: set[str],
+) -> str:
+    """按标的类型与宇宙推断 layer：market / watch / discovery。"""
+    if subject_type in ("market", "etf"):
+        return "market"
+    if subject_type == "sector":
+        return "discovery"
+    if subject in watch:
+        return "watch"
+    if subject in discovery:
+        return "discovery"
+    return "discovery"
 
 
 def _latest_zt_date(conn: sqlite3.Connection, asof: dt.date) -> str | None:
@@ -82,6 +106,9 @@ def hot_sector_cores(
             vol_map[r["symbol"]] = float(row["volume"]) if row and row["volume"] else 0.0
         except Exception:
             vol_map[r["symbol"]] = 0.0
+    from invest.data.industry_map import industry_of, load_industry_stocks
+
+    mapping = load_industry_stocks()
     try:
         from invest.data.auction import fetch_industries
 
@@ -90,7 +117,11 @@ def hot_sector_cores(
         ind_map = {}
     blocks: dict[str, list] = {}
     for r in rows:
-        ind = ind_map.get(r["symbol"]) or "其他"
+        # 未知行业不得并进「其他」：否则无关昨涨停会被当成同一板块集体放量。
+        ind = industry_of(conn, r["symbol"], mapping) or ind_map.get(r["symbol"]) or ""
+        ind = str(ind).strip()
+        if not ind or ind == "其他":
+            continue
         item = dict(r)
         item["volume"] = vol_map.get(r["symbol"], 0.0)
         blocks.setdefault(ind, []).append(item)
@@ -100,3 +131,154 @@ def hot_sector_cores(
         stocks.sort(key=lambda s: -s.get("volume", 0.0))
         out.append({"block": ind, "count": len(stocks), "stocks": stocks[:per_block]})
     return out
+
+
+def discovery_cap_ok(symbols) -> None:
+    """发现层股票上限断言（测试/自检用）。"""
+    assert len(list(symbols)) <= DISCOVERY_STOCK_CAP
+
+
+def lhb_symbols(conn: sqlite3.Connection, cap: int = LHB_DISCOVERY_CAP) -> list[str]:
+    """最新龙虎日 DISTINCT symbol，上限 cap。无表/空返回 []。"""
+    try:
+        row = conn.execute("SELECT MAX(date) AS d FROM dragon_tiger").fetchone()
+        if not row or not row["d"]:
+            return []
+        rows = conn.execute(
+            """SELECT symbol, MAX(ABS(COALESCE(net, 0))) AS mag
+               FROM dragon_tiger WHERE date=?
+               GROUP BY symbol ORDER BY mag DESC LIMIT ?""",
+            (row["d"], cap),
+        ).fetchall()
+        return [r["symbol"] for r in rows if r["symbol"]]
+    except Exception:
+        return []
+
+
+def rs_core_symbols(
+    conn: sqlite3.Connection,
+    asof: dt.date,
+    mapping: dict | None = None,
+    per_industry: int = RS_CORE_PER_INDUSTRY,
+) -> list[str]:
+    """短线 RS TOP 行业的映射内核心股，按最近一日 amount 取 per_industry 只。
+
+    映射为空的行业跳过，不退回全市场 daily_bars。
+    """
+    from invest.data.industry_map import load_industry_stocks, stocks_of
+
+    m = mapping if mapping is not None else load_industry_stocks()
+    try:
+        latest = conn.execute(
+            """SELECT MAX(run_date) AS d FROM quant_strength
+               WHERE period='short' AND obj_type='industry'"""
+        ).fetchone()["d"]
+    except Exception:
+        return []
+    if not latest:
+        return []
+    try:
+        industries = conn.execute(
+            """SELECT obj FROM quant_strength
+               WHERE period='short' AND obj_type='industry' AND run_date=?
+               ORDER BY rs DESC LIMIT ?""",
+            (latest, RS_INDUSTRY_TOP),
+        ).fetchall()
+    except Exception:
+        return []
+    cut = compact(asof)
+    out: list[str] = []
+    for r in industries:
+        ind = r["obj"]
+        mapped = stocks_of(ind, m)
+        if not mapped:
+            continue
+        pool_syms: list[str] = []
+        try:
+            pool_syms = [
+                str(x["symbol"])
+                for x in conn.execute(
+                    "SELECT symbol FROM candidate_pool "
+                    "WHERE industry=? AND out_date IS NULL",
+                    (ind,),
+                )
+            ]
+        except Exception:
+            pass
+        cands = list(dict.fromkeys(list(mapped) + pool_syms))
+        scored: list[tuple[float, str]] = []
+        for sym in cands:
+            try:
+                row = conn.execute(
+                    """SELECT amount, volume FROM daily_bars
+                       WHERE symbol=? AND REPLACE(date,'-','') <= ?
+                       ORDER BY REPLACE(date,'-','') DESC LIMIT 1""",
+                    (sym, cut),
+                ).fetchone()
+            except Exception:
+                row = None
+            amt = 0.0
+            if row:
+                raw = row["amount"] if row["amount"] is not None else row["volume"]
+                try:
+                    amt = float(raw or 0)
+                except (TypeError, ValueError):
+                    amt = 0.0
+            scored.append((amt, sym))
+        scored.sort(key=lambda kv: -kv[0])
+        for _, sym in scored[:per_industry]:
+            if sym not in out:
+                out.append(sym)
+    return out
+
+
+def discovery_symbols(
+    conn: sqlite3.Connection,
+    asof: dt.date,
+    *,
+    boards: list[dict] | None = None,
+    cap: int = DISCOVERY_STOCK_CAP,
+    hot: list[dict] | None = None,
+) -> list[str]:
+    """昨涨停 ∪ 热门板块核心 ∪ boards ∪ RS 核心 ∪ 龙虎。去重，截断 cap。
+
+    RS 核心与龙虎优先保留：涨停日 ≥cap 时不能把发现宇宙截成纯涨停基因。
+    hot 传入则不再重算热门核心（scan 已算过一遍）。
+    """
+    must: list[str] = []
+    filler: list[str] = []
+    seen: set[str] = set()
+
+    def _add(dest: list[str], sym: str | None) -> None:
+        if not sym or sym in seen:
+            return
+        seen.add(sym)
+        dest.append(sym)
+
+    for s in rs_core_symbols(conn, asof):
+        _add(must, s)
+    for s in lhb_symbols(conn):
+        _add(must, s)
+    if len(must) > cap:
+        must = must[:cap]
+        return must
+
+    for r in yesterday_zt(conn, asof):
+        _add(filler, r.get("symbol"))
+    for block in (hot if hot is not None else hot_sector_cores(conn, asof)):
+        for s in block.get("stocks") or []:
+            _add(filler, s.get("symbol"))
+    for b in boards or []:
+        if isinstance(b, dict):
+            _add(filler, b.get("symbol"))
+    room = cap - len(must)
+    return must + filler[:room]
+
+
+def quote_symbols(
+    conn: sqlite3.Connection,
+    asof: dt.date,
+    boards: list[dict] | None = None,
+) -> list[str]:
+    """watch ∪ discovery，盘中/竞价批量行情覆盖范围。"""
+    return list(dict.fromkeys(watch_symbols(conn) + discovery_symbols(conn, asof, boards=boards)))

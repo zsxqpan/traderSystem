@@ -53,18 +53,103 @@ def load_latest_movers(db: str) -> pd.DataFrame:
     )
 
 
-def load_crowding_vs_strength(db: str) -> pd.DataFrame:
-    """拥挤度 × 相对强度散点数据（最新快照）。"""
-    return _read(
-        db,
-        """SELECT s.obj, s.rs, s.trend_stage, v.crowding
+_SCATTER_SQL = """SELECT s.obj, s.rs, s.trend_stage, v.crowding, v.crowding_state,
+                  (SELECT ts.signal_id FROM trade_signals ts
+                   WHERE ts.session='daily' AND ts.signal_id LIKE 'quad_%'
+                     AND ts.subject = s.obj
+                     AND ts.date = (SELECT MAX(date) FROM trade_signals WHERE session='daily')
+                   LIMIT 1) AS quad_id
            FROM quant_strength s
            JOIN quant_valuation v ON v.obj = s.obj
            WHERE s.period='short' AND s.obj_type='industry'
              AND s.run_date = (SELECT MAX(run_date) FROM quant_strength WHERE period='short' AND obj_type='industry')
              AND v.run_date = (SELECT MAX(run_date) FROM quant_valuation)
            ORDER BY s.rs DESC"""
+
+_SCATTER_SQL_NO_SIG = """SELECT s.obj, s.rs, s.trend_stage, v.crowding, v.crowding_state,
+                  CAST(NULL AS TEXT) AS quad_id
+           FROM quant_strength s
+           JOIN quant_valuation v ON v.obj = s.obj
+           WHERE s.period='short' AND s.obj_type='industry'
+             AND s.run_date = (SELECT MAX(run_date) FROM quant_strength WHERE period='short' AND obj_type='industry')
+             AND v.run_date = (SELECT MAX(run_date) FROM quant_valuation)
+           ORDER BY s.rs DESC"""
+
+
+def load_crowding_vs_strength(db: str) -> pd.DataFrame:
+    """拥挤度 × 相对强度散点数据（最新快照）。含 crowding_state 与当日 quad_id。缺表不炸。"""
+    empty = pd.DataFrame(columns=["obj", "rs", "trend_stage", "crowding", "crowding_state", "quad_id"])
+    try:
+        return _read(db, _SCATTER_SQL)
+    except Exception:
+        try:
+            return _read(db, _SCATTER_SQL_NO_SIG)
+        except Exception:
+            return empty
+
+
+_SIGNAL_COLS = [
+    "date", "session", "horizon", "layer", "severity",
+    "signal_id", "name", "subject", "hint", "evidence",
+]
+
+
+def load_signals(
+    db: str,
+    *,
+    asof=None,
+    horizon: str | None = None,
+    session: str | None = None,
+    layer: str | None = None,
+    severity: str | None = None,
+    limit: int = 200,
+    days: int | None = None,
+) -> pd.DataFrame:
+    """封装 list_signals → DataFrame。days 有值时取最近 N 个自然日。"""
+    import datetime as dt
+
+    from invest.signals.query import list_signals
+
+    conn = connect(db)
+    try:
+        asof_d = asof
+        if isinstance(asof_d, str) and asof_d:
+            asof_d = dt.date.fromisoformat(asof_d[:10])
+        date_from = None
+        if days:
+            if asof_d is None:
+                try:
+                    row = conn.execute("SELECT MAX(date) AS d FROM trade_signals").fetchone()
+                    raw = row["d"] if row else None
+                    asof_d = dt.date.fromisoformat(str(raw)[:10]) if raw else None
+                except Exception:
+                    return pd.DataFrame(columns=_SIGNAL_COLS)
+            if asof_d is not None:
+                date_from = asof_d - dt.timedelta(days=int(days) - 1)
+        rows = list_signals(
+            conn,
+            asof_d,
+            horizon=horizon,
+            session=session,
+            layer=layer,
+            severity=severity,
+            limit=limit,
+            date_from=date_from,
+        )
+    except Exception:
+        return pd.DataFrame(columns=_SIGNAL_COLS)
+    finally:
+        conn.close()
+    if not rows:
+        return pd.DataFrame(columns=_SIGNAL_COLS)
+    df = pd.DataFrame(rows)
+    for c in _SIGNAL_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df["evidence"] = df["evidence"].map(
+        lambda x: x if isinstance(x, str) else ("" if x is None else str(x))
     )
+    return df[_SIGNAL_COLS]
 
 
 def load_rotation_history(db: str) -> pd.DataFrame:
@@ -154,6 +239,55 @@ def load_macro(db: str) -> pd.DataFrame:
     return _read(db, "SELECT date, indicator, value FROM quant_macro ORDER BY date DESC, indicator")
 
 
+_BIGV_COLS = [
+    "id", "name", "xueqiu_id", "homepage", "watched",
+    "last_harvest_at", "last_harvest_new", "last_harvest_error",
+    "backfill_done", "persona_updated_at", "n_opinions",
+]
+
+
+def load_bigv_profiles(db: str) -> pd.DataFrame:
+    try:
+        return _read(
+            db,
+            """SELECT p.id, p.name, p.xueqiu_id, p.homepage, p.watched,
+                      p.last_harvest_at, p.last_harvest_new, p.last_harvest_error,
+                      p.backfill_done, p.persona_updated_at,
+                      (SELECT COUNT(*) FROM big_v_opinion o WHERE o.profile_id=p.id) AS n_opinions
+               FROM big_v_profile p
+               WHERE p.watched=1
+               ORDER BY p.name COLLATE NOCASE""",
+        )
+    except Exception:
+        return pd.DataFrame(columns=_BIGV_COLS)
+
+
+def register_bigv(db: str, name: str, xueqiu: str) -> dict:
+    from invest.bigv.watch import register
+
+    try:
+        conn = connect(db)
+        try:
+            return register(conn, name=name, xueqiu=xueqiu)
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def ask_bigv(db: str, profile_id: str, question: str, mode: str = "grounded") -> dict:
+    from invest.bigv.ask import ask_big_v
+
+    try:
+        conn = connect(db)
+        try:
+            return ask_big_v(conn, profile_id=profile_id, question=question, mode=mode)
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"error": str(exc), "answer": ""}
+
+
 def load_viewpoints(db: str, status: str | None = None, limit: int = 100) -> pd.DataFrame:
     sql = "SELECT id, source, obj, conclusion, period_tag, confidence, status, valid_until, created_at FROM viewpoints"
     args: list = []
@@ -175,6 +309,47 @@ def load_accuracy(db: str) -> pd.DataFrame:
     if df.empty:
         df = pd.DataFrame(columns=["group", "verified", "invalidated", "accuracy"])
     return df
+
+
+def load_actions(db: str, asof=None) -> pd.DataFrame:
+    """动作清单只读。缺表返回空表。"""
+    from invest.actions.query import list_actions
+
+    cols = [
+        "date", "symbol", "verb", "priority", "source", "entry_lo", "entry_hi",
+        "stop_loss", "target", "status", "hint", "position_hint",
+    ]
+    conn = connect(db)
+    try:
+        rows = list_actions(conn, asof)
+    finally:
+        conn.close()
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[cols]
+
+
+def load_watch(db: str, status: str = "open") -> pd.DataFrame:
+    """观察名单只读。缺表返回空表。"""
+    from invest.actions.watch import list_watch
+
+    cols = ["symbol", "source", "reason", "status", "in_date", "expire_date"]
+    conn = connect(db)
+    try:
+        rows = list_watch(conn, status=status)
+    finally:
+        conn.close()
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[cols]
 
 
 def load_pool(db: str) -> pd.DataFrame:
@@ -199,6 +374,27 @@ def load_backtests(db: str) -> pd.DataFrame:
 
 def load_jobs(db: str, limit: int = 20) -> pd.DataFrame:
     return _read(db, "SELECT job, status, started_at, finished_at FROM job_runs ORDER BY id DESC LIMIT ?", (limit,))
+
+
+_REPORT_JOBS = (
+    "morning_brief", "auction", "evening_report", "premarket",
+    "action_digest", "action_digest_pm",
+)
+
+
+def load_report_jobs(db: str, limit: int = 12) -> pd.DataFrame:
+    """报告/推送类任务最近留痕（含 detail，供数据状态页回看）。"""
+    marks = ",".join("?" * len(_REPORT_JOBS))
+    try:
+        return _read(
+            db,
+            f"""SELECT job, status, started_at, finished_at, detail
+                FROM job_runs WHERE job IN ({marks})
+                ORDER BY id DESC LIMIT ?""",
+            (*_REPORT_JOBS, limit),
+        )
+    except Exception:
+        return pd.DataFrame(columns=["job", "status", "started_at", "finished_at", "detail"])
 
 
 def load_coverage(db: str) -> pd.DataFrame:

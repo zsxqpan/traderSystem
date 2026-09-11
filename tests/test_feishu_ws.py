@@ -822,3 +822,69 @@ def test_install_frame_hook_failure_degrades_gracefully():
         pass
 
     assert feishu_ws._install_frame_hook(NoHook()) is False
+
+
+def test_agent_reply_bigv_short_circuits_before_intent(monkeypatch):
+    """/大V 必须在 classify_intent / run_chat 之前本地拦截。"""
+    sent: list[str] = []
+
+    class _Conn:
+        def close(self):
+            return None
+
+    monkeypatch.setattr("invest.push.feishu_push.send_message",
+                        lambda *a, **k: sent.append(a[2] if len(a) > 2 else ""))
+    monkeypatch.setattr("invest.db.connect", lambda *a, **k: _Conn())
+    monkeypatch.setattr("invest.bigv.route.try_feishu", lambda conn, text: "大V有据回答")
+
+    def _boom(text):
+        raise AssertionError(f"不应再走意图识别: {text}")
+
+    monkeypatch.setattr("invest.agent.agents.classify_intent", _boom)
+    feishu_ws._agent_reply("oc_test", "/大V 段永平 茅台怎么看", "ou_owner", chat_type="p2p")
+    assert sent == ["大V有据回答"]
+
+
+def test_agent_reply_bigv_command_error_does_not_fall_through(monkeypatch):
+    """口令 /大V 在分流异常时必须失败提示，不能掉进普通闲聊。"""
+    sent: list[str] = []
+
+    class _Boom:
+        def close(self):
+            return None
+
+    monkeypatch.setattr("invest.push.feishu_push.send_message",
+                        lambda *a, **k: sent.append(a[2] if len(a) > 2 else ""))
+    monkeypatch.setattr("invest.db.connect", lambda *a, **k: _Boom())
+
+    def _raise(*a, **k):
+        raise RuntimeError("fts down")
+
+    monkeypatch.setattr("invest.bigv.route.try_feishu", _raise)
+
+    def _boom(text):
+        raise AssertionError(f"口令失败不应走意图: {text}")
+
+    monkeypatch.setattr("invest.agent.agents.classify_intent", _boom)
+    feishu_ws._agent_reply("oc_test", "/大V 段永平 茅台怎么看", "ou_owner", chat_type="p2p")
+    assert sent and "不可用" in sent[0]
+
+
+def test_agent_reply_nl_unmatched_falls_through(monkeypatch):
+    """口语未点中名单时 try_feishu 返回 None，应继续普通分流。"""
+    classified: list[str] = []
+    monkeypatch.setattr("invest.push.feishu_push.send_message", lambda *a, **k: None)
+
+    class _Conn:
+        def close(self):
+            return None
+
+    monkeypatch.setattr("invest.db.connect", lambda *a, **k: _Conn())
+    monkeypatch.setattr("invest.bigv.route.try_feishu", lambda conn, text: None)
+    monkeypatch.setattr(
+        "invest.agent.agents.classify_intent",
+        lambda text: classified.append(text) or "chat",
+    )
+    monkeypatch.setattr("invest.agent.agents.run_chat", lambda *a, **k: "普通回答")
+    feishu_ws._agent_reply("oc_test", "今天天气如何", "ou_owner", chat_type="p2p")
+    assert classified == ["今天天气如何"]

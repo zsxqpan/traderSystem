@@ -3,7 +3,8 @@
 用法: myenv\\Scripts\\python.exe -u scripts/run_job.py <job_name>
 可选 job: premarket | morning_brief | auction | snapshot_close | after_close
           | pool_trap_scan | weekend | monthly | yearly | industry_refresh
-          | daily_refresh | factcard_refresh | evening_report
+          | daily_refresh | factcard_refresh | evening_report | action_digest
+          | action_digest_pm | big_v_harvest
 
 每次运行只执行一个任务（job_executions 持久幂等 + job_runs 兼容留痕）。
 业务返回 False、推送失败、执行异常或 missed 均返回非零；竞价仅在

@@ -11,6 +11,12 @@
   plan close <plan_id>
   trade add <plan_id> <buy|sell> <price> <qty> [--emotion ...]
   risk check <plan_id> <price>
+  watch add <symbol> [--reason ...]
+  watch list
+  watch dismiss <symbol>
+  watch promote <symbol> [--level track|core|rest]
+  action done <date> <symbol>
+  action skip <date> <symbol>
 """
 from __future__ import annotations
 
@@ -93,6 +99,33 @@ def main() -> None:
             from invest.discipline.risk import check_stop_loss
             plan = conn.execute("SELECT * FROM trade_plans WHERE id=?", (int(args[2]),)).fetchone()
             print("止损触发:", check_stop_loss(dict(plan), float(args[3])) if plan else "计划不存在")
+        elif cmd == "watch" and len(args) >= 3 and args[1] == "add":
+            from invest.actions.watch import add_watch
+            rest = args[2:]
+            kwargs = {}
+            if "--reason" in rest:
+                kwargs["reason"] = rest[rest.index("--reason") + 1]
+            print(add_watch(conn, rest[0], source="user", **kwargs))
+        elif cmd == "watch" and len(args) >= 2 and args[1] == "list":
+            from invest.actions.watch import list_watch
+            for w in list_watch(conn):
+                print(w["symbol"], w["source"], w["status"], w.get("reason") or "")
+        elif cmd == "watch" and len(args) >= 3 and args[1] == "dismiss":
+            from invest.actions.watch import dismiss_watch
+            dismiss_watch(conn, args[2])
+            print("dismissed")
+        elif cmd == "watch" and len(args) >= 3 and args[1] == "promote":
+            from invest.actions.watch import promote_watch
+            rest = args[2:]
+            level = "track"
+            if "--level" in rest:
+                level = rest[rest.index("--level") + 1]
+            print(promote_watch(conn, rest[0], level=level))
+        elif cmd == "action" and len(args) >= 4 and args[1] in ("done", "skip"):
+            from invest.actions.persist import mark_action
+            status = "done" if args[1] == "done" else "skipped"
+            mark_action(conn, args[2], args[3], status)
+            print(status)
         else:
             print(__doc__)
     finally:

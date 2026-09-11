@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 21
 
 SCHEMA_SQL = """
 -- ============ 行情 ============
@@ -462,7 +462,15 @@ CREATE TABLE IF NOT EXISTS big_v_profile (
     track_record TEXT,                     -- 历史战绩/里程碑（文本或 JSON）
     source_links TEXT,                     -- 公开资料链接（JSON 数组文本）
     notes       TEXT,
-    updated_at  TEXT
+    updated_at  TEXT,
+    watched     INTEGER NOT NULL DEFAULT 0,
+    persona_card TEXT,
+    persona_updated_at TEXT,
+    last_harvest_at TEXT,
+    last_harvest_new INTEGER,
+    last_harvest_error TEXT,
+    backfill_cursor TEXT,
+    backfill_done INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS big_v_opinion (
@@ -475,6 +483,7 @@ CREATE TABLE IF NOT EXISTS big_v_opinion (
     bias         TEXT,                     -- bullish / bearish / neutral
     confidence   REAL,                     -- 0-1，可空
     url          TEXT,                     -- 原文链接
+    body         TEXT,                     -- 全文（2026-09-09 大V画像库）
     collected_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_big_v_opinion_profile ON big_v_opinion(profile_id, opinion_date);
@@ -548,10 +557,10 @@ CREATE TABLE IF NOT EXISTS comparison_records (
 );
 CREATE INDEX IF NOT EXISTS idx_comparison_as_of ON comparison_records(as_of);
 
--- ============ 短线交易信号（2026-09-03） ============
+-- ============ 短线/中线交易信号（horizon/layer） ============
 CREATE TABLE IF NOT EXISTS trade_signals (
     date         TEXT NOT NULL,
-    session      TEXT NOT NULL,            -- auction / intraday / close
+    session      TEXT NOT NULL,            -- auction / intraday / close / daily
     signal_id    TEXT NOT NULL,
     subject_type TEXT NOT NULL,            -- stock / sector / market / etf
     subject      TEXT NOT NULL,
@@ -560,6 +569,8 @@ CREATE TABLE IF NOT EXISTS trade_signals (
     hint         TEXT,
     evidence     TEXT,                     -- JSON
     src          TEXT NOT NULL DEFAULT 'signals',
+    horizon      TEXT NOT NULL DEFAULT 'short',   -- short / mid
+    layer        TEXT NOT NULL DEFAULT 'watch',   -- watch / discovery / market
     PRIMARY KEY (date, session, signal_id, subject)
 );
 CREATE INDEX IF NOT EXISTS idx_trade_signals_date ON trade_signals(date, session);
@@ -575,6 +586,52 @@ CREATE TABLE IF NOT EXISTS auction_snapshots (
     src    TEXT NOT NULL DEFAULT 'tencent',
     PRIMARY KEY (date, symbol)
 );
+
+-- ============ 动作清单 / 观察名单 ============
+CREATE TABLE IF NOT EXISTS daily_actions (
+    date               TEXT NOT NULL,
+    symbol             TEXT NOT NULL,
+    name               TEXT DEFAULT '',
+    verb               TEXT NOT NULL,          -- buy/add/hold/reduce/sell/wait/watch
+    priority           INTEGER NOT NULL,       -- 1必须 / 2计划内 / 3信号 / 4探索
+    source             TEXT NOT NULL,          -- card/plan/pool/signal/llm/user
+    source_ref         TEXT DEFAULT '',
+    entry_lo           REAL,
+    entry_hi           REAL,
+    stop_loss          REAL,
+    target             REAL,
+    invalid_condition  TEXT DEFAULT '',
+    position_hint      TEXT DEFAULT '',
+    status             TEXT NOT NULL DEFAULT 'pending',
+    hint               TEXT DEFAULT '',
+    evidence           TEXT DEFAULT '{}',
+    src                TEXT NOT NULL DEFAULT 'actions',
+    updated_at         TEXT DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (date, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_actions_date ON daily_actions(date, priority);
+
+CREATE TABLE IF NOT EXISTS review_lessons (
+    date TEXT NOT NULL,
+    kind TEXT NOT NULL,            -- intraday / plan
+    body TEXT NOT NULL,
+    src  TEXT NOT NULL DEFAULT 'llm',
+    PRIMARY KEY (date, kind, body)
+);
+
+CREATE TABLE IF NOT EXISTS watch_items (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol       TEXT NOT NULL,
+    source       TEXT NOT NULL,            -- signal / llm_pick / user
+    source_ref   TEXT DEFAULT '',
+    reason       TEXT DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'open',  -- open / promoted / dismissed / expired
+    in_date      TEXT NOT NULL,
+    expire_date  TEXT,
+    created_at   TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_watch_items_status ON watch_items(status, symbol);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_items_open_sym ON watch_items(symbol) WHERE status='open';
 """
 
 
@@ -660,6 +717,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             """CREATE INDEX IF NOT EXISTS idx_delivery_receipts_status
                ON delivery_receipts(status, scheduled_date)"""
         )
+    cols_sig = [r["name"] for r in conn.execute("PRAGMA table_info(trade_signals)")]
+    if cols_sig:
+        if "horizon" not in cols_sig:
+            conn.execute("ALTER TABLE trade_signals ADD COLUMN horizon TEXT NOT NULL DEFAULT 'short'")
+        if "layer" not in cols_sig:
+            conn.execute("ALTER TABLE trade_signals ADD COLUMN layer TEXT NOT NULL DEFAULT 'watch'")
     # dragon_tiger 历史 bug：榜单行不写 seat_type（NULL），SQLite 主键中
     # NULL!=NULL，导致每次采集重复插入。清理每个 (date,symbol) 仅保留一行；
     # 新数据由采集层统一写入非空 seat_type='list'（见 akshare_source.py）。
@@ -677,6 +740,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_chat_history_chat_sender "
         "ON chat_history(chat_id, sender_id, id)"
     )
+    from invest.bigv.schema import ensure_bigv_schema
+
+    ensure_bigv_schema(conn)
 
 
 def init_db(db_path: str | Path) -> None:

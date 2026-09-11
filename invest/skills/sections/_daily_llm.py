@@ -16,6 +16,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_SIGNAL_CITE = "禁止编造保量/缩量/拥挤度/RS象限/主战场划分，只能引用规则信号原文；禁止写「建议买入」"
+_ACTION_CITE = "必须引用动作草稿里的价位；禁止编造止损/买入区间；草稿已有 verb 时 plans 与之对齐；禁止写「建议买入」"
 _SYSTEM = (
     "你是 A 股盘后策略分析师（机构级：护城河/景气度/估值分位 + 游资：情绪周期/龙头战法）。\n"
     "只许基于给定数据推理，禁止编造数字。输出严格 JSON，不要任何其他文字。"
@@ -57,7 +59,7 @@ def intraday_review_llm(db_path: str, ctx: dict) -> dict:
             out = _llm(conn, _SYSTEM,
                        f"以下是今日竞价报告与盘中报告给出的观点（预测/操作建议/短线判断，来源已标注）：\n{ctx.get('views_text') or '（今日无观点）'}\n\n"
                        f"以下是当日实际表现：\n{ctx.get('actual_text') or '暂无'}\n"
-                       f"规则算出的当日信号（禁止编造，只能引用）：\n{ctx.get('signals_text') or '无'}\n\n"
+                       f"规则算出的当日信号（{_SIGNAL_CITE}）：\n{ctx.get('signals_text') or '无'}\n\n"
                        "请输出 JSON：\n"
                        '{"verdict": "逐条判断观点对错（对/错/部分对；竞价预判与盘中判断分别点评，50字内）",\n'
                        '"wrong_reasons": ["错误原因（数据/逻辑/突发，每条20字内）"],\n'
@@ -85,7 +87,7 @@ def board_analysis_llm(db_path: str, ctx: dict) -> dict:
                        f"板块涨幅TOP:\n{ctx.get('sector_top') or '暂无'}\n"
                        f"连板梯队:\n{ctx.get('ladder') or '暂无'}\n"
                        f"异动个股:\n{ctx.get('stock_moves') or '暂无'}\n"
-                       f"规则交易信号（集体放量/偏离等，禁止编造只能引用）:\n{ctx.get('signals_text') or '无'}\n\n"
+                       f"规则交易信号（{_SIGNAL_CITE}）：\n{ctx.get('signals_text') or '无'}\n\n"
                        "请覆盖分析以下方向（AI硬件/AI软件/机器人/金融/金属/新能源/旧能源/内需），输出 JSON：\n"
                        '{"boards": [{"name": "方向名",'
                        '"active": true或false（当天是否有明显异动）,'
@@ -114,13 +116,19 @@ def plan_gen_llm(db_path: str, ctx: dict) -> dict:
                        "以下是关注/持仓股（用户指定，多为持仓；系统推荐仅为迭代验证）：\n"
                        + (ctx.get("holdings") or "暂无") + "\n\n"
                        "以下是最近几天预案质量复盘（若有）：\n" + (ctx.get("plan_history") or "暂无") + "\n\n"
-                       "规则算出的当日信号（禁止编造，只能引用）：\n" + (ctx.get("signals_text") or "无") + "\n\n"
+                       "规则算出的当日信号（" + _SIGNAL_CITE + "）：\n" + (ctx.get("signals_text") or "无") + "\n\n"
+                       "规则合成的动作草稿（" + _ACTION_CITE + "）：\n" + (ctx.get("actions_text") or "无") + "\n\n"
+                       "近期复盘教训（避免重复同一类错误）：\n" + (ctx.get("lessons_text") or "无") + "\n\n"
+                       "picks 若推荐个股，优先落在给定 quad_hunt 行业或 discovery 短线命中行业；"
+                       "无信号时仍可探索，不要因为没有 hunt 就输出空 picks。"
+                       "每条 pick 必须带 6 位 symbol，没有代码的不要输出。\n\n"
                        "请输出明日预案 JSON：\n"
                        '{"direction": "明日主线方向判断（25字内）",\n'
-                       '"picks": [{"name": "明日可介入股票名", "reason": "介入理由（结合今日主线/ETF，20字内）",'
+                       '"picks": [{"name": "明日可介入股票名", "symbol": "6位代码",'
+                       ' "reason": "介入理由（结合今日主线/ETF，20字内）",'
                        '"plan": "介入预案（如回踩X均线低吸/打板/半路，20字内）"}],  # 最多3只，仅系统探索推荐\n'
                        '"plans": [{"symbol": "关注/持仓股代码", "action": "明日操作预案（持有/减/加/止盈止损位，20字内）"}]}\n'
-                       "plans 必须覆盖所有列出的关注/持仓股。",
+                       "plans 必须覆盖动作草稿里 priority 1-2 的全部 symbol。",
                        max_tokens=1200)
             return _parse_json(out) or {}
         finally:

@@ -397,11 +397,19 @@ def test_os_task_manifest_matches_job_funcs_and_required_times():
 
     raw = (ROOT / "scripts" / "install_os_tasks.ps1").read_text(encoding="utf-8-sig")
     entries = re.findall(r'Time = "(\d\d:\d\d)"; Job = "([^"]+)"', raw)
-    jobs_to_times = {job: time for time, job in entries}
+    jobs_to_times = {}
+    for slot_time, job in entries:
+        if job in jobs_to_times and jobs_to_times[job] != slot_time:
+            raise AssertionError(
+                f"Job={job} 映射了 {jobs_to_times[job]} 与 {slot_time}，下午 digest 必须用 action_digest_pm"
+            )
+        jobs_to_times[job] = slot_time
     assert set(jobs_to_times) == set(JOB_FUNCS)
     assert jobs_to_times["auction"] == "09:26"
     assert jobs_to_times["snapshot_close"] == "15:01"
     assert jobs_to_times["pool_trap_scan"] == "16:20"
+    assert jobs_to_times["action_digest"] == "10:00"
+    assert jobs_to_times["action_digest_pm"] == "13:30"
     assert (ROOT / "scripts" / "install_os_tasks.ps1").read_bytes().startswith(b"\xef\xbb\xbf")
 
 

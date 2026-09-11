@@ -17,14 +17,28 @@ def persist_signals(
 ) -> None:
     day = iso(asof)
     conn.execute("DELETE FROM trade_signals WHERE date=? AND session=?", (day, session))
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(trade_signals)")}
+    has_hl = "horizon" in cols and "layer" in cols
     for s in signals:
-        conn.execute(
-            """INSERT OR REPLACE INTO trade_signals
-               (date, session, signal_id, subject_type, subject, severity, name, hint, evidence, src)
-               VALUES (?,?,?,?,?,?,?,?,?, 'signals')""",
-            (day, session, s.id, s.subject_type, s.subject, s.severity,
-             s.name, s.hint, json.dumps(s.evidence or {}, ensure_ascii=False)),
-        )
+        evidence = json.dumps(s.evidence or {}, ensure_ascii=False)
+        if has_hl:
+            conn.execute(
+                """INSERT OR REPLACE INTO trade_signals
+                   (date, session, signal_id, subject_type, subject, severity, name, hint, evidence, src, horizon, layer)
+                   VALUES (?,?,?,?,?,?,?,?,?, 'signals', ?, ?)""",
+                (day, session, s.id, s.subject_type, s.subject, s.severity,
+                 s.name, s.hint, evidence,
+                 getattr(s, "horizon", None) or "short",
+                 getattr(s, "layer", None) or "watch"),
+            )
+        else:
+            conn.execute(
+                """INSERT OR REPLACE INTO trade_signals
+                   (date, session, signal_id, subject_type, subject, severity, name, hint, evidence, src)
+                   VALUES (?,?,?,?,?,?,?,?,?, 'signals')""",
+                (day, session, s.id, s.subject_type, s.subject, s.severity,
+                 s.name, s.hint, evidence),
+            )
     conn.commit()
 
 

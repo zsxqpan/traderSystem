@@ -101,7 +101,8 @@ _HELP_TEXT = (
     "在的。可以这样用我：\n"
     "· @我并说「来一份盘中报告 / 现在行情」→ 盘中实时报告（板块异动/龙头人气/核心池行情）；\n"
     "· 直接问我市场问题（如'今天哪些板块最强''怎么看军工'）→ 我会查系统数据回答；\n"
-    "· 私聊我也一样。非管理员每天有 token 额度上限（100万）。"
+    "· 私聊我也一样。非管理员每天有 token 额度上限（100万）。\n"
+    "· `/大V 段永平 茅台怎么看` 或以「问某某 / 以某某的视角」→ 按该人公开言论回答（默认有据；说「推断」才外推）。"
 )
 
 _bot_open_id_cache: str = ""
@@ -565,6 +566,31 @@ def _agent_reply(chat_id: str, text: str, sender_id: str, nonadmin: bool = False
                      "⏳ 收到，正在用 UZI 深度分析，约 5-20 分钟（完成后自动发送报告摘要与路径）。")
 
     from invest.agent.agents import classify_intent
+
+    try:
+        from invest.bigv.route import try_feishu
+        from invest.db import connect as _bv_connect
+
+        _bv_conn = _bv_connect(str(ROOT / "data" / "invest.db"))
+        try:
+            _bv_reply = try_feishu(_bv_conn, text)
+        finally:
+            _bv_conn.close()
+        if _bv_reply is not None:
+            send_message(chat_id, "chat_id", _bv_reply)
+            logger.info("大V画像库回复 len=%d", len(_bv_reply))
+            return
+    except Exception as exc:
+        logger.warning("大V分流失败: %s", exc)
+        try:
+            from invest.bigv.route import parse_feishu as _parse_bv
+
+            _bv_parsed = _parse_bv(text)
+        except Exception:
+            _bv_parsed = None
+        if _bv_parsed and _bv_parsed.get("kind") == "command":
+            send_message(chat_id, "chat_id", "大V画像库暂时不可用，请稍后再试。")
+            return
 
     intent = classify_intent(text)
     want_report = intent == "intraday_report"

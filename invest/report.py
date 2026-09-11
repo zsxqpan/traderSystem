@@ -461,6 +461,7 @@ def daily_report(db_path: str, agent_text: str = "") -> str:
         lines = []
         lines.append("【A股投资系统 · 盘后日报】")
         lines.append(f"数据截至: {_freshness(conn)}")
+        lines.append("────────")
         # 宏观流动性（2026-08-18 方案C：从重要宏观开始）
         try:
             from invest.pipeline import _macro_text
@@ -570,6 +571,7 @@ def premarket_report(db_path: str, agent_text: str = "") -> str:
         lines = []
         lines.append("【A股投资系统 · 盘前】")
         lines.append(f"数据截至: {_freshness(conn)}")
+        lines.append("────────")
         lines.append(f"🎯 仓位: {_rating_guide(conn)}")
         lines.append(f"📈 评级: {_ratings(conn)}")
         if score is not None:
@@ -665,6 +667,59 @@ def _news_block(db_path: str, n: int = 5, days: int = 3, job: str = "weekly") ->
     return "\n".join(f"  - {ln}" for ln in raw_lines[:n])
 
 
+def _weekly_action_summary(conn) -> str:
+    """本周 daily_actions 的 triggered/expired 计数。无表或无行则空。"""
+    try:
+        row = conn.execute(
+            """SELECT
+                 SUM(CASE WHEN status='triggered' THEN 1 ELSE 0 END) AS trig,
+                 SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END) AS exp,
+                 COUNT(*) AS n
+               FROM daily_actions
+               WHERE date >= date('now','localtime','weekday 0','-6 days')"""
+        ).fetchone()
+        if not row or not row["n"]:
+            return ""
+        return f"  共 {int(row['n'])} 条；triggered {int(row['trig'] or 0)} / expired {int(row['exp'] or 0)}"
+    except Exception:
+        return ""
+
+
+def _weekly_mid_signals(conn) -> str:
+    """最近 5 个 date 的 daily mid 信号，按 (signal_id, subject) 去重留最新。"""
+    try:
+        dates = [
+            r["date"]
+            for r in conn.execute(
+                """SELECT DISTINCT date FROM trade_signals
+                   WHERE session='daily' AND horizon='mid'
+                   ORDER BY date DESC LIMIT 5"""
+            )
+        ]
+        if not dates:
+            return ""
+        ph = ",".join("?" * len(dates))
+        rows = conn.execute(
+            f"""SELECT date, signal_id, subject, name, hint FROM trade_signals
+                WHERE session='daily' AND horizon='mid' AND date IN ({ph})
+                ORDER BY date DESC, signal_id, subject""",
+            dates,
+        ).fetchall()
+        seen: set[tuple[str, str]] = set()
+        lines: list[str] = []
+        for r in rows:
+            key = (r["signal_id"], r["subject"])
+            if key in seen:
+                continue
+            seen.add(key)
+            hint = r["hint"] or ""
+            name = r["name"] or r["signal_id"]
+            lines.append(f"  {r['subject']} {name}：{hint}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def weekly_report(db_path: str, agent_text: str = "") -> str:
     """周报：聚焦中期（中线强度/行业趋势/估值分位/宏观流动性/评级仓位/持仓中线评估）。
 
@@ -707,6 +762,7 @@ def weekly_report(db_path: str, agent_text: str = "") -> str:
         lines = []
         lines.append("【A股投资系统 · 周报】")
         lines.append(f"数据截至: {_freshness(conn)}")
+        lines.append("────────")
         lines.append("")
         lines.append(f"📈 评级: {_ratings(conn)}")
         lines.append(f"🎯 仓位: {_rating_guide(conn)}")
@@ -716,6 +772,16 @@ def weekly_report(db_path: str, agent_text: str = "") -> str:
         lines.append("【中线强度前8（周线口径，看方向）】")
         lines.append(mid_block)
         lines.append("")
+        mid_sig = _weekly_mid_signals(conn)
+        if mid_sig:
+            lines.append("【中线信号】")
+            lines.append(mid_sig)
+            lines.append("")
+        act_sum = _weekly_action_summary(conn)
+        if act_sum:
+            lines.append("【本周动作兑现】")
+            lines.append(act_sum)
+            lines.append("")
         lines.append("【低估值+趋势候选（中线配置视角）】")
         lines.append(val_block)
         lines.append("")
@@ -922,6 +988,7 @@ def intraday_report(db_path: str, public: bool = False, brief: bool = True) -> s
     finally:
         conn0.close()
     lines.append(f"数据截至: {freshness}")
+    lines.append("────────")
 
     # 实时行情（三源轮询，仅收新鲜数据）
     live, pct_map = _live_quotes(db_path, core)

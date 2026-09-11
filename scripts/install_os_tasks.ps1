@@ -19,6 +19,9 @@
         TraderSystem_weekend            周日   20:00
         TraderSystem_monthly            每月1日 09:30
         TraderSystem_yearly             每年1/1 09:30
+        TraderSystem_action_digest_am   交易日 10:00
+        TraderSystem_action_digest_pm   交易日 13:30
+        TraderSystem_big_v_harvest      每天   17:10
     电源策略任务（2026-09-07：机器仅 08:30-17:30 唤醒，其余时间允许休眠省电）：
         TraderSystem_power_on           交易日 08:25（唤醒机器 + 插电永不休眠，需管理员）
         TraderSystem_power_off          交易日 17:35（恢复插电 25 分钟休眠，需管理员）
@@ -51,7 +54,10 @@ $jobs = @(
     @{ Name = "TraderSystem_industry_refresh"; Desc = "16:30 行业数据刷新";                Trigger = 'weekday'; Time = "16:30"; Job = "industry_refresh" },
     @{ Name = "TraderSystem_daily_refresh";    Desc = "16:40 日线/指数补采+quant";         Trigger = 'weekday'; Time = "16:40"; Job = "daily_refresh" },
     @{ Name = "TraderSystem_factcard_refresh"; Desc = "16:50 行业事实卡/重要变化推送";       Trigger = 'weekday'; Time = "16:50"; Job = "factcard_refresh" },
-    @{ Name = "TraderSystem_evening_report";   Desc = "17:00 晚间盘后报告(含数据滞后门禁)"; Trigger = 'weekday'; Time = "17:00"; Job = "evening_report" }
+    @{ Name = "TraderSystem_evening_report";   Desc = "17:00 晚间盘后报告(含数据滞后门禁)"; Trigger = 'weekday'; Time = "17:00"; Job = "evening_report" },
+    @{ Name = "TraderSystem_action_digest_am"; Desc = "10:00 动作 digest";                 Trigger = 'weekday'; Time = "10:00"; Job = "action_digest" },
+    @{ Name = "TraderSystem_action_digest_pm"; Desc = "13:30 动作 digest";                 Trigger = 'weekday'; Time = "13:30"; Job = "action_digest_pm" },
+    @{ Name = "TraderSystem_big_v_harvest";    Desc = "17:10 大V画像库雪球慢速回灌";         Trigger = 'daily'; Time = "17:10"; Job = "big_v_harvest" }
 )
 
 function New-TriggerXml([string]$kind, [string]$time) {

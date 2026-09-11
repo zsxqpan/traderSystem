@@ -23,6 +23,14 @@ from __future__ import annotations
 import re
 
 
+def _is_major_section(sec: dict) -> bool:
+    """表格 / 图表 / 以 ** 开头的标题节，渲染时前面加分隔。"""
+    if sec.get("type") in ("table", "chart"):
+        return True
+    text = (sec.get("text") or "").lstrip()
+    return text.startswith("**")
+
+
 def _strip_asterisk(text: str) -> str:
     """把单星号 *xx* 转成 **xx**（飞书 lark_md 粗体）；已有的 **xx** 原样保留。"""
     return re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"**\1**", text)
@@ -57,16 +65,17 @@ def _table_component(sec: dict) -> dict:
 
 
 def _table_plain(sec: dict) -> str:
-    """表格节 → 纯文本（标题 + 每行「名称 值 …」）。"""
+    """表格节 → 纯文本（标题 + 每行「列名 值」，列对之间多空一格便于扫读）。"""
     lines = []
     if sec.get("title"):
         lines.append(f"【{sec['title']}】")
     columns = sec.get("columns") or []
     for r in sec.get("rows") or []:
-        lines.append("  " + " ".join(
-            f"{columns[i]} {cell}" if i < len(columns) and columns[i] else str(cell)
-            for i, cell in enumerate(r)
-        ))
+        pairs = []
+        for i, cell in enumerate(r):
+            label = columns[i] if i < len(columns) and columns[i] else ""
+            pairs.append(f"{label} {cell}" if label else str(cell))
+        lines.append("  " + "  ".join(pairs))
     return "\n".join(lines)
 
 
@@ -82,12 +91,16 @@ def _chart_png(sec: dict) -> bytes | None:
         import matplotlib.pyplot as plt
         from matplotlib import font_manager
 
-        # Windows 微软雅黑（无则回退默认字体，中文可能方块——尽力而为）
+        # Windows 微软雅黑 / macOS 苹方（无则回退默认字体，中文可能方块——尽力而为）
         try:
             font_manager.fontManager.addfont(r"C:\Windows\Fonts\msyh.ttc")
             plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
         except Exception:
-            pass
+            try:
+                font_manager.fontManager.addfont("/System/Library/Fonts/PingFang.ttc")
+                plt.rcParams["font.sans-serif"] = ["PingFang SC"]
+            except Exception:
+                pass
         plt.rcParams["axes.unicode_minus"] = False
 
         kind = sec.get("chart")
@@ -150,7 +163,9 @@ def render_feishu(struct: dict, upload_fn=None) -> dict:
         except Exception:
             upload_fn = None
     elements: list[dict] = []
-    for sec in struct.get("sections") or []:
+    for i, sec in enumerate(struct.get("sections") or []):
+        if i and _is_major_section(sec) and elements:
+            elements.append({"tag": "hr"})
         if sec.get("type") == "table":
             if sec.get("rows"):
                 elements.append(_table_component(sec))
@@ -183,7 +198,10 @@ def render_feishu(struct: dict, upload_fn=None) -> dict:
     title = (struct.get("title") or "A股投资系统").replace("**", "")
     return {
         "schema": "2.0",
-        "header": {"title": {"tag": "plain_text", "content": title}},
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "template": "blue",
+        },
         "body": {"elements": elements},
     }
 
@@ -204,4 +222,4 @@ def render_plain(struct: dict) -> str:
             text = _strip_asterisk_plain(sec.get("text") or "")
             if text.strip():
                 parts.append(text)
-    return "\n".join(parts)
+    return "\n\n".join(parts)

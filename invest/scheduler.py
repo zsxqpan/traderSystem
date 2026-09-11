@@ -81,6 +81,9 @@ JOB_SLOTS = {
     "daily_refresh": "16:40",
     "factcard_refresh": "16:50",
     "evening_report": "17:00",
+    "action_digest": "10:00",
+    "action_digest_pm": "13:30",
+    "big_v_harvest": "17:10",
 }
 # 同日补偿窗口。开始前不处理；窗口内复用正常执行链路；结束后只记 missed。
 # 2026-09-07：配合"机器仅 08:30-17:30 唤醒"电源策略，全部压缩到 17:29:59 前，
@@ -99,6 +102,9 @@ JOB_COMPENSATION_WINDOWS = {
     "daily_refresh": (dt.time(16, 40), dt.time(17, 29, 59)),
     "factcard_refresh": (dt.time(16, 50), dt.time(17, 29, 59)),
     "evening_report": (dt.time(17, 0), dt.time(17, 29, 59)),
+    "action_digest": (dt.time(10, 0), dt.time(13, 29, 59)),
+    "action_digest_pm": (dt.time(13, 30), dt.time(17, 29, 59)),
+    "big_v_harvest": (dt.time(17, 10), dt.time(17, 29, 59)),
 }
 TRADING_DAY_JOBS = {
     "premarket",
@@ -110,6 +116,8 @@ TRADING_DAY_JOBS = {
     "industry_refresh",
     "daily_refresh",
     "factcard_refresh",
+    "action_digest",
+    "action_digest_pm",
 }
 JOB_LEASE_SECONDS = {"auction": 180}
 DEFAULT_JOB_LEASE_SECONDS = 7200
@@ -684,6 +692,42 @@ def _weekend(db: str, conn) -> JobResult:
     )
 
 
+def _action_digest(db: str, conn) -> JobResult:
+    """交易日 10:00 / 13:30 动作 digest，无 LLM。"""
+    import invest.pipeline as pl
+
+    ok = pl.notify_action_digest(db)
+    if ok:
+        return JobResult.ok("动作 digest 已推送", artifact="action_digest")
+    return JobResult.ok("动作 digest 无内容", artifact="action_digest")
+
+
+def _big_v_harvest(db: str, conn) -> JobResult:
+    """每天 17:10 雪球大V 慢速回灌：每人最多几条、时间线优先、限流即停。"""
+    from invest.bigv.harvest import harvest
+    from invest.bigv.persona import maybe_refresh_persona
+    from invest.bigv.watch import list_watched
+
+    out = harvest(
+        conn,
+        budget_s=600,
+        backfill=True,
+        limit=50,
+        max_new_per_person=6,
+        gap_s=12.0,
+        gap_jitter_s=8.0,
+        person_gap_s=25.0,
+    )
+    for prof in list_watched(conn):
+        maybe_refresh_persona(conn, prof["id"])
+    detail = f"新增{out['new']}条"
+    if out.get("stopped_budget"):
+        detail += "（预算到点或限流已停）"
+    if out.get("errors"):
+        detail += "；" + "；".join(out["errors"][:3])
+    return JobResult.ok(detail, artifact="big_v_harvest")
+
+
 def _monthly(db: str, conn) -> JobResult:
     from invest.review.monthly import monthly_review
     from invest.review.report import save_report
@@ -979,6 +1023,12 @@ def _evening_report(db: str, conn) -> JobResult:
     from invest.skills.runner import run_structured
 
     struct = run_structured("a3_daily", db_path=db)
+    try:
+        from invest.signals.scan import scan_db
+
+        scan_db(db, "close", persist=True)
+    except Exception:
+        logger.warning("收盘信号落库失败", exc_info=True)
     tail = f"【今日】到期进复盘 {expired} 条 | 工单超时 {overdue} 张 | 新增观点 {new_vp} 条"
     # 数据质量报告（PIT 四状态）追加
     try:
@@ -1110,11 +1160,16 @@ JOB_FUNCS: dict[str, Callable] = {
     "factcard_refresh": _factcard_refresh,
     "evening_report": _evening_report,
     "pool_trap_scan": _pool_trap_scan,  # 2026-08-23：候选池杀猪盘扫描
+    "action_digest": _action_digest,    # 2026-09-09：10:00 动作 digest
+    "action_digest_pm": _action_digest,  # 2026-09-09：13:30 动作 digest（独立槽，避免 already_ok）
+    "big_v_harvest": _big_v_harvest,    # 2026-09-10：每天 17:10 慢速回灌
 }
 
 
 def _job_is_scheduled_today(job_name: str, date: dt.date) -> bool:
     """判断补偿扫描当天是否应有该计划槽位。"""
+    if job_name == "big_v_harvest":
+        return True
     if job_name in TRADING_DAY_JOBS or job_name == "evening_report":
         from invest.data.calendar import is_trading_day
 
@@ -1345,6 +1400,9 @@ def build_scheduler(ticker_only: bool = False) -> BackgroundScheduler:
     sched.add_job(_wrap("morning_brief", _morning_brief), CronTrigger(day_of_week="mon-fri", hour=8, minute=40), id="morning_brief", misfire_grace_time=21600)
     # 竞价报告（2026-08-22）：9:26（ticker-only 部署由 _intraday_tick_job 竞价窗口触发，这里为 full 模式备选）
     sched.add_job(_wrap("auction", _auction_report), CronTrigger(day_of_week="mon-fri", hour=9, minute=26), id="auction", misfire_grace_time=300)
+    # 动作 digest（2026-09-09 阶段 C）：10:00 / 13:30，无 LLM；限频 90 分钟
+    sched.add_job(_wrap("action_digest", _action_digest), CronTrigger(day_of_week="mon-fri", hour=10, minute=0), id="action_digest_am", misfire_grace_time=1800)
+    sched.add_job(_wrap("action_digest_pm", _action_digest), CronTrigger(day_of_week="mon-fri", hour=13, minute=30), id="action_digest_pm", misfire_grace_time=1800)
     sched.add_job(_wrap("after_close", _after_close), CronTrigger(day_of_week="mon-fri", hour=16, minute=0), id="after_close", misfire_grace_time=21600)
     # 收盘即日线（2026-08-20 初版 16:10；2026-08-24 提前到 15:01 并升级全市场 OHLCV）：
     # 东财 clist 批量接口 15:00 收盘后立即返回全市场当日 OHLCV，15:01 落库 src='snapshot'，
@@ -1374,4 +1432,5 @@ def build_scheduler(ticker_only: bool = False) -> BackgroundScheduler:
     # 晚间盘后报告（2026-08-18 合并 daily_report/P2简报/每日复盘；2026-09-07 由 22:00 提前到 17:00，
     # 随机器休眠策略改为交易日下午发）：数据滞后时跳过并推送原因（_data_lag_reason 门禁）
     sched.add_job(_wrap("evening_report", _evening_report), CronTrigger(day_of_week="mon-fri", hour=17, minute=0), id="evening_report", misfire_grace_time=7200)
+    sched.add_job(_wrap("big_v_harvest", _big_v_harvest), CronTrigger(hour=17, minute=10), id="big_v_harvest", misfire_grace_time=1200)
     return sched

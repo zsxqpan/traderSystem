@@ -27,7 +27,8 @@ SKILL = {
     "kind": "report",
     "description": "盘中实时报告：盘面总览(含ETF)/情绪判断+预测/日内主线(ETF+推荐股)/核心关注与预案对照",
     "uses": ["d8_temp_guide", "d9_rating_guide", "d11_emotion", "d12_limit_up_ladder",
-             "d13_fund_line", "d21_freshness", "d29_sector_resonance", "d32_trade_signals"],
+             "d13_fund_line", "d21_freshness", "d29_sector_resonance",
+             "d32_trade_signals", "d33_daily_actions"],
     "params": {
         "db_path": "str, required",
         "public": "bool, optional, default False",
@@ -227,6 +228,10 @@ def _core_quotes(db_path: str, results=None) -> tuple[list[list[str]], str, list
             "SELECT symbol FROM candidate_pool WHERE level IN ('core','track') "
             "AND out_date IS NULL ORDER BY level"
         )]
+        core += [r["symbol"] for r in conn.execute(
+            "SELECT symbol FROM cards WHERE status IN ('locked','review')"
+        )]
+        core = list(dict.fromkeys(core))
     finally:
         conn.close()
     if not core:
@@ -329,18 +334,34 @@ def render(db_path: str, public: bool = False, brief: bool = False, snapshot=Non
     if degrade:
         sections.append({"type": "text", "text": degrade_alert_text(cov_info)})
 
-    # ---- 1b) 交易信号（缩量/高位放量/集体/空间；2026-09-03；简洁版也保留） ----
+    # ---- 1b) 交易信号（缩量/高位放量/集体/空间；简洁版也保留） ----
     sigs: list = []
     sig_text = ""
     try:
-        from invest.signals.format import format_signals, signal_section
+        from invest.signals.format import (
+            format_discovery_action,
+            format_signals,
+            signal_section,
+            split_b1,
+        )
         from invest.signals.scan import scan_db
+        from invest.signals.thresholds import DISPLAY_B1_WATCH
 
-        sigs = scan_db(db_path, "intraday")  # 行情由 scan 自取（快照架构无 all_quotes）
-        sig_text = format_signals(sigs)
-        blk = signal_section(sigs)
+        sigs = scan_db(db_path, "intraday", persist=True, limit=10_000)
+        main, disc = split_b1(sigs)
+        sig_text = "\n".join(
+            x for x in (
+                format_signals(main, limit=DISPLAY_B1_WATCH),
+                format_discovery_action(sigs),
+            ) if x
+        )
+        blk = signal_section(main, limit=DISPLAY_B1_WATCH)
         if blk:
             sections.append(blk)
+        if disc:
+            dblk = signal_section(disc, title="【明确发现】")
+            if dblk:
+                sections.append(dblk)
     except Exception:
         sigs = []
         sig_text = ""
@@ -427,7 +448,8 @@ def render(db_path: str, public: bool = False, brief: bool = False, snapshot=Non
             lines.append(f"  → 推演: {ml['outlook']}")
     if degrade:
         pass  # 覆盖不足：禁止日内主线完整结论（含规则回退）
-    elif lines:
+    elif lines and not brief:
+        # 2026-09-11：简洁版只留客观盘面（模块约定），LLM 主线/推演仅完整版输出
         sections.append({"type": "text", "text": "**【日内主线】**\n" + "\n".join(lines)})
         views["mainline"] = mainline.get("main_lines")
     elif not brief and (sector_top or fund_top):
@@ -457,8 +479,8 @@ def render(db_path: str, public: bool = False, brief: bool = False, snapshot=Non
         try:
             from invest.signals.format import tags_for as _tags
 
-            tagged = [_tags(sigs, r[0]) or "-" for r in rows]
-            if any(t != "-" for t in tagged):  # 有信号才加列，避免空「信号」列
+            tagged = [_tags(sigs, r[0], layers=["watch"]) or "-" for r in rows]
+            if any(t != "-" for t in tagged):
                 cols.append("信号")
                 for row, tag in zip(rows, tagged):
                     row.append(tag)
@@ -479,8 +501,72 @@ def render(db_path: str, public: bool = False, brief: bool = False, snapshot=Non
                 sections.append({"type": "text", "text": f"**核心关注板块**: {core_inds}"})
             if mainline.get("core_outlook"):
                 sections.append({"type": "text", "text": f"**走势推演**: {mainline['core_outlook']}"})
-    if plan and not brief:
-        sections.append({"type": "text", "text": "**【与盘后预案对照】**\n" + plan})
+    try:
+        from invest.actions.format import pick_b1
+        from invest.actions.persist import update_statuses
+        from invest.actions.query import list_actions
+        from invest.actions.types import VERB_CN, Action
+
+        conn_a = connect(db_path)
+        try:
+            raw = list_actions(conn_a)
+            day = raw[0]["date"] if raw else ""
+            live: dict[str, float] = {}
+            for r in _core_rows:
+                try:
+                    live[r[0]] = float(str(r[1]).replace(",", ""))
+                except (TypeError, ValueError, IndexError):
+                    pass
+            missing = [
+                r.get("symbol") for r in raw
+                if r.get("symbol") and r["symbol"] not in live
+            ]
+            if missing:
+                from invest.intraday import fetch_batch_prices
+
+                live.update(fetch_batch_prices(missing, db_path=db_path) or {})
+            if day and live:
+                update_statuses(conn_a, day, live)
+                raw = list_actions(conn_a, day)
+        finally:
+            conn_a.close()
+        acts = [
+            Action(
+                date=r.get("date") or "", symbol=r.get("symbol") or "",
+                verb=r.get("verb") or "hold", priority=int(r.get("priority") or 2),
+                source=r.get("source") or "",
+                entry_lo=r.get("entry_lo"), entry_hi=r.get("entry_hi"),
+                stop_loss=r.get("stop_loss"), status=r.get("status") or "pending",
+            )
+            for r in raw
+        ]
+        shown = pick_b1(acts)
+        if shown:
+            live_map = {r[0]: r[1] for r in _core_rows}
+            rows = []
+            for a in shown:
+                rng = (
+                    f"{a.entry_lo:g}-{a.entry_hi:g}"
+                    if a.entry_lo is not None and a.entry_hi is not None else "-"
+                )
+                rows.append([
+                    VERB_CN.get(a.verb, a.verb), a.symbol,
+                    str(live_map.get(a.symbol, "-")), rng,
+                    f"{a.stop_loss:g}" if a.stop_loss is not None else "-",
+                    a.status,
+                ])
+            sections.append({
+                "type": "table", "title": "动作对照",
+                "columns": ["动作", "代码", "现价", "区间", "止损", "状态"],
+                "rows": rows,
+            })
+        if plan:
+            direction = next((ln.strip() for ln in plan.splitlines() if "方向" in ln), "")
+            if direction:
+                sections.append({"type": "text", "text": "**【昨夜方向】** " + direction})
+    except Exception:
+        if plan and not brief:
+            sections.append({"type": "text", "text": "**【与盘后预案对照】**\n" + plan})
 
     # 2026-08-23 角度 skill 复用：板块共振（d29），失败静默不阻断
     if not brief:

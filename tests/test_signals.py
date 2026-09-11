@@ -68,6 +68,145 @@ def test_schema_has_signal_tables():
     assert "auction_snapshots" in names
 
 
+def test_schema_has_horizon_layer_columns():
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(trade_signals)")}
+        assert "horizon" in cols
+        assert "layer" in cols
+        ver = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert ver >= 13
+    finally:
+        conn.close()
+
+
+def test_migrate_adds_horizon_layer_to_old_table():
+    """SCHEMA 12 旧表无新列：_migrate 幂等加列。"""
+    from invest.db import _migrate
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        conn.execute("DROP TABLE trade_signals")
+        conn.execute(
+            """CREATE TABLE trade_signals (
+                date TEXT NOT NULL,
+                session TEXT NOT NULL,
+                signal_id TEXT NOT NULL,
+                subject_type TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                name TEXT,
+                hint TEXT,
+                evidence TEXT,
+                src TEXT NOT NULL DEFAULT 'signals',
+                PRIMARY KEY (date, session, signal_id, subject)
+            )"""
+        )
+        conn.commit()
+        cols_before = {r[1] for r in conn.execute("PRAGMA table_info(trade_signals)")}
+        assert "horizon" not in cols_before
+        _migrate(conn)
+        _migrate(conn)  # 幂等
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(trade_signals)")}
+        assert "horizon" in cols
+        assert "layer" in cols
+    finally:
+        conn.close()
+
+
+def test_init_db_twice_idempotent():
+    p = _tmp_db()
+    init_db(p)
+    conn = connect(p)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(trade_signals)")}
+        assert "horizon" in cols and "layer" in cols
+        ver = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert ver >= 13
+    finally:
+        conn.close()
+
+
+def test_signal_defaults_horizon_short_layer_watch():
+    from invest.signals.types import HORIZONS, LAYERS, SESSIONS, Signal
+
+    s = Signal(
+        id="x", name="n", session="intraday", severity="info",
+        subject_type="stock", subject="600519", hint="h",
+    )
+    assert s.horizon == "short"
+    assert s.layer == "watch"
+    assert "daily" in SESSIONS
+    assert HORIZONS == ("short", "mid")
+    assert LAYERS == ("watch", "discovery", "market")
+
+
+def test_assign_layer_market_watch_discovery():
+    from invest.signals.universe import assign_layer
+
+    watch = {"600519"}
+    discovery = {"000001"}
+    assert assign_layer("market", "市场", watch, discovery) == "market"
+    assert assign_layer("etf", "510300", watch, discovery) == "market"
+    assert assign_layer("sector", "半导体", watch, discovery) == "discovery"
+    assert assign_layer("stock", "600519", watch, discovery) == "watch"
+    assert assign_layer("stock", "000002", watch, discovery) == "discovery"
+
+
+def test_thresholds_phase2_constants():
+    from invest.signals.thresholds import (
+        AUCTION_YOY,
+        BOARD_HIGH_OPEN_PCT,
+        BOARD_LOW_OPEN_PCT,
+        BOARD_TOP_N,
+        DISCOVERY_STOCK_CAP,
+        DISPLAY_A3,
+        DISPLAY_A7,
+        DISPLAY_B1_DISCOVERY_ACTION,
+        DISPLAY_B1_WATCH,
+        DISPLAY_LIMIT,
+        DISPLAY_WIDE,
+        FLOW_SPIKE,
+        PATH_DAYS,
+        QUAD_CHASE_LIMIT,
+        QUAD_CROWDING,
+        QUAD_HUNT_LIMIT,
+        QUAD_RS_ZERO,
+        QUAD_WATCH_LIMIT,
+        ROTATION_LEAD_RANK,
+        RS_CORE_PER_INDUSTRY,
+        RS_INDUSTRY_TOP,
+        RS_LEADER_RANK,
+        RS_LEADER_UP,
+    )
+
+    assert DISPLAY_LIMIT == 8
+    assert DISPLAY_B1_WATCH == 12
+    assert DISPLAY_B1_DISCOVERY_ACTION == 5
+    assert DISPLAY_A7 == 12
+    assert DISPLAY_A3 == 12
+    assert DISPLAY_WIDE == 30
+    assert DISCOVERY_STOCK_CAP == 80
+    assert RS_INDUSTRY_TOP == 8
+    assert RS_CORE_PER_INDUSTRY == 3
+    assert BOARD_TOP_N == 10
+    assert AUCTION_YOY == 0.80
+    assert BOARD_HIGH_OPEN_PCT == 3.0
+    assert BOARD_LOW_OPEN_PCT == -3.0
+    assert FLOW_SPIKE == 2.0
+    assert RS_LEADER_RANK == 8
+    assert RS_LEADER_UP == 3
+    assert ROTATION_LEAD_RANK == 15
+    assert QUAD_RS_ZERO == 0.0
+    assert QUAD_CROWDING == 0.8
+    assert QUAD_HUNT_LIMIT == 8
+    assert QUAD_CHASE_LIMIT == 8
+    assert QUAD_WATCH_LIMIT == 6
+    assert PATH_DAYS == 5
+
+
 def test_watch_universe_core_track_and_cards():
     from invest.signals.universe import watch_symbols
 
@@ -105,6 +244,56 @@ def test_auction_keep_vol_hits_limit_up_stock():
         sigs = scan(conn, "auction", asof=ASOF, quotes=quotes)
         ids = [s.id for s in sigs if s.subject == "600519"]
         assert "auction_keep_vol" in ids
+    finally:
+        conn.close()
+
+
+def test_scan_daily_does_not_fetch_quotes(monkeypatch):
+    import importlib
+
+    scan_mod = importlib.import_module("invest.signals.scan")
+
+    def _boom(_symbols=None):
+        raise AssertionError("daily must not fetch quotes")
+
+    monkeypatch.setattr(scan_mod, "_fetch_quotes", _boom)
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        sigs = scan_mod.scan(conn, "daily", asof=ASOF)
+        assert sigs == []
+    finally:
+        conn.close()
+
+
+def test_scan_layers_filter():
+    from invest.signals.scan import scan
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        _add_pool(conn, "600519")
+        _seed_bars(conn, "600519", last_vol=10_000, avg_vol=10_000)
+        _seed_bars(conn, "000002", last_vol=10_000, avg_vol=10_000)
+        conn.execute("INSERT INTO limit_up_pool(date, symbol, name, lianban, zhaban) "
+                     "VALUES(?,?,?,?,0)", (YDAY.strftime("%Y%m%d"), "600519", "茅台", 2))
+        conn.execute("INSERT INTO limit_up_pool(date, symbol, name, lianban, zhaban) "
+                     "VALUES(?,?,?,?,0)", (YDAY.strftime("%Y%m%d"), "000002", "万科", 1))
+        conn.commit()
+        quotes = {
+            "600519": {"name": "茅台", "price": 10.0, "pct": 1.2, "vol": 400},
+            "000002": {"name": "万科", "price": 10.0, "pct": 1.2, "vol": 400},
+        }
+        all_sigs = scan(conn, "auction", asof=ASOF, quotes=quotes, boards=[])
+        disc = next(s for s in all_sigs if s.subject == "000002" and s.id == "auction_keep_vol")
+        assert disc.layer == "discovery"
+        watch = next(s for s in all_sigs if s.subject == "600519" and s.id == "auction_keep_vol")
+        assert watch.layer == "watch"
+        filtered = scan(conn, "auction", asof=ASOF, quotes=quotes, layers=["watch"])
+        subjects = {s.subject for s in filtered if s.id == "auction_keep_vol"}
+        assert "600519" in subjects
+        assert "000002" not in subjects
+        assert scan(conn, "auction", asof=ASOF, quotes=quotes, horizon="mid") == []
     finally:
         conn.close()
 
@@ -296,8 +485,251 @@ def test_persist_signals_and_auction_snapshots():
                               (ASOF.isoformat(),)).fetchone()[0]
         assert n_sig >= 1
         assert n_snap == 1
+        row = conn.execute(
+            "SELECT horizon, layer FROM trade_signals WHERE subject='600519'"
+        ).fetchone()
+        assert row["horizon"] == "short"
+        assert row["layer"] in ("watch", "discovery")
     finally:
         conn.close()
+
+
+def _sig(**kwargs):
+    from invest.signals.types import Signal
+
+    base = {
+        "id": "high_vol", "name": "高位放量", "session": "close", "severity": "watch",
+        "subject_type": "stock", "subject": "600519", "hint": "量比2.5", "evidence": {},
+    }
+    base.update(kwargs)
+    return Signal(**base)
+
+
+def test_persist_writes_explicit_horizon_layer():
+    from invest.signals.persist import persist_signals
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        persist_signals(
+            conn,
+            [_sig(horizon="mid", layer="discovery", session="daily", id="quad_hunt")],
+            ASOF,
+            "daily",
+        )
+        row = conn.execute(
+            "SELECT horizon, layer, session FROM trade_signals WHERE subject='600519'"
+        ).fetchone()
+        assert row["horizon"] == "mid"
+        assert row["layer"] == "discovery"
+        assert row["session"] == "daily"
+    finally:
+        conn.close()
+
+
+def test_persist_daily_does_not_delete_close():
+    from invest.signals.persist import persist_signals
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        persist_signals(conn, [_sig(session="close", id="high_vol")], ASOF, "close")
+        persist_signals(
+            conn,
+            [_sig(session="daily", id="quad_hunt", horizon="mid", layer="market")],
+            ASOF,
+            "daily",
+        )
+        sessions = {
+            r[0]
+            for r in conn.execute(
+                "SELECT session FROM trade_signals WHERE date=?", (ASOF.isoformat(),)
+            )
+        }
+        assert sessions == {"close", "daily"}
+    finally:
+        conn.close()
+
+
+def test_persist_missing_horizon_layer_columns_does_not_raise():
+    """未 migrate 的旧表：persist 不炸，仍能写入一期列。"""
+    from invest.signals.persist import persist_signals
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        conn.execute("DROP TABLE trade_signals")
+        conn.execute(
+            """CREATE TABLE trade_signals (
+                date TEXT NOT NULL,
+                session TEXT NOT NULL,
+                signal_id TEXT NOT NULL,
+                subject_type TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                name TEXT,
+                hint TEXT,
+                evidence TEXT,
+                src TEXT NOT NULL DEFAULT 'signals',
+                PRIMARY KEY (date, session, signal_id, subject)
+            )"""
+        )
+        conn.commit()
+        persist_signals(conn, [_sig()], ASOF, "close")
+        n = conn.execute("SELECT COUNT(*) FROM trade_signals").fetchone()[0]
+        assert n == 1
+    finally:
+        conn.close()
+
+
+def test_list_signals_filters_by_layer():
+    from invest.signals.persist import persist_signals
+    from invest.signals.query import list_signals
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        persist_signals(
+            conn,
+            [
+                _sig(layer="watch", subject="600519", id="high_vol"),
+                _sig(layer="discovery", subject="000002", id="shrink_extreme"),
+            ],
+            ASOF,
+            "close",
+        )
+        rows = list_signals(conn, ASOF)
+        assert len(rows) == 2
+        watch = list_signals(conn, ASOF, layer="watch")
+        assert len(watch) == 1 and watch[0]["subject"] == "600519"
+        disc = list_signals(conn, ASOF, layer="discovery")
+        assert len(disc) == 1 and disc[0]["subject"] == "000002"
+        latest = list_signals(conn)
+        assert len(latest) == 2
+        assert list_signals(conn, ASOF, horizon="mid") == []
+        sess = list_signals(conn, ASOF, session="close")
+        assert len(sess) == 2
+    finally:
+        conn.close()
+
+
+def test_list_signals_missing_columns_returns_empty():
+    from invest.signals.query import list_signals
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        conn.execute("DROP TABLE trade_signals")
+        conn.execute(
+            """CREATE TABLE trade_signals (
+                date TEXT NOT NULL,
+                session TEXT NOT NULL,
+                signal_id TEXT NOT NULL,
+                subject_type TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                name TEXT,
+                hint TEXT,
+                evidence TEXT,
+                src TEXT NOT NULL DEFAULT 'signals',
+                PRIMARY KEY (date, session, signal_id, subject)
+            )"""
+        )
+        conn.commit()
+        assert list_signals(conn, ASOF) == []
+    finally:
+        conn.close()
+
+
+def test_split_b1_main_excludes_discovery_watch():
+    from invest.signals.format import format_discovery_action, format_signals, split_b1
+
+    watch_main = [
+        _sig(subject=f"w{i}", layer="watch", horizon="short", severity="info", id=f"info{i}")
+        for i in range(3)
+    ]
+    market = [
+        _sig(subject="广度", layer="market", horizon="short", severity="watch",
+             subject_type="market", id="space_breadth"),
+    ]
+    disc_watch = [
+        _sig(subject=f"dw{i}", layer="discovery", horizon="short", severity="watch",
+             id="shrink_extreme")
+        for i in range(10)
+    ]
+    disc_act = [
+        _sig(subject=f"da{i}", layer="discovery", horizon="short", severity="action",
+             id="high_vol")
+        for i in range(3)
+    ]
+    mid = [
+        _sig(subject="半导体", layer="discovery", horizon="mid", severity="action",
+             subject_type="sector", id="quad_hunt"),
+    ]
+    main, disc = split_b1(watch_main + market + disc_watch + disc_act + mid)
+    assert all(s.layer in ("watch", "market") for s in main)
+    assert all(s.horizon == "short" for s in main)
+    assert not any(s.subject.startswith("dw") for s in main)
+    assert not any(s.id == "quad_hunt" for s in main)
+    assert not any(s.id == "quad_hunt" for s in disc)
+    assert "广度" in {s.subject for s in main}
+    assert len(disc) <= 5
+    assert len(disc) == 3
+    assert all(s.layer == "discovery" and s.severity == "action" for s in disc)
+    assert format_discovery_action(watch_main + disc_watch) == ""
+    text = format_discovery_action(watch_main + disc_act)
+    assert text.startswith("【明确发现】")
+    assert format_signals(watch_main, title="【自定义】").startswith("【自定义】")
+
+    extra = [
+        _sig(subject=f"dx{i}", layer="discovery", horizon="short", severity="action",
+             id=f"act{i}")
+        for i in range(6)
+    ]
+    _, disc6 = split_b1(extra)
+    assert len(disc6) == 5
+
+
+def test_undigested_actions_marks_out_of_pool():
+    from invest.signals.format import undigested_actions
+    from invest.signals.persist import persist_signals
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        persist_signals(
+            conn,
+            [_sig(severity="action", subject="000002", name="极致缩量",
+                  id="shrink_extreme", layer="discovery")],
+            YDAY,
+            "close",
+        )
+        text = undigested_actions(conn, ASOF)
+        assert "000002" in text
+        assert "池外" in text
+        assert "昨日未消化" in text
+    finally:
+        conn.close()
+
+
+def test_format_market_opportunity_quad_and_extra():
+    from invest.signals.format import format_market_opportunity
+
+    empty = format_market_opportunity([])
+    assert empty == ""
+    text = format_market_opportunity([
+        _sig(id="quad_hunt", name="主战场", subject="半导体", horizon="mid",
+             layer="discovery", subject_type="sector", session="daily",
+             hint="rs 0.25 crowding 0.30 正常"),
+        _sig(id="sector_resonance", name="板块共振", subject="半导体", horizon="mid",
+             layer="discovery", subject_type="sector", session="daily", hint="RS∩资金"),
+        _sig(id="emotion_stage_shift", name="情绪切换", subject="情绪", horizon="mid",
+             layer="market", subject_type="market", session="daily", hint="冰点→修复"),
+    ])
+    assert text.startswith("【市场机会（规则）】")
+    assert "主战场" in text and "半导体" in text
+    assert "板块共振" in text
+    assert "情绪切换" in text or "冰点" in text
 
 
 def test_d32_render_and_pick_limit():
@@ -339,6 +771,29 @@ def test_d32_render_and_pick_limit():
     assert "保量" in text or "交易信号" in text
     out = run_skill("d32_trade_signals", db_path=p, session="close")
     assert isinstance(out, str)
+    out_blank = run_skill("d32_trade_signals", db_path=p, session="close", horizon="", layer="")
+    assert isinstance(out_blank, str)
+
+    from invest.signals.persist import persist_signals
+    from invest.skills.sections.d32_trade_signals import render
+
+    conn3 = connect(p)
+    try:
+        persist_signals(
+            conn3,
+            [_sig(session="daily", horizon="mid", layer="discovery", id="quad_hunt",
+                  name="主战场", subject="半导体", hint="rs>0 crowding<0.8")],
+            ASOF,
+            "daily",
+        )
+        n_before = conn3.execute("SELECT COUNT(*) FROM trade_signals").fetchone()[0]
+        daily_text = render(p, session="daily", horizon="mid", layer="discovery")
+        assert "半导体" in daily_text
+        n_after = conn3.execute("SELECT COUNT(*) FROM trade_signals").fetchone()[0]
+        assert n_after == n_before
+        assert "半导体" not in render(p, session="daily", horizon="short")
+    finally:
+        conn3.close()
 
 
 def test_auto_overlays_background_zero_weight():

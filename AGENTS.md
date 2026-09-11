@@ -20,7 +20,7 @@
 7. 飞书发文本 `invest/push/feishu_push.send_message`；富文本 `send_post`；表情 `add_reaction`
 8. LLM 用量记 `llm_usage`（job 维度）；2026-08-20 起**不拦截只告警**（单次>2万 / 日累计>50万）
 9. 数据新鲜度防御：报告/回复前查 `query_data_freshness` / `_data_lag_reason`，滞后先说明原因再答
-10. 测试断言用 `pytest`；改定时任务同时更新 `test_pipeline.test_scheduler_jobs` 与 `JOB_FUNCS`
+10. 测试断言用 `pytest`；改定时任务同时更新 `test_pipeline.test_scheduler_jobs` 与 `JOB_FUNCS`。**同一 job 名一天只有一个 `run_slot`**：一天要跑两次必须拆两个 JOB_FUNCS（如 `action_digest` 10:00 + `action_digest_pm` 13:30），否则第二次 `already_ok` 被吃掉
 
 ## 已踩过的坑（勿重犯）
 - **飞书 lark-oapi**：`Message.mentions[].id` 是 **UserId 对象**（`.open_id` 属性）不是 str/dict；WS 事件用 **v2 信封**（查找键 `p2.xxx`），未订阅事件（如 reaction）须 **p1+p2 双注册 `_ignore_event`** 防 "processor not found" 刷屏
@@ -53,6 +53,10 @@
 - `invest/data/`：采集（collector / realtime 三源 / emotion 涨停池 / fund_flow 板块资金 / global_snapshot 隔夜外围 / sources / storage / calendar）
 - `invest/quant/`：量化计算（strength/rotation/temperature/capital/linkage/valuation/emotion_cycle/alpha158）
 - `invest/report.py`：日报/周报/盘中报告（`brief` 简洁版默认，`public` 去持仓警戒）/消息面（LLM 提炼）
+- `invest/signals/`：短线+中线交易信号（scan/落库/format）；仪表盘「交易信号」页只读 `trade_signals`
+- `invest/actions/`：每日动作清单（compose → daily_actions）+ 观察名单 watch_items + 盘中 digest；不自动下单、不自动入 core
+- `invest/bigv/`：大V画像库（watch/harvest/FTS/人格卡/ask_big_v）；仪表盘「大V画像库」+ 飞书 `/大V`；一期只采雪球
+- `dashboard/`：Streamlit 复盘（总览散点 / 交易信号 / 短中线轨）
 - `invest/agent/`：LLM 客户端（llm.py）+ 工具注册表（tools.py：**新增工具必须同步加 TOOL_SCHEMAS 和 dispatch**）+ 双 Agent（agents.py）
 - `invest/push/`：飞书（feishu_ws 长连接接收 / feishu_push 发送）/ 微信（weixin_push）
 - `invest/scheduler.py`：全部定时任务 + `JOB_FUNCS`（OS 任务入口）+ ticker

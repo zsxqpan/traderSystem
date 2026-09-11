@@ -58,10 +58,11 @@ def fetch_top_gainers(limit: int = 10) -> list[dict]:
     try:
         url = ("https://push2delay.eastmoney.com/api/qt/clist/get"
                f"?pn=1&pz={limit}&po=1&np=1&fltt=2&invt=2&fid=f3&fs={_FS_A}"
-               "&fields=f12,f14,f2,f3")
+               "&fields=f12,f14,f2,f3,f5,f6")
         diff = (_em_get(url).get("data") or {}).get("diff") or []
         return [{"symbol": str(it.get("f12", "")), "name": str(it.get("f14", "")),
-                 "pct": it.get("f3")} for it in diff]
+                 "pct": it.get("f3"), "vol": it.get("f5"), "amount": it.get("f6")}
+                for it in diff]
     except Exception as exc:
         logger.warning("竞价高开榜获取失败: %s", exc)
         return []
@@ -72,10 +73,11 @@ def fetch_top_losers(limit: int = 10) -> list[dict]:
     try:
         url = ("https://push2delay.eastmoney.com/api/qt/clist/get"
                f"?pn=1&pz={limit}&po=0&np=1&fltt=2&invt=2&fid=f3&fs={_FS_A}"
-               "&fields=f12,f14,f2,f3")
+               "&fields=f12,f14,f2,f3,f5,f6")
         diff = (_em_get(url).get("data") or {}).get("diff") or []
         return [{"symbol": str(it.get("f12", "")), "name": str(it.get("f14", "")),
-                 "pct": it.get("f3")} for it in diff]
+                 "pct": it.get("f3"), "vol": it.get("f5"), "amount": it.get("f6")}
+                for it in diff]
     except Exception as exc:
         logger.warning("竞价低开榜获取失败: %s", exc)
         return []
@@ -89,10 +91,11 @@ def fetch_vol_top(limit: int = 10) -> list[dict]:
     try:
         url = ("https://push2delay.eastmoney.com/api/qt/clist/get"
                f"?pn=1&pz={limit}&po=1&np=1&fltt=2&invt=2&fid=f5&fs={_FS_A}"
-               "&fields=f12,f14,f2,f3,f5")
+               "&fields=f12,f14,f2,f3,f5,f6")
         diff = (_em_get(url).get("data") or {}).get("diff") or []
         return [{"symbol": str(it.get("f12", "")), "name": str(it.get("f14", "")),
-                 "pct": it.get("f3"), "vol": it.get("f5")} for it in diff]
+                 "pct": it.get("f3"), "vol": it.get("f5"), "amount": it.get("f6")}
+                for it in diff]
     except Exception as exc:
         logger.warning("竞价放量榜获取失败: %s", exc)
         return []

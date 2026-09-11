@@ -355,9 +355,17 @@ def test_workbench_empty_as_of_on_empty_db_is_iso_date(db_path: str):
 
 
 def test_workbench_page_uses_resolved_as_of_not_today():
+    """中期比价页必须用已落库事实卡时点，不得回落到 date.today()。
+
+    2026-09-11：断言收窄到 page_mid_compare（动作表等其它页面合理使用 date.today()，
+    原「整文件不含 date.today()」的写法会误伤）。
+    """
     text = (ROOT / "dashboard" / "app.py").read_text(encoding="utf-8")
     assert "resolve_workbench_as_of" in text
-    assert "date.today().isoformat()" not in text
+    start = text.index("def page_mid_compare")
+    end = text.index("\ndef ", start + 1) if "\ndef " in text[start + 1:] else len(text)
+    body = text[start:end]
+    assert "date.today().isoformat()" not in body
 
 
 def test_human_comparison_record_stores_peer_set_and_conclusion(db_path: str):

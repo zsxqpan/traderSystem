@@ -84,14 +84,15 @@ def _fresh_db():
 # ---------- 注册表完整性 ----------
 
 def test_registry_complete():
-    """39 个 skill 全注册：7 报告 + 32 小节；元数据与 uses 引用全合法。"""
+    """40 个 skill 全注册：7 报告 + 33 小节；元数据与 uses 引用全合法。"""
     ids = registry.list_skills()
-    assert len(ids) == 39, f"期望 39 个 skill，实际 {len(ids)}"
+    assert len(ids) == 40, f"期望 40 个 skill，实际 {len(ids)}"
     reports = registry.list_skills("report")
     sections = registry.list_skills("section")
     assert len(reports) == 7
-    assert len(sections) == 32
+    assert len(sections) == 33
     assert "d32_trade_signals" in sections
+    assert "d33_daily_actions" in sections
     assert set(reports) == {"a0_premarket", "a3_daily", "a4_weekly", "a5_monthly",
                             "a6_yearly", "a7_auction", "b1_intraday"}
     assert registry.validate_all() == []  # 元数据合法 + uses 引用存在
@@ -160,6 +161,24 @@ def test_a3_structured(monkeypatch):
                         lambda conn: [{"date": "2026-08-21", "plan_summary": "看多半导体",
                                        "actual_summary": "半导体 +1.2% 兑现"}])
 
+    from invest.signals.persist import persist_signals
+    from invest.signals.types import Signal
+
+    conn_q = connect(p)
+    try:
+        persist_signals(
+            conn_q,
+            [Signal(
+                id="quad_hunt", name="主战场", session="daily", severity="watch",
+                subject_type="sector", subject="半导体", hint="rs>0 crowding<0.8",
+                horizon="mid", layer="discovery",
+            )],
+            dt.date(2026, 8, 14),
+            "daily",
+        )
+    finally:
+        conn_q.close()
+
     struct = run_structured("a3_daily", db_path=p)
     texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
     tables = [s for s in struct["sections"] if s.get("type") == "table"]
@@ -168,11 +187,13 @@ def test_a3_structured(monkeypatch):
     assert "点2 盘中观点复盘" in texts and "量能判断失误" in texts
     assert "点3 重要板块总分析" in texts and "AI硬件" in texts and "机器人" in texts
     assert "点4 明日预案" in texts and "600519" in texts
+    assert any(t["title"] == "明日动作（规则）" for t in tables)
     assert "预案质量复盘" in texts and "增加ETF量能权重" in texts
     # 2026-08-24：指数 ETF 解读（LLM 详细归因 + 风格变化）
     assert "指数ETF解读" in texts and "大资金进场" in texts and "风格变化可能" in texts
     # 预案闭环：plan_data 可落库
     assert struct.get("plan_data", {}).get("direction") == "继续关注AI硬件"
+    assert "中线战场" in texts or "主战场" in texts
 
 
 def test_b1_structured(monkeypatch):
@@ -196,8 +217,10 @@ def test_b1_structured(monkeypatch):
         "000852": {"name": "中证1000", "price": 7601.8, "pct": 0.9},
     })
     monkeypatch.setattr("invest.data.etf.fetch_etf_quotes", lambda codes=None: {})
-    # 2026-09-03：交易信号 scan 自取行情，测试里 mock 掉避免联网
-    monkeypatch.setattr("invest.data.auction.fetch_batch_quotes", lambda symbols=None: {})
+    monkeypatch.setattr("invest.data.auction.fetch_batch_quotes",
+                        lambda symbols=None: {s: {"name": s, "price": 105.0, "pct": 5.0, "vol": 1000}
+                                              for s in (symbols or [])})
+    monkeypatch.setattr("invest.data.auction.fetch_industries", lambda symbols=None: {})
     with mock.patch("invest.report._live_quotes", return_value=({"600519": 105.0}, {"600519": 0.05})), \
          mock.patch("invest.data.realtime.RealtimeQuoter._fetch_merged", side_effect=RuntimeError("down")):
         struct = run_structured("b1_intraday", db_path=p)
@@ -377,7 +400,6 @@ def test_a7_auction_structured(monkeypatch):
             return out
 
     monkeypatch.setattr("invest.data.realtime.RealtimeQuoter", _LiveQuoter)
-    # 2026-09-03：交易信号热门板块核心会调 fetch_industries，测试里 mock 避免联网
     monkeypatch.setattr("invest.data.auction.fetch_industries",
                         lambda symbols=None: {s: "半导体" for s in (symbols or [])})
     # 关键股票：mock 热门板块核心股（避免依赖 industry_map 数据）
@@ -409,6 +431,8 @@ def test_a7_auction_structured(monkeypatch):
     assert struct.get("views", {}).get("analysis", {}).get("index")
     # 交易信号节：连板全高开 → 至少有高开率信号
     assert "交易信号" in texts
+    assert "过精确阈值" in texts
+    assert "发现器" in texts
 
 
 # ---------- 错误路径 ----------
@@ -1184,3 +1208,344 @@ def test_query_data_freshness_includes_report_ledger():
         assert jobs.get("auction") == "data_insufficient"
     finally:
         conn.close()
+
+
+def test_b1_discovery_action_not_watch_hint(monkeypatch):
+    """明确发现只收 discovery+action，不含 discovery watch 的 hint。"""
+    import importlib
+
+    import invest.skills.sections._intraday_llm as _il
+    from invest.signals.types import Signal
+    from invest.skills.runner import run_structured
+
+    _il.mood_llm = lambda db, ctx: {"mood": "暖", "prediction": "x", "short_term": "y"}
+    _il.mainline_llm = lambda db, ctx: {"main_lines": [], "core_outlook": ""}
+    fake = [
+        Signal(id="high_vol", name="高位放量", session="intraday", severity="action",
+               subject_type="stock", subject="000002", hint="量比滞涨发现票",
+               horizon="short", layer="discovery"),
+        Signal(id="shrink_extreme", name="极致缩量", session="intraday", severity="watch",
+               subject_type="stock", subject="000003", hint="洗盘观察池外不该出现",
+               horizon="short", layer="discovery"),
+        Signal(id="quad_hunt", name="主战场", session="daily", severity="action",
+               subject_type="sector", subject="半导体", hint="中线不进b1",
+               horizon="mid", layer="discovery"),
+    ]
+    scan_mod = importlib.import_module("invest.signals.scan")
+    monkeypatch.setattr(scan_mod, "scan_db", lambda *a, **k: fake)
+    monkeypatch.setattr("invest.data.index_realtime.fetch_index_realtime", lambda: {
+        "000001": {"name": "上证指数", "price": 3905.2, "pct": 0.35},
+    })
+    monkeypatch.setattr("invest.data.auction.fetch_batch_quotes",
+                        lambda symbols=None: {})
+    monkeypatch.setattr("invest.data.auction.fetch_industries", lambda symbols=None: {})
+    p = _fresh_db()
+    with mock.patch("invest.report._live_quotes", return_value=({}, {})):
+        struct = run_structured("b1_intraday", db_path=p)
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+    assert "明确发现" in texts
+    assert "000002" in texts
+    assert "洗盘观察池外不该出现" not in texts
+    assert "中线不进b1" not in texts
+
+
+def test_weekly_report_contains_mid_signals():
+    from invest.report import weekly_report
+    from invest.signals.persist import persist_signals
+    from invest.signals.types import Signal
+
+    p = _fresh_db()
+    conn = connect(p)
+    try:
+        persist_signals(
+            conn,
+            [Signal(
+                id="quad_hunt", name="主战场", session="daily", severity="watch",
+                subject_type="sector", subject="半导体", hint="拥挤回落仍强",
+                horizon="mid", layer="discovery",
+            )],
+            dt.date(2026, 8, 14),
+            "daily",
+        )
+    finally:
+        conn.close()
+    from pathlib import Path
+
+    msg = weekly_report(p)
+    assert "中线信号" in msg
+    assert "半导体" in msg
+    root = Path(__file__).resolve().parents[1]
+    src_a5 = (root / "invest/skills/reports/a5_monthly.py").read_text(encoding="utf-8")
+    src_a6 = (root / "invest/skills/reports/a6_yearly.py").read_text(encoding="utf-8")
+    assert "format_market_opportunity" not in src_a5
+    assert "scan_db" not in src_a6
+
+
+def test_llm_prompts_forbid_quadrant_fabrication():
+    from pathlib import Path
+
+    from invest.skills.sections import _daily_llm, _intraday_llm
+
+    assert "禁止编造" in _daily_llm._SIGNAL_CITE
+    assert "象限" in _daily_llm._SIGNAL_CITE
+    assert "象限" in _intraday_llm._SIGNAL_CITE
+    src = (Path(__file__).resolve().parents[1] / "invest/skills/sections/_daily_llm.py").read_text(encoding="utf-8")
+    assert "quad_hunt" in src
+    assert "不要因为没有 hunt" in src
+
+
+def test_llm_prompts_forbid_suggest_buy():
+    from pathlib import Path
+
+    from invest.skills.sections import _daily_llm, _intraday_llm
+
+    assert "建议买入" in _daily_llm._SIGNAL_CITE or "建议买入" in _daily_llm._ACTION_CITE
+    assert "建议买入" in _intraday_llm._SIGNAL_CITE
+    root = Path(__file__).resolve().parents[1]
+    for rel in (
+        "invest/skills/reports/a0_premarket.py",
+        "invest/skills/reports/a3_daily.py",
+        "invest/skills/reports/a7_auction.py",
+        "invest/skills/reports/b1_intraday.py",
+        "invest/skills/sections/d32_trade_signals.py",
+        "invest/skills/sections/d33_daily_actions.py",
+    ):
+        text = (root / rel).read_text(encoding="utf-8")
+        assert "建议买入" not in text
+
+
+def test_d32_d33_readonly_no_persist(monkeypatch):
+    from invest.skills.sections.d32_trade_signals import render as d32
+    from invest.skills.sections.d33_daily_actions import render as d33
+
+    p = _fresh_db()
+    conn = connect(p)
+    try:
+        n_sig = conn.execute("SELECT COUNT(*) AS n FROM trade_signals").fetchone()["n"]
+        n_act = conn.execute("SELECT COUNT(*) AS n FROM daily_actions").fetchone()["n"]
+    finally:
+        conn.close()
+
+    def _boom(*a, **k):
+        raise AssertionError("d32/d33 不得落库")
+
+    import invest.actions.persist as act_persist
+    import invest.signals.persist as sig_persist
+
+    monkeypatch.setattr(sig_persist, "persist_signals", _boom)
+    monkeypatch.setattr(act_persist, "persist_actions", _boom)
+    d32(p, session="intraday")
+    d32(p, session="daily")
+    d33(p)
+    conn = connect(p)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM trade_signals").fetchone()["n"] == n_sig
+        assert conn.execute("SELECT COUNT(*) AS n FROM daily_actions").fetchone()["n"] == n_act
+    finally:
+        conn.close()
+
+
+def test_a7_scan_receives_boards_and_core_tags_watch_only(monkeypatch):
+    """boards 必须传入 scan；核心表 tags 只标 watch。"""
+    import invest.skills.sections._intraday_llm as _il
+    from invest.data.quotes import AssetRef, QuoteResult
+    from invest.signals.types import Signal
+    from invest.skills.runner import run_structured
+    from invest.skills.snapshot import DataBlock, ReportSnapshot
+
+    captured: dict = {}
+
+    def _scan(db_path, session, **kw):
+        captured["session"] = session
+        captured["boards"] = kw.get("boards")
+        captured["persist"] = kw.get("persist")
+        return [
+            Signal(
+                id="shrink_extreme", name="极致缩量", session="auction",
+                severity="watch", subject_type="stock", subject="600519",
+                hint="发现层不该进核心标签", horizon="short", layer="discovery",
+            ),
+            Signal(
+                id="auction_keep_vol", name="竞价保量", session="auction",
+                severity="watch", subject_type="stock", subject="600519",
+                hint="池内保量", horizon="short", layer="watch",
+            ),
+        ]
+
+    import importlib
+
+    scan_mod = importlib.import_module("invest.signals.scan")
+    monkeypatch.setattr(scan_mod, "scan_db", _scan)
+    _il.auction_llm = lambda db, ctx: {}
+    _il.key_stock_llm = lambda db, ctx: {"blocks": []}
+    _il.section_analysis_llm = lambda db, ctx: {}
+
+    now = dt.datetime(2026, 8, 22, 9, 26)
+    q = QuoteResult(
+        ref=AssetRef("600519", "stock", "茅台"), price=10.0, pct=0.01,
+        ts=now, src="test", status="live", freshness="live",
+    )
+    snap = ReportSnapshot(skill_id="a7_auction", as_of=now.isoformat(timespec="seconds"))
+    boards = {
+        "gainers": [{"symbol": "600519", "name": "茅台", "pct": 2.0, "vol": 1e6}],
+        "losers": [{"symbol": "000001", "name": "平安", "pct": -2.0, "vol": 1e5}],
+        "vol_top": [{"symbol": "300750", "name": "宁德", "pct": 1.0, "vol": 2e6}],
+    }
+    snap.blocks["auction_boards"] = DataBlock("auction_boards", snap.as_of, True, payload=boards)
+    snap.blocks["index_quotes"] = DataBlock("index_quotes", snap.as_of, True, quotes=[])
+    snap.blocks["core_quotes"] = DataBlock("core_quotes", snap.as_of, True, quotes=[q])
+    snap.blocks["ladder_quotes"] = DataBlock("ladder_quotes", snap.as_of, True, quotes=[])
+    snap.blocks["key_quotes"] = DataBlock("key_quotes", snap.as_of, True, payload={"hot": []}, quotes=[])
+    monkeypatch.setattr("invest.skills.snapshot.freeze_snapshot", lambda *a, **k: snap)
+
+    p = _fresh_db()
+    struct = run_structured("a7_auction", db_path=p, snapshot=snap)
+    assert captured.get("session") == "auction"
+    assert captured.get("persist") is True
+    board_syms = {b.get("symbol") for b in (captured.get("boards") or [])}
+    assert {"600519", "000001", "300750"} <= board_syms
+    core = next(t for t in struct["sections"] if t.get("type") == "table" and "核心关注" in t.get("title", ""))
+    flat = " ".join(str(x) for row in core["rows"] for x in row)
+    assert "发现层不该进核心标签" not in flat
+    assert "极致缩量" not in flat
+    assert "保量" in flat
+
+
+def test_b1_brief_keeps_discovery_and_caps_five(monkeypatch):
+    """简洁版也有明确发现；discovery×action 最多 5；中线不进。"""
+    import importlib
+
+    import invest.skills.sections._intraday_llm as _il
+    from invest.signals.types import Signal
+    from invest.skills.runner import run_structured
+
+    _il.mood_llm = lambda db, ctx: {}
+    _il.mainline_llm = lambda db, ctx: {"main_lines": [], "core_outlook": ""}
+    fake = [
+        Signal(
+            id="high_vol", name="高位放量", session="intraday", severity="action",
+            subject_type="stock", subject=f"00000{i}", hint=f"发现票{i}",
+            horizon="short", layer="discovery",
+        )
+        for i in range(1, 7)
+    ]
+    fake.append(Signal(
+        id="quad_hunt", name="主战场", session="daily", severity="action",
+        subject_type="sector", subject="半导体", hint="中线不进简洁版",
+        horizon="mid", layer="discovery",
+    ))
+    scan_mod = importlib.import_module("invest.signals.scan")
+    monkeypatch.setattr(scan_mod, "scan_db", lambda *a, **k: fake)
+    monkeypatch.setattr("invest.data.index_realtime.fetch_index_realtime", lambda: {
+        "000001": {"name": "上证指数", "price": 3905.2, "pct": 0.35},
+    })
+    monkeypatch.setattr("invest.data.auction.fetch_batch_quotes", lambda symbols=None: {})
+    monkeypatch.setattr("invest.data.auction.fetch_industries", lambda symbols=None: {})
+    p = _fresh_db()
+    from invest.actions.persist import persist_actions
+    from invest.actions.types import Action
+
+    conn_a = connect(p)
+    try:
+        persist_actions(
+            conn_a,
+            [Action(date=dt.date.today().isoformat(), symbol="600519",
+                    verb="hold", priority=1, source="card", hint="持仓对照")],
+            dt.date.today(),
+        )
+    finally:
+        conn_a.close()
+    with mock.patch("invest.report._live_quotes", return_value=({}, {})):
+        struct = run_structured("b1_intraday", db_path=p, brief=True)
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+    tables = [s for s in struct["sections"] if s.get("type") == "table"]
+    assert "明确发现" in texts
+    assert "中线不进简洁版" not in texts
+    disc_hits = [f"00000{i}" for i in range(1, 7) if f"00000{i}" in texts]
+    assert len(disc_hits) == 5
+    assert any(t["title"] == "动作对照" for t in tables)
+
+
+def test_a3_lessons_persist_and_action_before_point4(monkeypatch):
+    """lessons 落库；明日动作表在点4 预案之前。"""
+    import invest.skills.sections._daily_llm as _dl
+    from invest.skills.runner import run_structured
+
+    _dl.intraday_review_llm = lambda db, ctx: {
+        "verdict": "部分对", "wrong_reasons": ["量能"],
+        "lessons": ["放量日需看承接"]}
+    _dl.board_analysis_llm = lambda db, ctx: {"boards": []}
+    _dl.plan_gen_llm = lambda db, ctx: {
+        "direction": "观望", "picks": [{"name": "某股", "symbol": "600001",
+        "reason": "x", "plan": "等"}],
+        "plans": [{"symbol": "600519", "action": "持有"}]}
+    _dl.plan_review_llm = lambda db, ctx: {"quality": "一般", "fixes": ["增加ETF权重"]}
+    _dl.etf_analysis_llm = lambda db, ctx: {}
+    monkeypatch.setattr("invest.data.index_realtime.fetch_index_realtime", lambda: {
+        "000001": {"name": "上证指数", "price": 3905.2, "pct": 0.35}})
+    monkeypatch.setattr("invest.data.etf.fetch_etf_quotes", lambda codes=None: {})
+    monkeypatch.setattr("invest.data.etf.index_etf_signal_text", lambda: "")
+    monkeypatch.setattr("invest.data.etf.sector_etf_text", lambda: "")
+    monkeypatch.setattr("invest.data.auction.fetch_industries", lambda symbols=None: {})
+    monkeypatch.setattr("invest.agent.web_tools.web_search", lambda query, n=5: [])
+    monkeypatch.setattr(
+        "invest.skills.reports.a3_daily._plan_history",
+        lambda conn: [{"date": "2026-08-21", "plan_summary": "看多", "actual_summary": "+1%"}],
+    )
+    p = _fresh_db()
+    struct = run_structured("a3_daily", db_path=p)
+    titles = []
+    for s in struct["sections"]:
+        if s.get("type") == "table" and s.get("title"):
+            titles.append(s["title"])
+        elif s.get("type") == "text":
+            titles.append(s.get("text", "")[:40])
+    joined = "||".join(titles)
+    assert "明日动作（规则）" in joined
+    assert "点4 明日预案" in joined
+    assert joined.index("明日动作（规则）") < joined.index("点4 明日预案")
+    conn = connect(p)
+    try:
+        rows = conn.execute("SELECT kind, body FROM review_lessons").fetchall()
+        bodies = {r["body"] for r in rows}
+        kinds = {r["kind"] for r in rows}
+    finally:
+        conn.close()
+    assert "放量日需看承接" in bodies
+    assert "增加ETF权重" in bodies
+    assert "intraday" in kinds and "plan" in kinds
+
+
+def test_weekly_mid_uses_last_five_dates():
+    """周报中线取最近 5 个 date，更早的去重丢弃。"""
+    from invest.report import weekly_report
+    from invest.signals.persist import persist_signals
+    from invest.signals.types import Signal
+
+    p = _fresh_db()
+    conn = connect(p)
+    try:
+        for i, (day, subj) in enumerate((
+            (dt.date(2026, 8, 10), "太旧行业"),
+            (dt.date(2026, 8, 11), "行业A"),
+            (dt.date(2026, 8, 12), "行业B"),
+            (dt.date(2026, 8, 13), "行业C"),
+            (dt.date(2026, 8, 14), "行业D"),
+            (dt.date(2026, 8, 15), "行业E"),
+        )):
+            persist_signals(
+                conn,
+                [Signal(
+                    id="quad_hunt", name="主战场", session="daily", severity="watch",
+                    subject_type="sector", subject=subj, hint=f"d{i}",
+                    horizon="mid", layer="discovery",
+                )],
+                day,
+                "daily",
+            )
+    finally:
+        conn.close()
+    msg = weekly_report(p)
+    assert "中线信号" in msg
+    assert "行业A" in msg and "行业E" in msg
+    assert "太旧行业" not in msg

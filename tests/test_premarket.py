@@ -280,3 +280,119 @@ def test_render_feishu_chart(mock_upload=None):
     # 纯文本通道：图表转数据行
     plain = render_plain(struct)
     assert "📊 指数涨跌幅" in plain and "中证1000 +0.90%" in plain
+
+
+def test_a0_market_opportunity_from_quad(monkeypatch):
+    """库中有 quad_hunt → 盘前含主战场/行业名。"""
+    import datetime as dt
+
+    from invest.signals.persist import persist_signals
+    from invest.signals.types import Signal
+
+    p = _tmp_db()
+    conn = connect(p)
+    _seed(conn)
+    persist_signals(
+        conn,
+        [Signal(
+            id="quad_hunt", name="主战场", session="daily", severity="watch",
+            subject_type="sector", subject="半导体", hint="rs>0 crowding<0.8",
+            horizon="mid", layer="discovery",
+        )],
+        dt.date(2026, 8, 21),
+        "daily",
+    )
+    conn.close()
+    monkeypatch.setattr("invest.skills.sections._digest.overnight_analysis", lambda db: "外围普涨")
+    monkeypatch.setattr("invest.skills.sections._digest.digest", lambda db: dict(_DIGEST_OK))
+    monkeypatch.setattr("invest.data.global_snapshot.global_snapshot_rows", lambda: list(_SNAP_ROWS))
+    monkeypatch.setattr("invest.data.halt.fetch_halt_list", list)
+    monkeypatch.setattr("invest.skills.reports.a0_premarket._read_agent_focus", lambda: "半导体：关注")
+    struct = run_structured("a0_premarket", db_path=p)
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+    assert "市场机会" in texts or "主战场" in texts
+    assert "半导体" in texts
+
+
+def test_a0_yesterday_action_marks_pool_inout(monkeypatch):
+    """昨日 action 全列，池内/池外标注。"""
+    import datetime as dt
+
+    from invest.signals.persist import persist_signals
+    from invest.signals.types import Signal
+
+    p = _tmp_db()
+    conn = connect(p)
+    _seed(conn)
+    conn.execute(
+        "INSERT INTO candidate_pool(symbol, level, industry, in_date) "
+        "VALUES('600519','core','白酒','2026-08-20')"
+    )
+    persist_signals(
+        conn,
+        [
+            Signal(
+                id="shrink_extreme", name="极致缩量", session="close",
+                severity="action", subject_type="stock", subject="600519",
+                hint="缩量跌破昨收", horizon="short", layer="watch",
+            ),
+            Signal(
+                id="high_vol", name="高位放量", session="close",
+                severity="action", subject_type="stock", subject="000002",
+                hint="量比滞涨", horizon="short", layer="discovery",
+            ),
+        ],
+        dt.date(2026, 8, 21),
+        "close",
+    )
+    conn.close()
+    monkeypatch.setattr("invest.skills.sections._digest.overnight_analysis", lambda db: "x")
+    monkeypatch.setattr("invest.skills.sections._digest.digest", lambda db: dict(_DIGEST_OK))
+    monkeypatch.setattr("invest.data.global_snapshot.global_snapshot_rows", lambda: list(_SNAP_ROWS))
+    monkeypatch.setattr("invest.data.halt.fetch_halt_list", list)
+    monkeypatch.setattr("invest.skills.reports.a0_premarket._read_agent_focus", lambda: "")
+    struct = run_structured("a0_premarket", db_path=p)
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+    assert "昨日未消化" in texts or "昨日信号" in texts
+    assert "池内" in texts and "池外" in texts
+    assert "600519" in texts and "000002" in texts
+
+
+def test_a0_today_actions_mark_pool_inout(monkeypatch):
+    """今日动作表标池内/池外。"""
+    import datetime as dt
+
+    from invest.actions.persist import persist_actions
+    from invest.actions.types import Action
+
+    p = _tmp_db()
+    conn = connect(p)
+    _seed(conn)
+    conn.execute(
+        "INSERT INTO candidate_pool(symbol, level, industry, in_date) "
+        "VALUES('600519','core','白酒','2026-08-20')"
+    )
+    persist_actions(
+        conn,
+        [
+            Action(date="2026-08-24", symbol="600519", verb="hold", priority=2,
+                   source="card", hint="持仓等待"),
+            Action(date="2026-08-24", symbol="000002", verb="watch", priority=3,
+                   source="signal", hint="池外观察"),
+        ],
+        dt.date(2026, 8, 24),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr("invest.skills.sections._digest.overnight_analysis", lambda db: "x")
+    monkeypatch.setattr("invest.skills.sections._digest.digest", lambda db: dict(_DIGEST_OK))
+    monkeypatch.setattr("invest.data.global_snapshot.global_snapshot_rows", lambda: list(_SNAP_ROWS))
+    monkeypatch.setattr("invest.data.halt.fetch_halt_list", list)
+    monkeypatch.setattr("invest.skills.reports.a0_premarket._read_agent_focus", lambda: "")
+    struct = run_structured("a0_premarket", db_path=p)
+    tables = [s for s in struct["sections"] if s.get("type") == "table"]
+    act = next(t for t in tables if t.get("title") == "今日动作")
+    assert "池" in "".join(act["columns"])
+    cells = [c for row in act["rows"] for c in row]
+    assert "池内" in cells and "池外" in cells
+    assert "600519" in cells and "000002" in cells

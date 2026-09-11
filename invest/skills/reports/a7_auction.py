@@ -23,7 +23,7 @@ SKILL = {
     "name": "竞价报告",
     "kind": "report",
     "description": "9:25 竞价报告：指数竞价/高开量比榜/连板竞价/核心关注竞价/情绪预判(LLM)",
-    "uses": ["d12_limit_up_ladder", "d21_freshness", "d32_trade_signals"],
+    "uses": ["d12_limit_up_ladder", "d21_freshness", "d32_trade_signals", "d33_daily_actions"],
     "params": {
         "db_path": "str, required",
         "snapshot": "optional, 冻结快照；缺省则 render 内 freeze",
@@ -176,18 +176,19 @@ def render(db_path: str, snapshot=None) -> dict:
 
     sigs: list = []
     tags_for = None
-    try:
-        from invest.signals.format import tags_for as _tags_for
-        from invest.signals.scan import scan_db
-
-        tags_for = _tags_for
-        sigs = scan_db(db_path, "auction")  # 2026-09-03 合并：行情由 scan 自取（快照架构无 all_quotes）
-    except Exception:
-        sigs = []
     sig_text = ""
+    boards = list(gainers or []) + list(losers or []) + list(vol_top or [])
     try:
         from invest.signals.format import format_signals
+        from invest.signals.format import tags_for as _tags_for
+        from invest.signals.scan import scan_db
+        from invest.signals.thresholds import DISPLAY_A7
 
+        tags_for = _tags_for
+        sigs = scan_db(
+            db_path, "auction", boards=boards,
+            limit=DISPLAY_A7, persist=True,
+        )
         sig_text = format_signals(sigs)
     except Exception:
         pass
@@ -241,6 +242,10 @@ def render(db_path: str, snapshot=None) -> dict:
         blk = _sig_sec(sigs)
         if blk:
             sections.append(blk)
+            sections.append({
+                "type": "text",
+                "text": "信号=过精确阈值；下列榜单仍是发现器",
+            })
     except Exception:
         pass
 
@@ -299,15 +304,45 @@ def render(db_path: str, snapshot=None) -> dict:
     if core_rows:
         core_cols = ["代码", "名称", "竞价价", "竞价涨幅", "状态"]
         if tags_for:
-            tags = [tags_for(sigs, row[0]) or "-" for row in core_rows]
-            if any(t != "-" for t in tags):  # 有信号才加「信号」列，避免空列
+            tags = [tags_for(sigs, row[0], layers=["watch"]) or "-" for row in core_rows]
+            if any(t != "-" for t in tags):
                 core_cols.append("信号")
                 for row, tag in zip(core_rows, tags):
                     row.append(tag)
+        extra_cols: list[str] = []
+        watch_n = 0
+        try:
+            from invest.actions.format import VERB_CN, range_gap
+            from invest.actions.query import list_actions
+
+            conn_a = connect(db_path)
+            try:
+                amap = {r["symbol"]: r for r in list_actions(conn_a)}
+            finally:
+                conn_a.close()
+            extra_cols = ["动作", "距区间"]
+            for row in core_rows:
+                act = amap.get(row[0]) or {}
+                row.append(VERB_CN.get(act.get("verb") or "", act.get("verb") or "-") or "-")
+                try:
+                    price = float(str(row[2]).replace(",", ""))
+                except (TypeError, ValueError):
+                    price = None
+                row.append(range_gap(price, act.get("entry_lo"), act.get("entry_hi"),
+                                     act.get("stop_loss")))
+            watch_n = sum(1 for r in amap.values() if r.get("verb") == "watch")
+        except Exception:
+            extra_cols = []
+            watch_n = 0
         sections.append({
             "type": "table", "title": "核心关注/持仓竞价",
-            "columns": core_cols, "rows": core_rows,
+            "columns": core_cols + extra_cols, "rows": core_rows,
         })
+        if watch_n:
+            sections.append({
+                "type": "text",
+                "text": "池外观察动作已列入动作清单，不进核心表",
+            })
         if analysis:
             sections.append({"type": "text", "text": f"**核心关注竞价解析**: {_an('core')}"})
 
@@ -335,4 +370,5 @@ def render(db_path: str, snapshot=None) -> dict:
     return {"title": f"A股投资系统 · 竞价报告 {stamp}",
             "sections": sections, "views": views, "as_of": as_of,
             "completeness": {"status": gate.status, "detail": gate.detail,
-                             "degrade": gate.degrade}}
+                             "degrade": gate.degrade},
+            "signal_meta": {"boards": boards}}

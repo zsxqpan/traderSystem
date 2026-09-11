@@ -103,11 +103,13 @@ def xueqiu_fetch_user(conn, user_id: str, limit: int = 10) -> dict:
     # 建/更新画像（id 与主页固定；风格/擅长等由 big-v-monitor 后续补充）
     pid = f"xq_{uid}"
     try:
-        upsert_df(conn, "big_v_profile", _pd.DataFrame([{
+        from invest.bigv.watch import preserve_profile_fields
+
+        upsert_df(conn, "big_v_profile", _pd.DataFrame([preserve_profile_fields(conn, {
             "id": pid, "name": pid, "platform": "xueqiu",
             "xueqiu_id": uid, "homepage": f"https://xueqiu.com/u/{uid}",
             "updated_at": _dt.date.today().isoformat(),
-        }]))
+        })]))
     except Exception as exc:
         logger.warning("大V画像写入失败 %s: %s", pid, exc)
     return {"ok": True, "profile_id": pid, "statuses": rows[:limit]}
@@ -138,7 +140,8 @@ def xueqiu_fetch_article(conn, url: str, profile_id: str = "") -> dict:
                     "profile_id": profile_id,
                     "opinion_date": (art.get("time") or "")[:10] or "2026-08-25",
                     "symbol": "", "topic": (art.get("title") or "")[:100],
-                    "view": (art.get("text") or "")[:500],
+                    "view": (art.get("text") or "")[:60],
+                    "body": art.get("text") or "",
                     "bias": "", "confidence": None, "url": url,
                 }]))
             except Exception as exc:
@@ -515,7 +518,7 @@ def big_v_update(conn, action: str = "upsert_profile", profile_id: str = "", nam
                  track_record: str = "", source_links: str = "", notes: str = "",
                  opinion_date: str = "", symbol: str = "", topic: str = "",
                  view: str = "", bias: str = "", confidence: float | None = None,
-                 url: str = "") -> dict:
+                 url: str = "", body: str = "") -> dict:
     """写入/更新雪球大V画像或观点（big_v_update）。
 
     - action=upsert_profile：按 id 更新画像（name 必填；profile_id 缺省时由 name 自动生成）；
@@ -537,13 +540,15 @@ def big_v_update(conn, action: str = "upsert_profile", profile_id: str = "", nam
         nm = _s(name)
         if not (pid and nm):
             return {"ok": False, "error": "upsert_profile 需 name（profile_id 缺省时自动生成）"}
-        df = pd.DataFrame([{
+        from invest.bigv.watch import preserve_profile_fields
+
+        df = pd.DataFrame([preserve_profile_fields(conn, {
             "id": pid, "name": nm, "platform": _s(platform) or "xueqiu",
             "xueqiu_id": _s(xueqiu_id), "homepage": _s(homepage), "style": _s(style),
             "strengths": _s(strengths), "win_rate": _s(win_rate), "track_record": _s(track_record),
             "source_links": _s(source_links), "notes": _s(notes),
             "updated_at": dt.date.today().isoformat(),
-        }])
+        })])
         upsert_df(conn, "big_v_profile", df)
         return {"ok": True, "profile_id": pid}
     if action == "upsert_opinion":
@@ -556,15 +561,31 @@ def big_v_update(conn, action: str = "upsert_profile", profile_id: str = "", nam
         vw = _s(view)
         if not vw:
             return {"ok": False, "error": "upsert_opinion 需 view（观点内容）"}
+        link = _s(url)
+        if link:
+            exist_url = conn.execute(
+                "SELECT id FROM big_v_opinion WHERE url=? LIMIT 1", (link,),
+            ).fetchone()
+            if exist_url:
+                return {"ok": True, "profile_id": pid, "opinion_id": exist_url["id"],
+                        "deduped": True}
         cur = conn.execute(
-            """INSERT INTO big_v_opinion(profile_id, opinion_date, symbol, topic, view, bias, confidence, url)
-               VALUES(?,?,?,?,?,?,?,?)""",
+            """INSERT INTO big_v_opinion(profile_id, opinion_date, symbol, topic, view, bias, confidence, url, body)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
             (pid, _s(opinion_date) or dt.date.today().isoformat(), _s(symbol), _s(topic), vw,
-             _s(bias), confidence, _s(url)),
+             _s(bias), confidence, _s(url), _s(body) or vw),
         )
         conn.commit()
         return {"ok": True, "profile_id": pid, "opinion_id": cur.lastrowid}
     return {"ok": False, "error": f"未知 action: {action}"}
+
+
+def ask_big_v(conn, name: str = "", profile_id: str = "", question: str = "",
+              mode: str = "grounded") -> dict:
+    """以名单内大V 的视角回答（默认有据）。飞书 /大V 走本地分流，不依赖本工具。"""
+    from invest.bigv.ask import ask_big_v as _ask
+
+    return _ask(conn, name=name, profile_id=profile_id, question=question, mode=mode)
 
 
 def query_big_v(conn, name: str = "", profile_id: str = "", limit: int = 5) -> dict:
@@ -810,6 +831,8 @@ _SECTION_NO_GATE = {
     "d21_freshness", "d22_ratings", "d23_breadth", "d24_global_snapshot",
     "d25_overnight_analysis", "d26_market_watch", "d27_news_digest",
     "d28_community_hot", "d29_sector_resonance", "d30_cycle_position",
+    "d32_trade_signals",
+    "d33_daily_actions",
 }
 # 保留守卫（直接读 daily_bars 行情）：d16 持仓警戒收盘价 / d18 异常波动 / d19 做T / d31 杀猪盘K线
 
@@ -998,10 +1021,14 @@ TOOL_SCHEMAS = [
     {"type": "function", "function": {"name": "web_fetch", "description": "抓取指定网页正文（用于看搜索到的链接详情）", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
     {"type": "function", "function": {"name": "xueqiu_search", "description": "搜索雪球文章/大V（2026-08-24）：site:xueqiu.com 返回标题+摘要+链接（雪球站内被 WAF 保护无法抓正文，用搜索摘要获取某大V 近期文章/热门讨论）", "parameters": {"type": "object", "properties": {"keyword": {"type": "string", "description": "大V名/股票/关键词"}, "n": {"type": "integer", "description": "条数，默认5"}}, "required": ["keyword"]}}},
     {"type": "function", "function": {"name": "run_skill", "description": "跑 UZI 深度分析流水线（多维数据→LLM 多轮→HTML 报告）。**仅在用户明确提到『UZI』时调用**（如'跑 UZI'）；'深度分析/完整报告/全面分析'等词不代表要跑 UZI，改用 query_stock_daily/cross_validate 或角度 skill；depth=lite 快（约1分钟）", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "6位股票代码或名称"}, "depth": {"type": "string", "enum": ["lite", "medium", "deep"]}}, "required": ["symbol"]}}},
-    {"type": "function", "function": {"name": "big_v_update", "description": "写入/更新雪球大V画像或观点（big-v-monitor skill 用）。action=upsert_profile 更新画像（name 必填，profile_id 缺省自动生成）；action=upsert_opinion 追加观点（profile_id/view 必填，画像须先存在）。搜索到大V 新资料后调用沉淀，供下次复用", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["upsert_profile", "upsert_opinion"]}, "profile_id": {"type": "string"}, "name": {"type": "string"}, "platform": {"type": "string"}, "xueqiu_id": {"type": "string"}, "homepage": {"type": "string"}, "style": {"type": "string", "description": "风格：价投/成长/游资/宏观/量化/技术/趋势"}, "strengths": {"type": "string", "description": "擅长方向"}, "win_rate": {"type": "string", "description": "自述/公开胜率（注明口径）"}, "track_record": {"type": "string"}, "source_links": {"type": "string"}, "notes": {"type": "string"}, "opinion_date": {"type": "string", "description": "观点发表日 YYYY-MM-DD，缺省今天"}, "symbol": {"type": "string"}, "topic": {"type": "string"}, "view": {"type": "string", "description": "观点内容"}, "bias": {"type": "string", "enum": ["bullish", "bearish", "neutral"]}, "confidence": {"type": "number", "description": "0-1，可空"}, "url": {"type": "string", "description": "原文链接"}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "big_v_update", "description": "写入/更新雪球大V画像或观点（big-v-monitor skill 用）。action=upsert_profile 更新画像（name 必填，profile_id 缺省自动生成）；action=upsert_opinion 追加观点（profile_id/view 必填，画像须先存在）。搜索到大V 新资料后调用沉淀，供下次复用", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["upsert_profile", "upsert_opinion"]}, "profile_id": {"type": "string"}, "name": {"type": "string"}, "platform": {"type": "string"}, "xueqiu_id": {"type": "string"}, "homepage": {"type": "string"}, "style": {"type": "string", "description": "风格：价投/成长/游资/宏观/量化/技术/趋势"}, "strengths": {"type": "string", "description": "擅长方向"}, "win_rate": {"type": "string", "description": "自述/公开胜率（注明口径）"}, "track_record": {"type": "string"}, "source_links": {"type": "string"}, "notes": {"type": "string"}, "opinion_date": {"type": "string", "description": "观点发表日 YYYY-MM-DD，缺省今天"}, "symbol": {"type": "string"}, "topic": {"type": "string"}, "view": {"type": "string", "description": "观点内容"}, "bias": {"type": "string", "enum": ["bullish", "bearish", "neutral"]}, "confidence": {"type": "number", "description": "0-1，可空"}, "url": {"type": "string", "description": "原文链接"}, "body": {"type": "string", "description": "全文（进 FTS；缺省用 view）"}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "query_big_v", "description": "查询雪球大V画像与最近观点（big-v-monitor skill 用）。按 name 模糊或 profile_id 精确查；都不传则列出最近更新的画像。返回 profiles + opinions（含观点日期/标的/多空倾向/链接）", "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "profile_id": {"type": "string"}, "limit": {"type": "integer", "description": "画像条数，默认5"}}, "required": []}}},
-    {"type": "function", "function": {"name": "run_section", "description": "运行报告 D 组小节 skill（2026-08-23：日常对话按语义调用现成分析文本，返回 {section,text}）。section_id 全量：d1_news_block 消息面提炼(财联社电报→LLM挑重点)｜d2_focus_industries 重点关注行业｜d3_style 市场风格(大小盘/题材)｜d4_strength 行业强度榜(period/top)｜d5_movers 涨跌榜(n)｜d6_macro 宏观流动性｜d7_agent_viewpoints Agent观点(n)｜d8_temp_guide 温度倾向(score)｜d9_rating_guide 评级·仓位指南｜d10_action_guide 仓位建议(score)｜d11_emotion 情绪人气(涨停/连板/炸板+情绪周期)｜d12_limit_up_ladder 连板梯队｜d13_fund_line 资金主线(n)｜d14_sector_moves 板块异动(n)｜d15_capital_leaders 龙虎榜龙头(n)｜d16_card_alerts 持仓警戒｜d17_pool_delta 候选池变化｜d18_abnormal_moves 异常波动(n)｜d20_entry_timing 建仓时机｜d22_ratings 宏观/市场评级｜d23_breadth 涨跌家数｜d24_global_snapshot 隔夜外围｜d25_overnight_analysis 外围影响解读(LLM)｜d26_market_watch 涨停异动监控(停牌/暴雷)｜d27_news_digest 消息汇总(宏观/个股/市场外+风险)｜d28_community_hot 社区热议(n)｜d29_sector_resonance 板块共振(n)｜d30_cycle_position 周期行业定位｜d31_pool_trap_alerts 候选池预警｜d32_trade_signals 交易信号(session=auction/intraday/close)。不适用：d19_t_trade_hints 需实时价参数（对话不用）；d21_freshness 数据新鲜度用 query_data_freshness 工具。问'情绪/连板/板块/资金/宏观/外围/周期/消息/风格/持仓/异常'等现成统计或消息面时优先用这个，比裸查表更完整", "parameters": {"type": "object", "properties": {"section_id": {"type": "string", "description": "D 组小节 id（见描述清单）"}, "n": {"type": "integer", "description": "TOP n / 消息条数，多数小节可选，默认3-5"}, "period": {"type": "string", "description": "d4_strength 用：short/mid"}, "top": {"type": "integer", "description": "d4_strength 用：条数"}, "symbols": {"type": "array", "items": {"type": "string"}, "description": "d31 用：指定扫描标的"},
-                         "session": {"type": "string", "description": "d32 用：auction/intraday/close"}}, "required": ["section_id"]}}},
+    {"type": "function", "function": {"name": "ask_big_v", "description": "以指定大V视角回答问题（大V画像库）。默认 mode=grounded 必须对上原文；用户明确说推断/扮演才用 infer。口令 /大V 由飞书本地规则处理，不必调这个。", "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "profile_id": {"type": "string"}, "question": {"type": "string"}, "mode": {"type": "string", "enum": ["grounded", "infer"]}}, "required": ["question"]}}},
+    {"type": "function", "function": {"name": "run_section", "description": "运行报告 D 组小节 skill（2026-08-23：日常对话按语义调用现成分析文本，返回 {section,text}）。section_id 全量：d1_news_block 消息面提炼(财联社电报→LLM挑重点)｜d2_focus_industries 重点关注行业｜d3_style 市场风格(大小盘/题材)｜d4_strength 行业强度榜(period/top)｜d5_movers 涨跌榜(n)｜d6_macro 宏观流动性｜d7_agent_viewpoints Agent观点(n)｜d8_temp_guide 温度倾向(score)｜d9_rating_guide 评级·仓位指南｜d10_action_guide 仓位建议(score)｜d11_emotion 情绪人气(涨停/连板/炸板+情绪周期)｜d12_limit_up_ladder 连板梯队｜d13_fund_line 资金主线(n)｜d14_sector_moves 板块异动(n)｜d15_capital_leaders 龙虎榜龙头(n)｜d16_card_alerts 持仓警戒｜d17_pool_delta 候选池变化｜d18_abnormal_moves 异常波动(n)｜d20_entry_timing 建仓时机｜d22_ratings 宏观/市场评级｜d23_breadth 涨跌家数｜d24_global_snapshot 隔夜外围｜d25_overnight_analysis 外围影响解读(LLM)｜d26_market_watch 涨停异动监控(停牌/暴雷)｜d27_news_digest 消息汇总(宏观/个股/市场外+风险)｜d28_community_hot 社区热议(n)｜d29_sector_resonance 板块共振(n)｜d30_cycle_position 周期行业定位｜d31_pool_trap_alerts 候选池预警｜d32_trade_signals 交易信号(session=auction/intraday/close/daily,horizon=short/mid,layer=watch/discovery/market)｜d33_daily_actions 动作清单(date=YYYY-MM-DD)。不适用：d19_t_trade_hints 需实时价参数（对话不用）；d21_freshness 数据新鲜度用 query_data_freshness 工具。问'情绪/连板/板块/资金/宏观/外围/周期/消息/风格/持仓/异常/今日动作'等现成统计或消息面时优先用这个，比裸查表更完整", "parameters": {"type": "object", "properties": {"section_id": {"type": "string", "description": "D 组小节 id（见描述清单）"}, "n": {"type": "integer", "description": "TOP n / 消息条数，多数小节可选，默认3-5"}, "period": {"type": "string", "description": "d4_strength 用：short/mid"}, "top": {"type": "integer", "description": "d4_strength 用：条数"}, "symbols": {"type": "array", "items": {"type": "string"}, "description": "d31 用：指定扫描标的"},
+                         "session": {"type": "string", "description": "d32 用：auction/intraday/close/daily"},
+                         "horizon": {"type": "string", "description": "d32 用：short/mid，空=不过滤"},
+                         "layer": {"type": "string", "description": "d32 用：watch/discovery/market，空=不过滤"},
+                         "date": {"type": "string", "description": "d33 用：YYYY-MM-DD，空=最新"}}, "required": ["section_id"]}}},
     {"type": "function", "function": {"name": "load_skill", "description": "加载指定方法论 skill 的完整指令（SKILL.md 全文），本次回答按其执行。命中触发词时调用：grill-me/grilling（grill/拷问/挑战我的想法/找漏洞/拷问式需求对齐）、brainstorming（头脑风暴/设计/方案/怎么实现）、systemdebugging（debug/诊断/排查/为什么坏了/性能变慢/系统化排障）、角度 skill（stock-emotion/technical/fundamental/cycle、trap-scan、sector-analysis、opinion-analysis、big-v-monitor）、A-Stock-Skills/start-here 等。返回 {skill, text}；未知名返回 error 附可用清单，换名重试", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "skill 目录名或常用叫法（如 grill-me / brainstorming / systemdebugging / stock-fundamental / debug / grill）"}}, "required": ["name"]}}},
 ]
 
@@ -1031,6 +1058,7 @@ _IMPLEMENTATIONS = {
     "run_skill": run_skill,
     "big_v_update": big_v_update,
     "query_big_v": query_big_v,
+    "ask_big_v": ask_big_v,
     "run_section": run_section,
     "load_skill": load_skill,
 }
