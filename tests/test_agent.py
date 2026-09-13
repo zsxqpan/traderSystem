@@ -1734,6 +1734,81 @@ def test_bare_news_and_explain_skip_evidence_require():
     print("test_bare_news_and_explain_skip_evidence_require OK")
 
 
+def test_evidence_strip_keeps_dates_codes_and_scaled_numbers():
+    """2026-09-14 修：证据里有的数字不得误判「未核验」——日期/6位代码/亿·万换算/
+    千分位/比值↔百分比/字段名里的窗口（pct_20d→20）；编造数字仍必须剥离。"""
+    from invest.agent.agents import enforce_evidence
+
+    ev = [{
+        "id": "ev_1", "tool": "query_stock_daily", "kind": "quote",
+        "fetched_at": "2026-08-29T15:05:00", "as_of": "2026-08-29",
+        "url": None, "published_at": None,
+        "data": {
+            "symbol": "002415", "name": "海康威视", "latest_date": "2026-08-29",
+            "latest_close": 12.5034, "pct_1d": 0.0321, "pct_5d": 0.0417,
+            "pct_20d": 0.1905, "high_60d": 12.5, "low_60d": 6.5,
+            "amount": 123456789, "vol_ratio": 1.8, "main_net": 56780000,
+            "rs": 0.015, "score": 72,
+            "last_rows": [{"date": "2026-08-29", "close": 12.5}],
+        },
+    }]
+    ok = enforce_evidence(
+        "截至2026-08-29，海康威视(002415)[ev_1]收盘 12.50 元，涨 3.21%，"
+        "近5日 4.2%、近20日 19.05%，60日最高 12.50 元。"
+        "成交额约 1.23 亿元，量比 1.8，主力净流入 5,678 万元，RS +0.015，温度 72 分。",
+        ev, require=True,
+    )
+    assert "未核验" not in ok, ok
+    assert "2026-08-29" in ok and "002415" in ok
+    assert "1.23 亿" in ok and "5,678 万" in ok
+
+    bad = enforce_evidence(
+        "海康威视(002415)[ev_1]净利润 10 亿，涨 8%，目标价 99 元，仓位 30%",
+        ev, require=True,
+    )
+    assert "10" not in bad and "99" not in bad and "30" not in bad
+    assert bad.count("未核验") == 4
+
+    # 表格里省略年份的日期 + markdown/中文列表序号：定位与排版信息，不得被吞
+    # （注：日期/6位代码一律放行，代价是编造的日期也不会被标记——它们不是"行情数字"）
+    ok2 = enforce_evidence(
+        "**2. 位置** [ev_1]\n\n| 日期 | 收盘 |\n|---|---|\n| 08-29 | 12.50 |\n\n1、小结\n3) 末点\n",
+        ev, require=True,
+    )
+    assert "08-29" in ok2 and "12.50" in ok2
+    assert "**2. 位置**" in ok2 and "1、小结" in ok2 and "3) 末点" in ok2
+    assert "未核验" not in ok2, ok2
+
+    # 边界：模型自算的派生数字仍算未核验（防幻觉底线），公式里的原始数字放行
+    derived = enforce_evidence(
+        "海康威视(002415)[ev_1]距高点回撤约 18.3%（(12.50-12.5034)/12.5034）",
+        ev, require=True,
+    )
+    assert "18.3" not in derived and "未核验" in derived
+    assert "12.50" in derived and "12.5034" in derived
+    print("test_evidence_strip_keeps_dates_codes_and_scaled_numbers OK")
+
+
+def test_history_placeholder_stripped_before_injection():
+    """2026-09-14：历史注入前清掉「［未核验］」占位符，避免模型读到自己被校验的旧回答
+    后误判'我在编造'并自我检讨（二次污染）。"""
+    from invest.agent.agents import CORE_DISCIPLINE, _load_history, _save_history
+
+    assert "未核验" in CORE_DISCIPLINE  # 提示词必须保留这条免疫说明
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        _save_history(conn, "oc_clean", "大盘怎么样",
+                      "截至2026-［未核验］-［未核验］收盘，沪指 ［未核验］ 点。")
+        hist = _load_history(conn, "oc_clean")
+        assert len(hist) == 2
+        assert "未核验" not in hist[-1]["content"]
+        assert "2026-收盘" in hist[-1]["content"]
+    finally:
+        conn.close()
+    print("test_history_placeholder_stripped_before_injection OK")
+
+
 if __name__ == "__main__":
     test_tickets_flow()
     test_tools_query()
@@ -1791,4 +1866,6 @@ if __name__ == "__main__":
     test_one_cited_ev_still_strips_other_unverified_numbers()
     test_real_quote_payload_does_not_allow_ts_coverage_numbers()
     test_bare_news_and_explain_skip_evidence_require()
+    test_evidence_strip_keeps_dates_codes_and_scaled_numbers()
+    test_history_placeholder_stripped_before_injection()
     print("\nALL AGENT TESTS PASSED")

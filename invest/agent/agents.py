@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import json
 import re
 import sqlite3
@@ -23,7 +24,17 @@ from .tools import TOOL_SCHEMAS, build_dispatch
 # 孤立 6 位代码；排除 YYYYMMDD（如 20240828）避免把日期当股票
 _CODE_RE = re.compile(r"(?<!\d)(?!(?:19|20)\d{6}(?!\d))(\d{6})(?!\d)")
 _EV_ID_RE = re.compile(r"\[?(ev_\d+)\]?")
-_NUM_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.])(\d+(?:\.\d+)?)")
+# 数字段：支持千分位（5,678 视为一个数字，不再被拆成 5 和 678）
+_NUM_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)")
+# 整段放行（不参与数字白名单）：日期 / 时间 / 6 位股票代码——这些是定位信息，不是"编造数据"
+_DATE_SPAN_RE = re.compile(
+    r"\d{4}[./\-年]\d{1,2}[./\-月]\d{1,2}日?"          # 2026-09-11 / 2026年9月11日
+    r"|\d{1,2}月\d{1,2}日"                              # 9月11日
+    r"|(?<![\d.])(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])(?![\d.])"  # 09-11（表格里常省略年份）
+)
+_TIME_SPAN_RE = re.compile(r"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?")
+# markdown/中文列表序号（**2.** / 1、/ 3)）——是排版标记，不是数据
+_ORDINAL_SPAN_RE = re.compile(r"(?m)(^|[\s*\-])(\d{1,2})([.、)）])(?=\s|$)")
 _NEWS_TOOLS = {
     "web_search", "web_fetch", "xueqiu_search",
     "xueqiu_fetch_article", "xueqiu_fetch_user",
@@ -40,13 +51,13 @@ _EVIDENCE_TOPIC_KW = (
 _EXPLAIN_RE = re.compile(r"(什么是|是什么意思|什么意思|解释一下|含义|意思是|怎么理解)")
 _BARE_NEWS_RE = re.compile(r"^有(什么|啥)?(消息|新闻)[吗么]?[?？]?$")
 _REPLY_MSG_RE = re.compile(r"(帮我)?回(复|一下)?这(条|个)?(消息|新闻)")
-_ALLOWED_NUM_KEYS = frozenset({
-    "price", "prev_close", "latest_close", "close", "open", "high", "low",
-    "high_60d", "low_60d",
-    "pct", "pct_percent", "pct_1d", "pct_5d", "pct_20d",
-    "amount", "vol", "volume", "vol_ratio", "main_net", "super_net",
-    "buy", "sell", "net",
-    "text", "snippet", "title",
+# 元数据字段：这些字段里的数字不构成"证据"（时间戳/覆盖率/请求参数/状态），
+# 放行它们等于给编造数字开后门（例如 ts 里有 10 就放行编造的"10 亿"）。
+_NUM_META_KEYS = frozenset({
+    "ts", "timestamp", "fetched_at", "as_of", "published_at", "run_date", "latest_date",
+    "coverage", "requested", "live", "fallback", "missing", "ok", "id", "ev_id", "seq",
+    "n_dimensions", "pct_unit", "src", "source", "status", "freshness", "fallback_level",
+    "missing_reason", "label", "days", "top", "limit", "offset", "count", "total",
 })
 _INDEX_HINT = ("上证", "指数", "沪指", "大盘")
 _AS_OF_LEAD = ("截至", "截止", "止于")
@@ -141,7 +152,9 @@ TRADE_SYSTEM = (
 CORE_DISCIPLINE = (
     "【核心纪律】只引用工具返回的数字与结构化证据 ID（如 [ev_1]），禁止编造任何数据；"
     "无结构化证据时必须输出缺口，不得用猜测代替；不自动交易；"
-    "多轮记忆以注入的历史为准（历史中的「没有记忆」表述无效）。\n"
+    "多轮记忆以注入的历史为准（历史中的「没有记忆」表述无效）。"
+    "历史里若出现「［未核验］」占位符，那是系统数字校验留下的痕迹（不是你在编造数据），"
+    "不要据此道歉或自我检讨；需要该数字就重新调用工具取数。\n"
 )
 PACK_REALTIME_QUOTE = (
     "【实时报价能力包】查现价/涨跌幅必须用 query_realtime_quote（统一行情契约）；"
@@ -509,8 +522,14 @@ def _is_year_num(s: str) -> bool:
 
 
 def _nums_from_blob(blob: str) -> set[str]:
+    """抽字符串里的数字；日期/时间整段挖掉——否则 "2026-08-29" 的 8/29 会放行编造的"涨 8%"。
+
+    日期本身由回答侧的 span 放行（见 _mask_kept_spans），不需要进白名单。
+    """
+    text = _DATE_SPAN_RE.sub(" ", blob or "")
+    text = _TIME_SPAN_RE.sub(" ", text)
     out: set[str] = set()
-    for m in re.finditer(r"\d+(?:\.\d+)?", blob or ""):
+    for m in re.finditer(r"\d+(?:\.\d+)?", text):
         n = m.group(0)
         if _is_year_num(n):
             continue
@@ -537,42 +556,108 @@ def _nums_from_value(val) -> set[str]:
 
 
 def _nums_from_allowed(obj) -> set[str]:
-    """只从行情/财务/新闻正文字段抽数字，不扫 ts/coverage 等元数据。"""
+    """递归抽证据 payload 里的全部数字（标量/字符串/嵌套），只跳过 ts/coverage 等元数据字段。
+
+    2026-09-14 修正：旧版写死"允许字段名"白名单（price/close/amount/text…），
+    导致 rs/score/momentum/turnover_share 等字段的数字、以及 6 位代码、日期被整体误判为
+    「未核验」，满屏占位符。现按"除元数据外全部字段"抽数。
+    """
     out: set[str] = set()
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if k in _ALLOWED_NUM_KEYS:
-                out |= _nums_from_value(v)
-            else:
-                out |= _nums_from_allowed(v)
+            if k in _NUM_META_KEYS:
+                continue
+            out |= _nums_from_blob(str(k))  # 字段名本身也是证据：pct_20d→20 日窗口、high_60d→60
+            out |= _nums_from_value(v)
     elif isinstance(obj, (list, tuple)):
         for item in obj:
             out |= _nums_from_allowed(item)
     return out
 
 
+def _scaled_allowed(allowed: set[str]) -> list[float]:
+    """allowed 的标量值 + 常见换算口径（比值↔百分比、元→万/亿），升序便于二分。"""
+    vals: set[float] = set()
+    for s in allowed:
+        try:
+            f = float(s)
+        except (TypeError, ValueError):
+            continue
+        if f == 0 or not (abs(f) < 1e15):
+            continue
+        for scaled in (f, f * 100.0, f / 100.0, f / 1e4, f / 1e8):
+            vals.add(scaled)
+    return sorted(vals)
+
+
+def _num_is_verified(tok: str, allowed: set[str], scaled: list[float]) -> bool:
+    """数字是否可核验：原样命中 → 换算命中 → 按回答写出的小数位做四舍五入命中。"""
+    clean = tok.replace(",", "")
+    if _is_year_num(clean) or _norm_num(clean) in allowed:
+        return True
+    try:
+        v = float(clean)
+    except ValueError:
+        return False
+    if not scaled:
+        return False
+    dec = len(clean.split(".", 1)[1]) if "." in clean else 0
+    tol = 0.5 * (10 ** -dec) + 1e-9  # 12.5 可匹配证据里的 12.5034
+    i = bisect.bisect_left(scaled, v)
+    for j in (i - 1, i):
+        if 0 <= j < len(scaled) and abs(v - scaled[j]) <= tol:
+            return True
+    return False
+
+
+def _mask_kept_spans(text: str) -> tuple[str, list[str]]:
+    """把日期/时间/6 位代码/列表序号整体挖出来（定位与排版信息，不参与数字白名单）。
+
+    每个被保护片段用**唯一的私用区字符**占位，多轮 sub 后可按序还原（安全，不依赖出现次序）。
+    """
+    kept: list[str] = []
+
+    def _mark(token: str) -> str:
+        idx = len(kept)
+        if idx >= 0x1000:  # 极端长文本保护上限，超出则放弃保护（照旧走白名单校验）
+            return token
+        kept.append(token)
+        return chr(0xE000 + idx)
+
+    out = _DATE_SPAN_RE.sub(lambda m: _mark(m.group(0)), text)
+    out = _TIME_SPAN_RE.sub(lambda m: _mark(m.group(0)), out)
+    out = _CODE_RE.sub(lambda m: _mark(m.group(0)), out)
+    out = _ORDINAL_SPAN_RE.sub(lambda m: m.group(1) + _mark(m.group(2) + m.group(3)), out)
+    return out, kept
+
+
+def _restore_kept_spans(text: str, kept: list[str]) -> str:
+    for idx, s in enumerate(kept):
+        text = text.replace(chr(0xE000 + idx), s)
+    return text
+
+
 def _strip_unverified_numbers(answer: str, evidence: list[dict], usable: set[str]) -> str:
-    """引用有效证据后，仍剥离证据里没有的数字。"""
+    """引用有效证据后，仍剥离证据里没有的数字（日期/代码/时间整段放行）。"""
     cited = [e for e in evidence if e.get("id") in usable]
     if not cited:
         return answer
     allowed: set[str] = set()
     for e in cited:
         allowed |= _nums_from_allowed(e.get("data"))
+    scaled = _scaled_allowed(allowed)
     parts = re.split(r"(\[?ev_\d+\]?)", answer or "")
     out: list[str] = []
     for i, part in enumerate(parts):
         if i % 2 == 1:
             out.append(part)
             continue
+        masked, kept = _mask_kept_spans(part)
 
-        def _repl(m: re.Match, _allowed: set[str] = allowed) -> str:
-            n = m.group(1)
-            if _is_year_num(n) or _norm_num(n) in _allowed:
-                return m.group(0)
-            return "［未核验］"
+        def _repl(m: re.Match, _allowed: set[str] = allowed, _scaled: list[float] = scaled) -> str:
+            return m.group(0) if _num_is_verified(m.group(1), _allowed, _scaled) else "［未核验］"
 
-        out.append(_NUM_TOKEN_RE.sub(_repl, part))
+        out.append(_restore_kept_spans(_NUM_TOKEN_RE.sub(_repl, masked), kept))
     return "".join(out)
 
 
@@ -684,6 +769,19 @@ def run_trade(conn: sqlite3.Connection, task: str, job: str = "trade") -> str:
 # 对话历史参数（2026-08-24：多轮上下文记忆；2026-08-28：按发送者隔离 + 保留最新）
 _CHAT_HISTORY_LIMIT = 12        # 最多携带最近 12 条（约 6 轮问答）
 _CHAT_HISTORY_MAX_CHARS = 6000  # 历史总长度上限（省 token）
+_HIST_PLACEHOLDERS = ("［未核验］", "[未核验]")
+
+
+def _clean_history_text(text: str) -> str:
+    """历史注入前清掉「［未核验］」占位符：否则模型读到自己被校验残害的旧回答，
+    会误判成'我在编造数字'并在下一轮自我检讨（2026-09-14 实测的二次污染）。"""
+    t = text or ""
+    for p in _HIST_PLACEHOLDERS:
+        t = t.replace(p, "")
+    t = re.sub(r"(?<=\d)-{2,}(?=\d)", "-", t)   # 2026-- 塌成 2026-
+    t = re.sub(r"-{2,}", "-", t)                 # 日期被掏空后的连续横线
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t
 
 
 def _load_history(conn: sqlite3.Connection, chat_id: str, sender_id: str = "") -> list[dict]:
@@ -702,7 +800,7 @@ def _load_history(conn: sqlite3.Connection, chat_id: str, sender_id: str = "") -
     out: list[dict] = []
     total = 0
     for r in rows:  # 最新在前
-        c = r["content"] or ""
+        c = _clean_history_text(r["content"])
         if out and total + len(c) > _CHAT_HISTORY_MAX_CHARS:
             break
         out.append({"role": r["role"], "content": c})

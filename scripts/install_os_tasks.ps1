@@ -30,8 +30,8 @@
         powershell -ExecutionPolicy Bypass -File "C:\Users\狐狸怂\Documents\Codex\2026-08-01\la\traderSystem\scripts\install_os_tasks.ps1"
     卸载：
         powershell -ExecutionPolicy Bypass -File "...\install_os_tasks.ps1" -Uninstall
-    迁移后把常驻服务改为仅 ticker：
-        myenv\Scripts\python.exe -u scripts\run_service.py --ticker-only
+    迁移后重启常驻服务（默认就是 ticker-only，无需任何参数）：
+        powershell -ExecutionPolicy Bypass -File "...\scripts\restart_service.ps1"
 #>
 param([switch]$Uninstall, [switch]$DryRun)
 
@@ -233,7 +233,8 @@ foreach ($p in $powerJobs) {
     }
 }
 Write-Host ""
-Write-Host "下一步：把常驻服务改为仅 ticker（10s 轮询仍需常驻）："
-Write-Host "    myenv\Scripts\python.exe -u scripts\run_service.py --ticker-only"
+Write-Host "下一步：重启常驻服务（run_service.py 默认就是 ticker-only，无需 --ticker-only；"
+Write-Host "        10s 轮询 + 每分钟补偿 + 飞书长连接仍需常驻）："
+Write-Host "    powershell -ExecutionPolicy Bypass -File `"$root\scripts\restart_service.ps1`""
 Write-Host "验证：schtasks /Query /TN TraderSystem_evening_report"
 Write-Host "     schtasks /Query /TN TraderSystem_power_on /v /fo LIST   (WakeToRun 应为 True)"

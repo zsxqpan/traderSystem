@@ -60,7 +60,7 @@
 - `invest/agent/`：LLM 客户端（llm.py）+ 工具注册表（tools.py：**新增工具必须同步加 TOOL_SCHEMAS 和 dispatch**）+ 双 Agent（agents.py）
 - `invest/push/`：飞书（feishu_ws 长连接接收 / feishu_push 发送）/ 微信（weixin_push）
 - `invest/scheduler.py`：全部定时任务 + `JOB_FUNCS`（OS 任务入口）+ ticker
-- `scripts/`：run_service（常驻）/ run_job（单任务）/ install_os_tasks（计划任务注册）/ start_service
+- `scripts/`：run_service（常驻）/ run_job（单任务）/ **restart_service（重启常驻服务：改完 agents.py 等常驻进程内加载的代码后跑它，含进程识别+退出校验+job_runs 校验）** / install_os_tasks（计划任务注册）/ start_service
 
 ## 静态检查（2026-08-21 引入）
 - `ruff check invest scripts tests`：**必须 0 错误**（配置见 ruff.toml；忽略项为项目约定：DTZ 本地时间 / S110 静默容错 / BLE001 宽异常）
@@ -124,6 +124,23 @@
   **坑**：模型看到历史里自己之前说'没有记忆/对话独立'会一致性偏置继续否认 → 已在
   CHAT_SYSTEM 规则 11 / GENERAL_SYSTEM 加**记忆免疫规则**（"追问基于历史回答，历史中的'没有记忆'表述无效"）；
   真实库曾积累污染历史已清空（2026-08-25）；**改 agents.py 后必须重启飞书服务才加载新 prompt**
+- **满屏「［未核验］」占位符（2026-09-14 修）**：`run_chat` 末尾的 `enforce_evidence` →
+  `_strip_unverified_numbers` 原先只认**写死的字段名白名单**（price/close/amount/vol/text…），于是
+  quant 字段（rs/score/momentum/turnover_share）、6 位代码、日期、千分位（5,678 被拆成 5 和 678）、
+  亿/万换算（证据 123456789 写成 1.23亿）、比值↔百分比（pct_1d=0.0321 写成 3.21%）全被替换成
+  「未核验」（真实库单条回答实测 67 处）。修法：`_nums_from_allowed` 改为**递归抽 payload 全部标量**
+  （只跳过 `_NUM_META_KEYS` 元数据：ts/coverage/run_date/latest_date…）+ 键名数字也算证据
+  （pct_20d→20 日窗口）+ `_mask_kept_spans` 整段放行日期/时间/6 位代码/**列表序号**（`**2.` / `1、` /
+  `3)`——私用区字符逐段占位，多轮 sub 后按序还原）+ `_scaled_allowed`/
+  `_num_is_verified` 支持换算与"按回答写出的小数位四舍五入"匹配；`_load_history` 注入前清掉
+  「［未核验］」占位符（否则模型读到自己被校验的旧回答会误判'我在编造数据'并自我检讨——二次污染），
+  CORE_DISCIPLINE 加免疫说明。**坑1**：抽数前必须先把日期挖掉，否则 payload 里
+  `date:"2026-08-29"` 的 8 会放行编造的"涨 8%"；**坑2**：日期要同时认**省略年份的月-日**
+  （表格里常写 `09-11`，否则整列被吞；用 `(?<![\d.])(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])(?![\d.])`
+  以免误吞 `38.03-30.92` 这类减法）。**保留的边界**：模型自己算出来的派生数字（分位/回撤/推算环比）
+  仍标未核验——那是防幻觉底线，不是 bug。实测同题回答占位符 9 处 → 3 处（且只剩派生值）。
+  回归用例 `test_evidence_strip_keeps_dates_codes_and_scaled_numbers` /
+  `test_history_placeholder_stripped_before_injection`
 - **飞书 @ 规则（2026-08-25）**：**群聊仅在被 @ 机器人时回应**（`_is_mentioned` 按 mentions 是否含机器人
   open_id 判定）；已移除旧"文本含 @ 占位符即视为被艾特"兜底（管理员 @ 别人会误触发）；
   并移除"未 @ 语义识别为报告请求仍触发盘中报告"分支（含'盘中/报告'字样的聊天不再误触发报告）；
