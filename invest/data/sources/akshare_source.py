@@ -6,9 +6,17 @@
 """
 from __future__ import annotations
 
+import datetime as dt
+import logging
+
 import pandas as pd
 
 from .base import BaseSource, SourceError
+
+logger = logging.getLogger(__name__)
+
+# 行业估值（巨潮）最多向前回退的自然日数：用于跳过"当天尚未发布"的日期
+_INDUSTRY_VAL_MAX_BACK_DAYS = 12
 
 _RENAME_MAP = {
     "日期": "date", "开盘": "open", "收盘": "close",
@@ -157,6 +165,55 @@ def call_with_timeout(fn, *args, timeout: float = 25.0):
 class AkShareSource(BaseSource):
     name = "akshare"
 
+    def _fetch_industry_valuation(self, ak, task: dict) -> pd.DataFrame:
+        """巨潮行业市盈率（国证行业分类），按交易日向前回退到最近"已发布"的日期。
+
+        2026-09-14 修复：akshare `stock_industry_pe_ratio_cninfo` 在**该日数据尚未发布**时
+        `records` 为空 → 它先用 `pd.DataFrame([])`（0 列）再硬赋 12 个列名 → 抛
+        `ValueError: Length mismatch: Expected axis has 0 elements, new values have 12 elements`。
+        而巨潮该数据当天要晚些才发布（实测 22:00 场次成功、盘前 08:39 与 after_close 16:03 全失败，
+        09-09~09-14 连续 failed），collector 传的又是"当日"→ 必然炸。
+        这里逐交易日回退（最多 12 个自然日）：返回的快照自带 date 列（不冒充当日），
+        PIT 容忍度 10 天，因此盘前/盘后都能拿到最近可用估值。
+        """
+        from invest.data.calendar import is_trading_day, latest_trading_day
+
+        raw = str(task.get("date") or latest_trading_day().strftime("%Y%m%d"))
+        try:
+            target = dt.datetime.strptime(raw[:10].replace("-", ""), "%Y%m%d").date()
+        except ValueError:
+            target = latest_trading_day()
+
+        errors: list[str] = []
+        for back in range(_INDUSTRY_VAL_MAX_BACK_DAYS + 1):
+            day = target - dt.timedelta(days=back)
+            if not is_trading_day(day):
+                continue
+            stamp = day.strftime("%Y%m%d")
+            try:
+                df = ak.stock_industry_pe_ratio_cninfo(
+                    symbol="国证行业分类",
+                    date=stamp,
+                )
+            except Exception as exc:  # 未发布时 akshare 抛 Length mismatch；网络异常同样跳过
+                errors.append(f"{day.isoformat()}: {type(exc).__name__}: {exc}")
+                continue
+            if df is None or df.empty:
+                errors.append(f"{day.isoformat()}: 空数据")
+                continue
+            if back:
+                logger.warning(
+                    "行业估值 %s 尚未发布，回退到最近已发布交易日 %s（%d 行）",
+                    target.isoformat(),
+                    day.isoformat(),
+                    len(df),
+                )
+            return df
+        raise SourceError(
+            "行业估值获取失败：自 %s 起往前 %d 天均无已发布数据（%s）"
+            % (target.isoformat(), _INDUSTRY_VAL_MAX_BACK_DAYS, "；".join(errors[:3]) or "-")
+        )
+
     def fetch(self, task: dict) -> pd.DataFrame:
         """返回数据源原始 DataFrame（不做标准化，标准化由编排层调用）。"""
         kind = task["kind"]
@@ -178,25 +235,7 @@ class AkShareSource(BaseSource):
             if kind == "industry_all":
                 return self._fetch_all_industries(ak, task)
             if kind == "industry_valuation":
-                # 非交易日传 date 会返回空导致 JSON 解析失败：
-                # 失败自动回退最近交易日（collector 层已回退，这里双保险）。
-                import datetime as _dt
-
-                from invest.data.calendar import latest_trading_day
-                d = task.get("date") or latest_trading_day().strftime("%Y%m%d")
-                try:
-                    return ak.stock_industry_pe_ratio_cninfo(
-                        symbol="国证行业分类",
-                        date=d,
-                    )
-                except Exception:
-                    fallback = latest_trading_day(_dt.date.today()).strftime("%Y%m%d")
-                    if fallback == d:
-                        raise
-                    return ak.stock_industry_pe_ratio_cninfo(
-                        symbol="国证行业分类",
-                        date=fallback,
-                    )
+                return self._fetch_industry_valuation(ak, task)
             if kind == "seat_detail":
                 return self._fetch_seat_detail(ak, task)
             if kind == "stock_daily_all":

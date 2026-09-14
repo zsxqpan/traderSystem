@@ -33,6 +33,17 @@
   2026-08-25 曾漏清 index_bars 导致同 (index_code,date) snapshot/akshare 双行，
   quant.strength.calc_rs 的 pd.concat 报 "cannot reindex on an axis with duplicate labels"
   使 after_close/industry_refresh 失败；已加 calc_rs index 去重防御 + 清理历史重复）
+- **行业估值（巨潮）当日未发布 → akshare 抛 Length mismatch（2026-09-14 修）**：akshare 的
+  `stock_industry_pe_ratio_cninfo` 在 `records` 为空时先用 `pd.DataFrame([])`（0 列）再硬赋 12 个列名 →
+  `ValueError: Length mismatch: Expected axis has 0 elements, new values have 12 elements`。
+  而巨潮该数据**当天要晚些才发布**（实测 22:00 场次成功；盘前 08:39 与 after_close 16:03 全失败，
+  09-09~09-14 连续 failed，日志记成「akshare(第1次): ...Length mismatch」）。
+  修法：`AkShareSource._fetch_industry_valuation` 按交易日**向前回退**（最多 12 个自然日）取最近
+  已发布快照——返回的 df 自带 date 列（**不冒充当日**），PIT 容忍 10 天所以盘前/盘后都能用；
+  全无数据才抛 SourceError（诚实失败，不返回空表）。跨零点后 `params.date=latest_trading_day()`
+  拿到的是"新一天"，自然走回退分支（属正常，日志会 WARNING 一行）。
+  回归用例 `test_industry_valuation_falls_back_to_last_published_day` /
+  `test_industry_valuation_all_unpublished_raises_source_error`
 - **东财 push2 限流** → 用 `push2delay`（板块资金 clist `f62`）；涨停池 `push2ex getTopicZTPool`（盘中实时）
 - 新浪接口 GBK；腾讯指数 `~` 分割 `[2]=代码 [3]=现价`
 - **Windows PowerShell 5.1 读 .ps1 需 UTF-8 BOM**（否则中文引号解析崩）

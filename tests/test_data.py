@@ -636,6 +636,60 @@ def test_migration_v4_dedupe():
             pass
     print("test_migration_v4_dedupe OK")
 
+def test_industry_valuation_falls_back_to_last_published_day():
+    """2026-09-14 修复：巨潮行业 PE 当日未发布时 akshare 抛
+    `Length mismatch: Expected axis has 0 elements, new values have 12 elements`
+    （它用 0 列 DataFrame 硬赋 12 个列名），盘前 08:39 / after_close 16:03 请求当日必炸。
+    现在必须向前回退到最近已发布交易日，而不是让整条采集失败。"""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    calls: list[str] = []
+
+    def fake_pe(symbol: str, date: str):
+        calls.append(date)
+        if date == "20260915":
+            raise ValueError(
+                "Length mismatch: Expected axis has 0 elements, new values have 12 elements"
+            )
+        return pd.DataFrame({
+            "变动日期": ["2026-09-14"], "行业名称": ["能源"], "行业层级": [1],
+            "静态市盈率-加权平均": [16.75], "行业编码": ["x"], "公司数量": [100],
+        })
+
+    fake = SimpleNamespace(stock_industry_pe_ratio_cninfo=fake_pe)
+    with mock.patch.dict(sys.modules, {"akshare": fake}):
+        src = AkShareSource()
+        df = src.fetch({"kind": "industry_valuation", "date": "20260915"})
+        out = src.normalize(df, {"kind": "industry_valuation"})
+
+    assert calls == ["20260915", "20260914"], calls  # 当日失败 → 只回退一个交易日
+    assert sorted(set(out["date"])) == ["2026-09-14"]  # 不冒充当日
+    assert out["pe"].tolist() == [16.75]
+    print("test_industry_valuation_falls_back_to_last_published_day OK")
+
+
+def test_industry_valuation_all_unpublished_raises_source_error():
+    """全部候选日都无数据时抛 SourceError（诚实失败，不返回空表冒充成功）。"""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from invest.data.sources.base import SourceError
+
+    def always_fail(symbol: str, date: str):
+        raise ValueError("Length mismatch: Expected axis has 0 elements, new values have 12 elements")
+
+    fake = SimpleNamespace(stock_industry_pe_ratio_cninfo=always_fail)
+    with mock.patch.dict(sys.modules, {"akshare": fake}):
+        src = AkShareSource()
+        try:
+            src.fetch({"kind": "industry_valuation", "date": "20991231"})
+            raise AssertionError("应抛 SourceError")
+        except SourceError as exc:
+            assert "均无已发布数据" in str(exc)
+    print("test_industry_valuation_all_unpublished_raises_source_error OK")
+
+
 if __name__ == "__main__":
     test_margin_normalize()
     test_macro_pmi_normalize()
@@ -657,6 +711,8 @@ if __name__ == "__main__":
     test_stock_daily_all_normalize()
     test_seat_detail_normalize_and_migration()
     test_valuation_normalize_and_tasks()
+    test_industry_valuation_falls_back_to_last_published_day()
+    test_industry_valuation_all_unpublished_raises_source_error()
     test_ths_parse_and_map_cache()
     test_industry_all_normalize()
     test_call_with_timeout()
