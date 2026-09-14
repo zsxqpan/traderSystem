@@ -130,12 +130,16 @@ function New-TaskXml([string]$name, [string]$desc, [string]$triggerXml, [string]
 "@
 }
 
-function New-PowerTaskXml([string]$name, [string]$desc, [string]$time, [string]$execLimit, [string]$action) {
+function New-PowerTaskXml([string]$name, [string]$desc, [string]$time, [string]$execLimit, [string]$command, [string]$arguments, [string]$workingDir) {
     # 电源策略任务：工作日到点唤醒机器。
     # - power_on：启动 keep_awake.py（pythonw，持有 ES_SYSTEM_REQUIRED 至 17:30，
     #   阻止"唤醒任务结束后自动复睡"——08-26:56 复睡导致 premarket 漏跑事故，2026-09-08 改）
     # - power_off：恢复插电 25 分钟休眠。
     # 需以管理员注册（RunLevel=HighestAvailable）+ WakeToRun 唤醒睡眠中的机器。
+    # 2026-09-14 事故：原先统一用 cmd.exe /c "…pythonw.exe" "…keep_awake.py" --until 17:30，
+    # 四个引号触发 cmd 的剥引号规则（/c 后首字符是引号且引号数≠2 → 删掉最后一个引号），
+    # 命令行被解析坏、返回码 1 → keep_awake 自 09-08 起从未启动，机器白天自动睡眠、
+    # 漏掉 16:20-17:10 整条盘后链。现在直接 Exec 目标程序，不经 cmd 包装。
     $boundary = "2026-09-07T$time" + ":00"
     return @"
 <?xml version="1.0" encoding="UTF-16"?>
@@ -167,9 +171,9 @@ function New-PowerTaskXml([string]$name, [string]$desc, [string]$time, [string]$
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>cmd.exe</Command>
-      <Arguments>$action</Arguments>
-      <WorkingDirectory>C:\Windows\System32</WorkingDirectory>
+      <Command>$command</Command>
+      <Arguments>$arguments</Arguments>
+      <WorkingDirectory>$workingDir</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
@@ -178,11 +182,12 @@ function New-PowerTaskXml([string]$name, [string]$desc, [string]$time, [string]$
 
 $pyw = Join-Path $root "myenv\Scripts\pythonw.exe"
 $keepAwake = Join-Path $root "scripts\keep_awake.py"
+$powercfg = Join-Path $env:SystemRoot "System32\powercfg.exe"
 $powerJobs = @(
     @{ Name = "TraderSystem_power_on";  Desc = "工作日08:25 唤醒+keep_awake保活至17:30"; Time = "08:25"; ExecLimit = "PT10H";
-       Action = "/c `"$pyw`" `"$keepAwake`" --until 17:30" },
+       Command = $pyw; Arguments = "`"$keepAwake`" --until 17:30"; WorkingDir = $root },
     @{ Name = "TraderSystem_power_off"; Desc = "工作日17:35 恢复插电25分钟休眠";          Time = "17:35"; ExecLimit = "PT10M";
-       Action = "/c powercfg /change standby-timeout-ac 25" }
+       Command = $powercfg; Arguments = "/change standby-timeout-ac 25"; WorkingDir = $root }
 )
 
 if ($Uninstall) {
@@ -218,7 +223,7 @@ foreach ($j in $jobs) {
 Write-Host ""
 Write-Host "=== 电源策略任务（08:25 唤醒+keep_awake 保活 / 17:35 恢复休眠；需管理员注册）==="
 foreach ($p in $powerJobs) {
-    $xml = New-PowerTaskXml $p.Name $p.Desc $p.Time $p.ExecLimit $p.Action
+    $xml = New-PowerTaskXml $p.Name $p.Desc $p.Time $p.ExecLimit $p.Command $p.Arguments $p.WorkingDir
     $xmlFile = Join-Path $tmpDir ("task_" + $p.Name + ".xml")
     [System.IO.File]::WriteAllText($xmlFile, $xml, ([System.Text.Encoding]::Unicode))
     if ($DryRun) {

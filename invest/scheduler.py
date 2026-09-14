@@ -430,12 +430,25 @@ def _execute_job(
             run_slot,
             effective_lease,
         )
-        if not claimed and existing == "ok":
-            return JobResult("already_ok", "该计划槽位已成功")
-        if not claimed and job_name == "auction" and existing == "missed":
-            return JobResult("already_missed", "竞价漏跑已记录")
-        if not claimed and existing == "running":
-            return JobResult("already_running", "该计划槽位正在执行")
+        if not claimed:
+            # 槽位不可占有：ok/missed 已是终态、running 有活跃租约 —— 一律不执行正文。
+            # 2026-09-14 事故：这里漏判 missed（只处理了 ok/auction-missed/running），
+            # 机器睡过补偿窗口后 OS 任务补跑时，正文被白跑一遍，收尾 _finish_execution
+            # 用空 lease_owner 更新 0 行 → 抛「执行租约已被回收」，结果被丢弃
+            # （evening_report 因此没发），job_runs 永久停在 running。
+            if existing == "ok":
+                return JobResult("already_ok", "该计划槽位已成功")
+            if existing == "missed":
+                return JobResult(
+                    "already_missed",
+                    "该计划槽位已记漏跑（超补偿窗口），不再补发",
+                )
+            if existing == "running":
+                return JobResult("already_running", "该计划槽位正在执行")
+            return JobResult(
+                "already_running",
+                f"计划槽位状态不可执行: {existing or 'unknown'}",
+            )
         heartbeat = _LeaseHeartbeat(
             db,
             job_name,

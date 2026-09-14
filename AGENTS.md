@@ -46,6 +46,32 @@
   强制 `cli._disconnect()` 触发 SDK 自动重连；健康连接下服务器约每 120s 回 PONG，安静不误触发。
   **依赖私有 API**（`_handle_message`/`_disconnect`/模块级 `loop`），lark-oapi 升级需回归
   `tests/test_feishu_ws.py` 看门狗用例；挂载失败自动降级（看门狗不可用，不影响收发）。
+- **盘后链整条漏跑 = 机器自动睡眠 + 两个 bug（2026-09-14 事故，盘后报告没发）**：
+  ① **保活任务自 09-08 起从未成功启动**：`TraderSystem_power_on` 的动作用了
+  `cmd.exe /c "…pythonw.exe" "…keep_awake.py" --until 17:30`——四个引号踩了 cmd 的剥引号规则
+  （`/c` 后首字符是引号且引号总数≠2 → 剥掉首引号并删掉最后一个引号）→ 命令行被解析坏、
+  返回码 1、`logs/keep_awake.log` 再无新记录。于是 `ES_SYSTEM_REQUIRED` 无人持有，
+  插电空闲 25 分钟超时（17:35 的 power_off 设的）一直生效 → 白天自动睡眠
+  （09-14 实测 09:41–15:54 / 16:05–17:34 / 17:36–20:02）→ **16:20–17:10 六个 OS 任务
+  （含 evening_report）根本没被触发**；17:34 定时唤醒后 ticker 立刻补偿扫描，窗口 17:29:59
+  已过 → 记 6 个 missed + 发「已超过补偿窗口，不再补发」告警。
+  **修法**：电源任务直接 Exec 目标程序（`Command=pythonw.exe`、
+  `Arguments="…keep_awake.py" --until 17:30`），**不再经 cmd 包装**；power_off 同理直接用
+  `powercfg.exe`。回归用例 `test_power_tasks_avoid_cmd_quote_trap`。
+  **该任务 RunLevel=HighestAvailable，重注册必须管理员 PowerShell 跑 `install_os_tasks.ps1`
+  （或用它生成的 `.tmp\task_TraderSystem_power_on.xml` 单独 `schtasks /Create /XML /F`）**。
+  ② **`_execute_job` 漏判 `existing == "missed"`**：claim 失败原本只处理 ok / auction+missed /
+  running，槽位已 missed 时 OS 任务补跑（机器 20:02 唤醒 → Task Scheduler 20:08 补跑）
+  会**把任务正文完整白跑一遍**，收尾 `_finish_execution` 用空 lease_owner 更新 0 行 →
+  抛「执行租约已被回收，忽略过期结果」（scheduler.py 收尾处）→ **结果被丢弃（报告没发）**、
+  job_runs 永久停在 running。**修法**：claim 失败一律不执行正文
+  （ok→already_ok / missed→already_missed / running→already_running / 其他→不可执行）；
+  回归用例 `test_missed_slot_never_runs_body_when_os_task_catches_up_late`。
+  ③ **诊断口径**：`job_runs` 每次运行都会留一条 `running` 行 + 一条终态行（设计如此），
+  **只有"缺终态行"才是异常**；槽位真相看 `job_executions`（含 lease/attempt）。
+  排查用：`Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-Kernel-Power'}`（42 睡 / 107 醒）、
+  `Get-ScheduledTask -TaskName 'TraderSystem_*' | Get-ScheduledTaskInfo`（LastRunTime 是否等于计划时刻、Result 码）、
+  `logs/keep_awake.log`（保活是否真在跑）、`job_runs` 里 6 位 traceback 定位到某一行。
 - Python 语法：关键字参数位置不能裸 walrus（`user=(x := ...)` 需括号）；try/with/finally 配对别写错
 - 涨停判断：主板 ≥9.8%、20cm 板 ≥19.8%；两市成交额=上证+深成指，别加创业板/科创50（子集重复）
 

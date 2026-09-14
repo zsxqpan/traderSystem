@@ -413,6 +413,69 @@ def test_os_task_manifest_matches_job_funcs_and_required_times():
     assert (ROOT / "scripts" / "install_os_tasks.ps1").read_bytes().startswith(b"\xef\xbb\xbf")
 
 
+def test_power_tasks_avoid_cmd_quote_trap():
+    """2026-09-14 事故：power_on 用 cmd.exe /c "…pythonw.exe" "…keep_awake.py" args，
+    四个引号触发 cmd 剥引号规则（删掉最后一个引号）→ 命令行解析坏、返回码 1 →
+    keep_awake 自 09-08 起从未启动 → 机器白天自动睡眠、漏掉 16:20-17:10 整条盘后链。
+    电源任务必须直接 Exec 目标程序，不得再经 cmd 包装。"""
+    raw = (ROOT / "scripts" / "install_os_tasks.ps1").read_text(encoding="utf-8-sig")
+    assert 'Action = "/c' not in raw, "电源任务不得再拼 cmd /c 命令行"
+    assert "Command = $pyw" in raw, "power_on 应直接执行 pythonw.exe"
+    assert "Command = $powercfg" in raw, "power_off 应直接执行 powercfg.exe"
+    assert '<Command>$command</Command>' in raw, "电源任务 XML 应使用参数化的 Command"
+    assert '`"$keepAwake`" --until 17:30' in raw, "keep_awake 应作为参数传给 pythonw"
+
+
+def test_missed_slot_never_runs_body_when_os_task_catches_up_late(db_path: str):
+    """2026-09-14 事故：槽位已被 ticker 记 missed 后，OS 任务补跑不得再执行正文。
+
+    旧实现在 claim 失败后只处理 ok / auction+missed / running，漏判 existing=='missed'：
+    正文被白跑一遍（重活重跑），收尾 _finish_execution 用空 lease_owner 更新 0 行 →
+    抛「执行租约已被回收，忽略过期结果」→ 结果被丢弃（evening_report 因此没发），
+    job_runs 永久停在 running。
+    """
+    calls: list[str] = []
+
+    def evening_body(_db, _conn):
+        calls.append("ran")
+        return JobResult.ok("报告已发送")
+
+    conn = connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                """INSERT INTO job_executions(
+                       job, scheduled_date, run_slot, status, attempt, started_at, updated_at)
+                   VALUES('evening_report', '2026-09-14', '17:00', 'missed', 1,
+                          datetime('now','localtime'), datetime('now','localtime'))"""
+            )
+    finally:
+        conn.close()
+
+    with mock.patch.dict("invest.scheduler.JOB_FUNCS", {"evening_report": evening_body}):
+        result = run_job_once(
+            "evening_report",
+            db_path=db_path,
+            now=dt.datetime(2026, 9, 14, 20, 8, 19),
+        )
+
+    assert result.status == "already_missed"
+    assert calls == [], "槽位已 missed，正文不得执行"
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT status FROM job_runs WHERE job='evening_report'"
+        ).fetchall()
+        assert [r["status"] for r in rows] == [], "不得留下 running 脏行"
+        slot = conn.execute(
+            """SELECT status, attempt FROM job_executions
+               WHERE job='evening_report' AND scheduled_date='2026-09-14'"""
+        ).fetchone()
+        assert slot["status"] == "missed" and slot["attempt"] == 1
+    finally:
+        conn.close()
+
+
 def test_job_result_rejects_failed_cli_semantics():
     result = JobResult.failed("push failed")
     assert result.success is False
