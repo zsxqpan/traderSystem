@@ -84,6 +84,7 @@ JOB_SLOTS = {
     "action_digest": "10:00",
     "action_digest_pm": "13:30",
     "big_v_harvest": "17:10",
+    "late_catchup": "21:30",
 }
 # 同日补偿窗口。开始前不处理；窗口内复用正常执行链路；结束后只记 missed。
 # 2026-09-07：配合"机器仅 08:30-17:30 唤醒"电源策略，全部压缩到 17:29:59 前，
@@ -105,6 +106,10 @@ JOB_COMPENSATION_WINDOWS = {
     "action_digest": (dt.time(10, 0), dt.time(13, 29, 59)),
     "action_digest_pm": (dt.time(13, 30), dt.time(17, 29, 59)),
     "big_v_harvest": (dt.time(17, 10), dt.time(17, 29, 59)),
+    # 21:30 兜底补采（2026-09-15 事故后新增）：当日关键任务仍漏跑且外网已恢复时补采/补推。
+    # 窗口留到 23:00 —— 网络恢复后每分钟补偿扫描会自动重试（任务返回 skipped/deferred 时可重试），
+    # 23:00 后不再尝试（当日数据已无意义，次日正常排程接管）。
+    "late_catchup": (dt.time(21, 30), dt.time(23, 0, 0)),
 }
 TRADING_DAY_JOBS = {
     "premarket",
@@ -118,6 +123,7 @@ TRADING_DAY_JOBS = {
     "factcard_refresh",
     "action_digest",
     "action_digest_pm",
+    "late_catchup",
 }
 JOB_LEASE_SECONDS = {"auction": 180}
 DEFAULT_JOB_LEASE_SECONDS = 7200
@@ -235,8 +241,14 @@ def _claim_execution(
     scheduled_date: str,
     run_slot: str,
     lease_seconds: int,
+    *,
+    force: bool = False,
 ) -> tuple[bool, str, str]:
-    """原子占有计划槽位，防止 OS 任务与 ticker 同时投递。"""
+    """原子占有计划槽位，防止 OS 任务与 ticker 同时投递。
+
+    `force=True`：允许抢占已有终态（ok/missed）的槽位，用于"网络中断后人工/自动补采"——
+    仍拒绝抢占**活跃租约**的 running 槽位（绝不并发跑同一任务）。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute(
@@ -253,7 +265,10 @@ def _claim_execution(
                 (row["lease_expires_at"],),
             ).fetchone()[0]
         )
-        if status in {"ok", "missed"} or (status == "running" and lease_active):
+        if status == "running" and lease_active:
+            conn.commit()
+            return False, status, ""
+        if status in {"ok", "missed"} and not force:
             conn.commit()
             return False, status, ""
         lease_modifier = f"+{lease_seconds} seconds"
@@ -401,6 +416,45 @@ def _notify_job_failure(job_name: str, detail: str) -> None:
         logger.warning("失败告警推送异常: %s", detail)
 
 
+# ---- 失败退避（2026-09-15）------------------------------------------------
+# 事故：外网中断时补偿扫描每分钟重试，snapshot_close 白跑 42 次（每次都在等 TCP 超时）。
+# 现在同一 job 连续失败后指数退避（2→4→8→15 分钟封顶），成功即清零；外网不通时短退避（1 分钟）。
+_BACKOFF_BASE_SECONDS = 120.0
+_BACKOFF_CAP_SECONDS = 900.0
+_BACKOFF_NET_DOWN_SECONDS = 60.0
+_JOB_BACKOFF: dict[str, tuple[int, float]] = {}
+# 这些任务只读本地库/发本地通知，不依赖外网，网络不通时不必拦
+_LOCAL_ONLY_JOBS = frozenset({"action_digest", "action_digest_pm"})
+
+
+def _backoff_remaining(job_name: str) -> float:
+    state = _JOB_BACKOFF.get(job_name)
+    if not state:
+        return 0.0
+    return max(0.0, state[1] - time.monotonic())
+
+
+def _note_job_failure(job_name: str, *, network_down: bool = False) -> None:
+    """记一次失败并设置退避；外网不通用短退避（网络恢复后能尽快重试）。"""
+    if network_down:
+        count = _JOB_BACKOFF.get(job_name, (0, 0.0))[0]
+        _JOB_BACKOFF[job_name] = (count, time.monotonic() + _BACKOFF_NET_DOWN_SECONDS)
+        return
+    count = _JOB_BACKOFF.get(job_name, (0, 0.0))[0] + 1
+    delay = min(_BACKOFF_BASE_SECONDS * (2 ** (count - 1)), _BACKOFF_CAP_SECONDS)
+    _JOB_BACKOFF[job_name] = (count, time.monotonic() + delay)
+    logger.warning("任务 %s 连续失败 %d 次，退避 %.0fs 后重试", job_name, count, delay)
+
+
+def _clear_job_backoff(job_name: str) -> None:
+    _JOB_BACKOFF.pop(job_name, None)
+
+
+def reset_job_backoff() -> None:
+    """清空退避状态（测试用）。"""
+    _JOB_BACKOFF.clear()
+
+
 def _execute_job(
     job_name: str,
     fn: Callable,
@@ -409,6 +463,9 @@ def _execute_job(
     now: dt.datetime | None = None,
     lease_seconds: int | None = None,
     heartbeat_interval: float | None = None,
+    network_gate: bool = False,
+    force: bool = False,
+    respect_backoff: bool = False,
 ) -> JobResult:
     from invest.delivery import delivery_context
 
@@ -416,6 +473,18 @@ def _execute_job(
     scheduled_date = now.date().isoformat()
     run_slot = JOB_SLOTS.get(job_name, "manual")
     _ensure_db_initialized(db)
+    # 退避只约束**补偿扫描**：OS 计划任务（run_job.py，独立进程）每天就那么几次，
+    # 不该被上一次失败挡住（2026-09-15）。
+    if respect_backoff and not force:
+        remaining = _backoff_remaining(job_name)
+        if remaining > 0:
+            return JobResult("deferred", f"退避中：{remaining:.0f}s 后重试")
+    if network_gate and not force and job_name not in _LOCAL_ONLY_JOBS:
+        from invest.data import nethealth
+
+        if not nethealth.internet_ok():
+            _note_job_failure(job_name, network_down=True)
+            return JobResult("deferred", "外网不通，暂停重试（恢复后自动补跑）")
     conn = connect(db)
     heartbeat = None
     try:
@@ -429,6 +498,7 @@ def _execute_job(
             scheduled_date,
             run_slot,
             effective_lease,
+            force=force,
         )
         if not claimed:
             # 槽位不可占有：ok/missed 已是终态、running 有活跃租约 —— 一律不执行正文。
@@ -530,6 +600,7 @@ def _execute_job(
             )
             logger.exception("%s 失败", job_name)
             _notify_job_failure(job_name, result.detail)
+            _note_job_failure(job_name)
             raise JobExecutionError(f"{job_name}: {result.detail}") from exc
 
         if deliveries.channel_states:
@@ -554,7 +625,9 @@ def _execute_job(
             raise JobExecutionError(f"{job_name}: 执行租约已被回收，忽略过期结果")
         if not result.success:
             _notify_job_failure(job_name, result.detail)
+            _note_job_failure(job_name)
             raise JobExecutionError(f"{job_name}: {result.detail}")
+        _clear_job_backoff(job_name)
         return result
     finally:
         if heartbeat is not None:
@@ -1158,6 +1231,100 @@ def _factcard_refresh(db: str, conn) -> JobResult:
     return run_factcard_refresh(db, conn, push=True)
 
 
+# ---- 21:30 兜底补采（2026-09-15 外网中断事故后新增）------------------------
+# 顺序有讲究：snapshot_close 必须排在 akshare 类任务**之前**——若先跑权威日线再补快照，
+# 会重新引入 (symbol,date) 的 snapshot/akshare 双行（2026-08-25 calc_rs 故障的同款坑）。
+LATE_CATCHUP_TARGETS: tuple[str, ...] = (
+    "snapshot_close",
+    "after_close",
+    "pool_trap_scan",
+    "industry_refresh",
+    "daily_refresh",
+    "factcard_refresh",
+    "evening_report",  # 放最后：报告要用到上面几项的数据
+)
+
+
+def _notify_late_report() -> None:
+    """补推报告前先说明一句，避免收到"过时的今日报告"产生误解。"""
+    try:
+        Notifier().send_text(
+            "⚠️ 今日盘后报告为**补发**（原定 17:00，因数据采集失败/外网中断延迟）",
+            key=f"late_report_{dt.date.today().isoformat()}",
+            message_kind="alert",
+            message_id="late_report",
+        )
+    except Exception:
+        logger.warning("补发说明推送异常", exc_info=True)
+
+
+def _late_catchup(db: str, conn, *, today: dt.date | None = None) -> JobResult:
+    """当日关键槽位若仍漏跑、且外网已恢复 → 逐个强制补采；报告补推前先发「补发」说明。
+
+    2026-09-15 事故：下午外网中断约 5 小时，整条盘后链（15:01–17:10）在补偿窗口
+    17:29:59 内全部失败；外网 20:10 恢复时已过窗，补偿扫描只记 missed，
+    当天数据与报告整份丢掉。现在 21:30 兜底：窗口内（至 23:00）每分钟扫描会重试本任务，
+    网络一恢复就自动补上。
+
+    `today` 仅测试用（钉住日期，避免跨零点导致用例不稳定）。
+    """
+    from invest.data import nethealth
+
+    if not nethealth.internet_ok():
+        # skipped 是**非终态**：分钟级补偿扫描会在窗口内继续重试，网络恢复后自动补采
+        return JobResult("skipped", "外网不通，等网络恢复后由补偿扫描继续补采")
+
+    day = today or dt.date.today()
+    stamp = day.isoformat()
+    run_now = dt.datetime.now() if today is None else dt.datetime.combine(day, dt.time(21, 35))
+    pending: list[str] = []
+    for job in LATE_CATCHUP_TARGETS:
+        row = conn.execute(
+            """SELECT status FROM job_executions
+               WHERE job=? AND scheduled_date=? AND run_slot=?""",
+            (job, stamp, JOB_SLOTS[job]),
+        ).fetchone()
+        status = str(row["status"]) if row else "missing"
+        if status != "ok":
+            logger.warning("兜底补采 %s（当日槽位状态=%s）", job, status)
+            pending.append(job)
+    if not pending:
+        return JobResult.ok("当日关键任务均已成功，无需补采")
+    if "snapshot_close" in pending and "daily_refresh" not in pending:
+        # 快照补完后必须让权威日线再写一次，清掉同 (symbol,date) 的 snapshot 行
+        pending.append("daily_refresh")
+
+    done: list[str] = []
+    failed: list[str] = []
+    for job in pending:
+        if job == "evening_report":
+            _notify_late_report()
+        try:
+            result = run_job_once(
+                job,
+                db_path=db,
+                now=run_now,
+                force=True,
+                wait_for_running=60.0,
+            )
+        except Exception as exc:
+            logger.exception("兜底补采 %s 异常", job)
+            failed.append(f"{job}({type(exc).__name__})")
+            continue
+        if result.status in {"ok", "already_ok"}:
+            done.append(job)
+        else:
+            failed.append(f"{job}({result.status})")
+
+    detail = (
+        f"需补 {len(pending)} 项 | 成功: {','.join(done) or '-'} | "
+        f"未成功: {','.join(failed) or '-'}"
+    )
+    if failed:
+        return JobResult.failed(detail)
+    return JobResult.ok(detail)
+
+
 # 单任务执行入口（供操作系统计划任务调用，见 scripts/run_job.py 与 install_os_tasks.ps1）
 JOB_FUNCS: dict[str, Callable] = {
     "premarket": _premarket,
@@ -1176,6 +1343,7 @@ JOB_FUNCS: dict[str, Callable] = {
     "action_digest": _action_digest,    # 2026-09-09：10:00 动作 digest
     "action_digest_pm": _action_digest,  # 2026-09-09：13:30 动作 digest（独立槽，避免 already_ok）
     "big_v_harvest": _big_v_harvest,    # 2026-09-10：每天 17:10 慢速回灌
+    "late_catchup": _late_catchup,      # 2026-09-15：21:30 兜底补采（外网中断事故后）
 }
 
 
@@ -1296,11 +1464,15 @@ def run_compensation_scan(
             continue
         try:
             if run_now.time() <= window_end:
+                # network_gate：外网不通直接 deferred（2026-09-15：断网时白跑 42 次快照）
+                # respect_backoff：连续失败后指数退避，别每分钟硬撞
                 results[job_name] = _execute_job(
                     job_name,
                     JOB_FUNCS[job_name],
                     db,
                     now=run_now,
+                    network_gate=True,
+                    respect_backoff=True,
                 )
             elif job_name == "auction":
                 # 复用竞价专用过窗保护：只告警并记 missed，绝不生成竞价报告。
@@ -1309,6 +1481,8 @@ def run_compensation_scan(
                     JOB_FUNCS[job_name],
                     db,
                     now=run_now,
+                    network_gate=True,
+                    respect_backoff=True,
                 )
             else:
                 results[job_name] = _record_compensation_missed(
@@ -1334,10 +1508,16 @@ def run_job_once(
     lease_seconds: int | None = None,
     heartbeat_interval: float | None = None,
     wait_for_running: float = 0.0,
+    network_gate: bool = False,
+    force: bool = False,
+    respect_backoff: bool = False,
 ) -> JobResult:
     """执行单个定时任务（含 running/ok/failed 留痕与失败推送，语义同 APScheduler _wrap）。
 
     job_name 不在 JOB_FUNCS 时抛 ValueError（调用方应捕获并给出错误码）。
+    `force=True`：强制接管已有终态槽位（补采用），仍拒绝抢占活跃租约。
+    `network_gate=True`：外网不通时直接 deferred（不跑正文）。
+    `respect_backoff=True`：上一次失败后的退避期内直接 deferred（补偿扫描用）。
     """
     fn = JOB_FUNCS.get(job_name)
     if fn is None:
@@ -1351,6 +1531,9 @@ def run_job_once(
         now=run_now,
         lease_seconds=lease_seconds,
         heartbeat_interval=heartbeat_interval,
+        network_gate=network_gate,
+        force=force,
+        respect_backoff=respect_backoff,
     )
     if result.status != "already_running" or wait_for_running <= 0:
         return result
@@ -1446,4 +1629,6 @@ def build_scheduler(ticker_only: bool = False) -> BackgroundScheduler:
     # 随机器休眠策略改为交易日下午发）：数据滞后时跳过并推送原因（_data_lag_reason 门禁）
     sched.add_job(_wrap("evening_report", _evening_report), CronTrigger(day_of_week="mon-fri", hour=17, minute=0), id="evening_report", misfire_grace_time=7200)
     sched.add_job(_wrap("big_v_harvest", _big_v_harvest), CronTrigger(hour=17, minute=10), id="big_v_harvest", misfire_grace_time=1200)
+    # 21:30 兜底补采（2026-09-15）：当日关键任务漏跑且外网恢复时补采/补推（窗口至 23:00）
+    sched.add_job(_wrap("late_catchup", _late_catchup), CronTrigger(day_of_week="mon-fri", hour=21, minute=30), id="late_catchup", misfire_grace_time=5400)
     return sched

@@ -68,6 +68,38 @@ def test_overview_queries():
 
 
 
+def test_data_health_reference_and_macro_month_parse():
+    """健康判定以「最近已收盘交易日」为参照（2026-09-15 修）：交易日内缺当日数据要显偏旧，
+    月度口径（macro_series 的 2026年08月份 / 2026-08）要能解析出日期而不是 NaT。"""
+    import pandas as pd
+
+    # 参照日：交易日 15:30 后=当天；盘前/盘中=上一交易日；周末回退到周五
+    assert q._last_closed_trading_day(pd.Timestamp("2026-09-15 16:30")).date().isoformat() == "2026-09-15"
+    assert q._last_closed_trading_day(pd.Timestamp("2026-09-15 09:00")).date().isoformat() == "2026-09-14"
+    assert q._last_closed_trading_day(pd.Timestamp("2026-09-19 12:00")).date().isoformat() == "2026-09-18"
+
+    # 状态阈值：容差 0 → 0 正常 / 1-2 偏旧 / ≥3 过期；dragon_tiger 容 1 天
+    assert q._health_status(0, 0) == "正常"
+    assert q._health_status(1, 0) == "偏旧"
+    assert q._health_status(3, 0) == "过期"
+    assert q._health_status(1, 1) == "正常"
+    assert q._health_status(float("nan"), 0) == "过期"
+
+    # 月度解析：中文月份/紧凑月份/月度首日 都能落到该月月末
+    for raw in ("2026年08月份", "2026-08", "202608", "2026-08-01"):
+        parsed = q._parse_month(raw)
+        assert parsed is not None, raw
+        assert parsed.date().isoformat() == "2026-08-31", (raw, parsed)
+
+    h = q.load_data_health(DB)
+    assert "ref_date" in h.columns
+    macro = h[h["tbl"] == "macro_series"]
+    assert not macro.empty
+    assert pd.notna(macro.iloc[0]["max_date"]), "macro_series 月份日期必须能解析（原先恒为 NaT/过期）"
+    assert macro.iloc[0]["status"] in {"正常", "偏旧", "过期"}
+    print("test_data_health_reference_and_macro_month_parse OK")
+
+
 def test_rotation_linkage_style_queries():
     """轮动轨迹/联动网络/风格时间线查询。"""
     rh = q.load_rotation_history(DB)
@@ -93,6 +125,7 @@ if __name__ == "__main__":
     test_strength_industry_only()
     test_viewpoints_status_parameterized()
     test_overview_queries()
+    test_data_health_reference_and_macro_month_parse()
     test_rotation_linkage_style_queries()
     test_position_limit()
     print("\nALL DASHBOARD TESTS PASSED")

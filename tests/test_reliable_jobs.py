@@ -1108,11 +1108,14 @@ def test_compensation_scan_retries_previous_failure_in_same_window(db_path: str)
             JobResult.ok("snapshot recovered"),
         ]
     )
+    # 2026-09-15 起失败会指数退避；本用例验证"退避结束后同一窗口仍会重试"，
+    # 故把退避基数压到 0（等价于时间已到），退避本身由 test_failed_job_backs_off_before_next_retry 覆盖。
     with mock.patch.dict(
         scheduler.JOB_FUNCS,
         {"snapshot_close": task},
         clear=True,
-    ), mock.patch("invest.data.calendar.is_trading_day", return_value=True):
+    ), mock.patch("invest.data.calendar.is_trading_day", return_value=True), \
+         mock.patch.object(scheduler, "_BACKOFF_BASE_SECONDS", 0.0):
         first = scheduler.run_compensation_scan(
             db_path=db_path,
             now=now,
@@ -1152,3 +1155,225 @@ def test_compensation_scan_uses_trading_calendar(db_path: str):
         )
     assert result == {}
     task.assert_not_called()
+
+
+# ---- 2026-09-15 外网中断事故后的防护：网络闸门 / 指数退避 / force 补采 / 21:30 兜底 ----
+
+def test_compensation_scan_defers_without_running_body_when_network_down(db_path: str):
+    """外网不通时补偿扫描直接 deferred：不跑正文（断网时快照白跑 42 次的事故防护）。"""
+    from invest import scheduler
+    from invest.data import nethealth
+
+    task = mock.Mock(return_value=JobResult.ok("不该被跑到"))
+    with mock.patch.dict(scheduler.JOB_FUNCS, {"snapshot_close": task}, clear=True), \
+         mock.patch.object(nethealth, "internet_ok", return_value=False), \
+         mock.patch("invest.data.calendar.is_trading_day", return_value=True):
+        result = scheduler.run_compensation_scan(
+            db_path=db_path,
+            now=dt.datetime(2026, 9, 15, 15, 30),
+            jobs={"snapshot_close"},
+        )
+    assert result["snapshot_close"].status == "deferred"
+    assert "外网不通" in result["snapshot_close"].detail
+    task.assert_not_called()
+
+
+def test_failed_job_backs_off_before_next_retry(db_path: str):
+    """连续失败后指数退避：同一窗口内不会立刻再跑，退避结束/清零后才重试。"""
+    from invest import scheduler
+
+    task = mock.Mock(return_value=JobResult.failed("采集失败"))
+    now = dt.datetime(2026, 9, 15, 16, 10)
+    with mock.patch.dict(scheduler.JOB_FUNCS, {"snapshot_close": task}, clear=True), \
+         mock.patch("invest.data.calendar.is_trading_day", return_value=True):
+        first = scheduler.run_compensation_scan(db_path=db_path, now=now, jobs={"snapshot_close"})
+        second = scheduler.run_compensation_scan(db_path=db_path, now=now, jobs={"snapshot_close"})
+        assert first["snapshot_close"].status == "failed"
+        assert second["snapshot_close"].status == "deferred"     # 退避中，不再白跑
+        assert "退避中" in second["snapshot_close"].detail
+        assert task.call_count == 1
+
+        scheduler.reset_job_backoff()
+        third = scheduler.run_compensation_scan(db_path=db_path, now=now, jobs={"snapshot_close"})
+    assert third["snapshot_close"].status == "failed"
+    assert task.call_count == 2
+
+
+def test_backoff_state_is_per_job_and_capped(db_path: str):
+    """退避按 job 隔离，且指数增长有上限。"""
+    from invest import scheduler
+
+    for _ in range(6):
+        scheduler._note_job_failure("snapshot_close")
+    remaining = scheduler._backoff_remaining("snapshot_close")
+    assert 0 < remaining <= scheduler._BACKOFF_CAP_SECONDS
+    assert scheduler._backoff_remaining("after_close") == 0.0
+    scheduler.reset_job_backoff()
+    assert scheduler._backoff_remaining("snapshot_close") == 0.0
+
+
+def test_force_claim_takes_over_missed_slot(db_path: str):
+    """force=True 可接管已 missed 的槽位（人工/自动补采用），attempt 递增。"""
+    conn = connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                """INSERT INTO job_executions(
+                       job, scheduled_date, run_slot, status, attempt, detail, updated_at)
+                   VALUES('evening_report','2026-09-15','17:00','missed',1,'超窗',datetime('now','localtime'))"""
+            )
+    finally:
+        conn.close()
+
+    from invest import scheduler
+
+    body = mock.Mock(return_value=JobResult.ok("补发成功"))
+    with mock.patch.dict(scheduler.JOB_FUNCS, {"evening_report": body}, clear=True):
+        result = run_job_once(
+            "evening_report",
+            db_path=db_path,
+            now=dt.datetime(2026, 9, 15, 21, 35),
+            force=True,
+        )
+    assert result.status == "ok"
+    body.assert_called_once()
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            """SELECT status, attempt FROM job_executions
+               WHERE job='evening_report' AND scheduled_date='2026-09-15'"""
+        ).fetchone()
+    finally:
+        conn.close()
+    assert tuple(row) == ("ok", 2)
+
+
+def test_force_claim_refuses_active_lease(db_path: str):
+    """force 也不抢占活跃租约：绝不并发跑同一任务（只认领已终态槽位）。"""
+    conn = connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                """INSERT INTO job_executions(
+                       job, scheduled_date, run_slot, status, attempt, lease_owner,
+                       lease_expires_at, updated_at)
+                   VALUES('evening_report','2026-09-15','17:00','running',1,'other-owner',
+                          datetime('now','localtime','+1 hour'), datetime('now','localtime'))"""
+            )
+    finally:
+        conn.close()
+
+    from invest import scheduler
+
+    body = mock.Mock(return_value=JobResult.ok("不该跑"))
+    with mock.patch.dict(scheduler.JOB_FUNCS, {"evening_report": body}, clear=True):
+        result = run_job_once(
+            "evening_report",
+            db_path=db_path,
+            now=dt.datetime(2026, 9, 15, 21, 35),
+            force=True,
+        )
+    assert result.status == "already_running"
+    body.assert_not_called()
+
+
+def _mark_slot(db_path: str, job: str, run_slot: str, status: str) -> None:
+    conn = connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO job_executions(
+                       job, scheduled_date, run_slot, status, attempt, detail, updated_at)
+                   VALUES(?, '2026-09-15', ?, ?, 1, '事故漏跑', datetime('now','localtime'))""",
+                (job, run_slot, status),
+            )
+    finally:
+        conn.close()
+
+
+def test_late_catchup_backfills_missed_slots(db_path: str):
+    """21:30 兜底：当日漏跑的槽位在网络恢复后被强制补采，报告补推前先发「补发」说明。"""
+    from invest import scheduler
+
+    # 只留两项待补：其余槽位都是 ok（顺带验证"已成功的不会被重跑"）
+    for job in scheduler.LATE_CATCHUP_TARGETS:
+        if job not in ("industry_refresh", "evening_report"):
+            _mark_slot(db_path, job, scheduler.JOB_SLOTS[job], "ok")
+    _mark_slot(db_path, "industry_refresh", "16:30", "missed")
+    _mark_slot(db_path, "evening_report", "17:00", "missed")
+
+    calls: list[str] = []
+
+    def _body(name):
+        def run(_db, _conn):
+            calls.append(name)
+            return JobResult.ok(f"{name} 已补")
+        return run
+
+    jobs = {name: _body(name) for name in scheduler.LATE_CATCHUP_TARGETS}
+    notifier = mock.Mock()
+    with mock.patch.dict(scheduler.JOB_FUNCS, jobs, clear=True), \
+         mock.patch.object(scheduler, "Notifier", notifier):
+        conn = connect(db_path)
+        try:
+            result = scheduler._late_catchup(db_path, conn, today=dt.date(2026, 9, 15))
+        finally:
+            conn.close()
+
+    assert result.status == "ok", result.detail
+    # snapshot_close 已 ok 不该重跑；industry_refresh 与 evening_report 应补
+    assert calls == ["industry_refresh", "evening_report"]
+    # 报告类补推前必须先告知用户"这是补发"
+    assert notifier.return_value.send_text.call_count == 1
+    assert "补发" in notifier.return_value.send_text.call_args[0][0]
+    conn = connect(db_path)
+    try:
+        statuses = {
+            r["job"]: r["status"]
+            for r in conn.execute(
+                "SELECT job, status FROM job_executions WHERE scheduled_date='2026-09-15'"
+            )
+        }
+    finally:
+        conn.close()
+    assert statuses["industry_refresh"] == "ok"
+    assert statuses["evening_report"] == "ok"
+
+
+def test_late_catchup_skips_when_network_still_down(db_path: str):
+    """外网仍不通 → skipped（非终态），分钟级扫描会在窗口内继续重试，不误报失败。"""
+    from invest import scheduler
+    from invest.data import nethealth
+
+    _mark_slot(db_path, "industry_refresh", "16:30", "missed")
+    body = mock.Mock(return_value=JobResult.ok("不该跑"))
+    with mock.patch.dict(scheduler.JOB_FUNCS, {"industry_refresh": body}, clear=True), \
+         mock.patch.object(nethealth, "internet_ok", return_value=False):
+        conn = connect(db_path)
+        try:
+            result = scheduler._late_catchup(db_path, conn, today=dt.date(2026, 9, 15))
+        finally:
+            conn.close()
+    assert result.status == "skipped"
+    body.assert_not_called()
+
+
+def test_late_catchup_noop_when_everything_ok(db_path: str):
+    """当日关键任务都成功 → 直接 ok，不重复跑也不推送。"""
+    from invest import scheduler
+
+    for job in scheduler.LATE_CATCHUP_TARGETS:
+        _mark_slot(db_path, job, scheduler.JOB_SLOTS[job], "ok")
+    body = mock.Mock(return_value=JobResult.ok("不该跑"))
+    notifier = mock.Mock()
+    with mock.patch.dict(scheduler.JOB_FUNCS, {"industry_refresh": body}, clear=True), \
+         mock.patch.object(scheduler, "Notifier", notifier):
+        conn = connect(db_path)
+        try:
+            result = scheduler._late_catchup(db_path, conn, today=dt.date(2026, 9, 15))
+        finally:
+            conn.close()
+    assert result.status == "ok"
+    assert "无需补采" in result.detail
+    body.assert_not_called()
+    notifier.return_value.send_text.assert_not_called()

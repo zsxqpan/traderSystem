@@ -1,6 +1,9 @@
 """仪表盘数据查询（只读）。"""
 from __future__ import annotations
 
+import datetime as dt
+import re
+
 import pandas as pd
 
 from invest.db import connect
@@ -196,8 +199,57 @@ def load_position_limit(db: str) -> dict:
         conn.close()
 
 
+def _last_closed_trading_day(now: pd.Timestamp | None = None) -> pd.Timestamp:
+    """最近一个**已收盘**的交易日（健康判定的参照日）。
+
+    交易日 15:30 之后 → 当天；否则回退上一交易日（周末/节假日继续回退）。
+    2026-09-15 修正：原先拿 today 比较并把"滞后≤1 天"判为正常，
+    导致交易日内缺当日数据（15:00 后仍只有昨日）也显示「正常」。
+    """
+    from invest.data.calendar import is_trading_day, latest_trading_day
+
+    ts = pd.Timestamp(now) if now is not None else pd.Timestamp.now()
+    day = ts.date()
+    if not (is_trading_day(day) and ts.time() >= dt.time(15, 30)):
+        day = latest_trading_day(day - dt.timedelta(days=1))
+    return pd.Timestamp(day)
+
+
+# 各表允许的"正常"滞后天数（相对参照日）。dragon_tiger 只在有上榜日才有数据，
+# 故容 1 天；其余行情/情绪/估值表当日必须有，容 0 天。
+_HEALTH_TOLERANCE = {"dragon_tiger": 1}
+_MACRO_TOLERANCE_DAYS = 45  # 月度数据（社融/PMI 等）天然滞后约一个月，放宽到 45 天
+
+
+def _health_status(lag_days: float, tolerance: int) -> str:
+    if pd.isna(lag_days):
+        return "过期"
+    if lag_days <= tolerance:
+        return "正常"
+    if lag_days <= tolerance + 2:
+        return "偏旧"
+    return "过期"
+
+
+def _parse_month(value) -> pd.Timestamp | None:
+    """解析月度口径日期：2026-08 / 202608 / 2026年08月份 / 2026-08-01 → 该月月末。"""
+    text = str(value or "").strip()
+    if not text or text.lower() in {"nat", "none"}:
+        return None
+    m = re.match(r"^(\d{4})\D{0,3}(\d{1,2})", text)
+    if m:
+        year, month = int(m.group(1)), min(max(int(m.group(2)), 1), 12)
+        return pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
+    ts = pd.to_datetime(text, errors="coerce")
+    return None if pd.isna(ts) else pd.Timestamp(ts).normalize() + pd.offsets.MonthEnd(0)
+
+
 def load_data_health(db: str) -> pd.DataFrame:
-    """各行情表最新日期与滞后天数（数据健康横幅）。"""
+    """各行情表最新日期与滞后天数（数据健康横幅）。
+
+    参照日 = 最近已收盘交易日（见 _last_closed_trading_day）；macro_series 按月解析、
+    用 45 天容忍度单独判定（原先 MAX(date) 解析不出中文月份 → 一直显示 NaT/过期）。
+    """
     sql = """
         SELECT 'industry_bars' AS tbl, MAX(date) AS max_date FROM industry_bars
         UNION ALL SELECT 'index_bars', MAX(date) FROM index_bars
@@ -205,17 +257,34 @@ def load_data_health(db: str) -> pd.DataFrame:
         UNION ALL SELECT 'market_emotion', MAX(date) FROM market_emotion
         UNION ALL SELECT 'industry_valuation', MAX(date) FROM industry_valuation
         UNION ALL SELECT 'dragon_tiger', MAX(date) FROM dragon_tiger
-        UNION ALL SELECT 'macro_series', MAX(date) FROM macro_series
     """
     df = _read(db, sql)
     if df.empty:
         return df
-    today = pd.Timestamp.today().normalize()
+    ref = _last_closed_trading_day()
     df["max_date"] = pd.to_datetime(df["max_date"], format="mixed", errors="coerce")
-    df["lag_days"] = (today - df["max_date"]).dt.days
-    df["status"] = df["lag_days"].apply(
-        lambda d: "正常" if d <= 1 else ("偏旧" if d <= 5 else "过期")
-    )
+    df["lag_days"] = (ref - df["max_date"]).dt.days
+    df["status"] = [
+        _health_status(lag, _HEALTH_TOLERANCE.get(tbl, 0))
+        for tbl, lag in zip(df["tbl"], df["lag_days"])
+    ]
+
+    macro = _read(db, "SELECT MAX(date) AS max_date FROM macro_series")
+    if not macro.empty and macro.iloc[0]["max_date"] is not None:
+        month_end = _parse_month(macro.iloc[0]["max_date"])
+        lag = float((ref - month_end).days) if month_end is not None else float("nan")
+        macro_row = pd.DataFrame([{
+            "tbl": "macro_series",
+            "max_date": month_end,
+            "lag_days": lag,
+            "status": _health_status(
+                lag,
+                _MACRO_TOLERANCE_DAYS if month_end is not None else 0,
+            ),
+        }])
+        df = pd.concat([df, macro_row], ignore_index=True)
+
+    df["ref_date"] = ref
     return df
 
 

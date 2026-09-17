@@ -83,7 +83,7 @@ def test_ticker_only_and_job_funcs():
     assert set(JOB_FUNCS) == {
         "premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend", "monthly",
         "yearly", "industry_refresh", "daily_refresh", "factcard_refresh", "evening_report", "pool_trap_scan",
-        "action_digest", "action_digest_pm", "big_v_harvest",
+        "action_digest", "action_digest_pm", "big_v_harvest", "late_catchup",
     }
     assert set(JOB_COMPENSATION_WINDOWS) == set(JOB_SLOTS) == set(JOB_FUNCS)
     print("test_ticker_only_and_job_funcs OK")

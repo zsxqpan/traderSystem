@@ -14,6 +14,7 @@ import pandas as pd
 
 from invest.data.calendar import get_trading_days, is_trading_day
 from invest.data.collector import run_collection
+from invest.data.nethealth import internet_ok as _REAL_INTERNET_OK
 from invest.data.sources.akshare_source import AkShareSource
 from invest.data.storage import upsert_df
 from invest.data.validator import cross_check
@@ -690,6 +691,46 @@ def test_industry_valuation_all_unpublished_raises_source_error():
     print("test_industry_valuation_all_unpublished_raises_source_error OK")
 
 
+def test_internet_probe_caches_and_recovers():
+    """外网探测：任一探测点连通即视为可达；结果带缓存，force 强制重探（2026-09-15 断网事故防护）。"""
+    from unittest import mock
+
+    from invest.data import nethealth
+
+    nethealth.reset_cache()
+    calls: list[tuple] = []
+
+    class _Sock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_connect(addr, timeout=None):
+        calls.append(addr)
+        if addr[0] == nethealth.PROBE_HOSTS[0][0]:
+            raise OSError("first host down")   # 单站点故障不该判成整网不通
+        return _Sock()
+
+    # conftest 默认打桩 internet_ok=True，这里换回真实实现来验证探测/缓存逻辑
+    with mock.patch.object(nethealth, "internet_ok", _REAL_INTERNET_OK), \
+         mock.patch("socket.create_connection", side_effect=fake_connect):
+        assert nethealth.internet_ok() is True
+        probed = len(calls)
+        assert nethealth.internet_ok() is True     # 命中缓存，不再探测
+        assert len(calls) == probed
+        assert nethealth.internet_ok(force=True) is True
+        assert len(calls) > probed                 # force 强制重探
+
+        nethealth.reset_cache()
+        with mock.patch("socket.create_connection", side_effect=OSError("no route")):
+            assert nethealth.internet_ok() is False
+            assert nethealth.internet_ok() is False  # 失败同样走缓存
+    nethealth.reset_cache()
+    print("test_internet_probe_caches_and_recovers OK")
+
+
 if __name__ == "__main__":
     test_margin_normalize()
     test_macro_pmi_normalize()
@@ -713,6 +754,7 @@ if __name__ == "__main__":
     test_valuation_normalize_and_tasks()
     test_industry_valuation_falls_back_to_last_published_day()
     test_industry_valuation_all_unpublished_raises_source_error()
+    test_internet_probe_caches_and_recovers()
     test_ths_parse_and_map_cache()
     test_industry_all_normalize()
     test_call_with_timeout()

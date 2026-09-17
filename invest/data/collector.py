@@ -266,6 +266,12 @@ def _run_one(
                 update_credibility(conn, src_name, False)
                 errors.append(f"{src_name}(第{attempt}次): {exc}")
                 if attempt < retries:
+                    from invest.data import nethealth
+
+                    if not nethealth.internet_ok():
+                        # 外网不通（2026-09-15 断网事故）：重试只是在等 TCP 超时，直接放弃
+                        errors.append("外网不通，放弃后续重试")
+                        break
                     time.sleep(delay)
         if source_results:
             break

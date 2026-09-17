@@ -83,6 +83,35 @@
   排查用：`Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-Kernel-Power'}`（42 睡 / 107 醒）、
   `Get-ScheduledTask -TaskName 'TraderSystem_*' | Get-ScheduledTaskInfo`（LastRunTime 是否等于计划时刻、Result 码）、
   `logs/keep_awake.log`（保活是否真在跑）、`job_runs` 里 6 位 traceback 定位到某一行。
+- **外网中断整天丢数据（2026-09-15 事故）→ 两条防护（2026-09-17 上线）**：
+  ① 现象：15:00–20:10 本机外网中断（所有采集域名 + 飞书/企微/微信推送全 TCP 超时），
+  盘后链 15:01–17:10 在补偿窗口 17:29:59 内全部失败 → 记 6 个 missed + 告警；17:00 的
+  `evening_report` 生成了但**推送全失败**（飞书连 tenant_access_token 都取不到）→ 日报没发；
+  仪表盘 7 张表 `MAX(date)` 停在上一交易日（**不是显示 bug，是当天数据一行没进来**）。
+  ② **网络探测**（`invest/data/nethealth.py`）：纯 TCP connect 探 4 个点（任一通即可达），
+  进程内缓存（通 60s / 不通 20s，`force=True` 重探）。补偿扫描带 `network_gate=True` →
+  外网不通直接 `deferred`（不再跑正文、不再等 TCP 超时刷屏）；`collector._run_one` 重试前探测，
+  不通就放弃后续重试（断网时 `snapshot_close` 曾白跑 42 次）。
+  ③ **失败指数退避**（`scheduler._JOB_BACKOFF`）：同一 job 连续失败 2→4→8→15 分钟封顶，
+  成功清零，外网不通用短退避 60s；**只作用于补偿扫描**（`respect_backoff=True`），
+  OS 计划任务（独立进程、一天几次）不受限。
+  ④ **21:30 兜底补采 `late_catchup`**：当日关键槽位（snapshot_close/after_close/pool_trap_scan/
+  industry_refresh/daily_refresh/factcard_refresh/evening_report）仍非 ok 且外网可达 →
+  `run_job_once(force=True)` 强制接管槽位补采（`_claim_execution(force=True)` 允许抢占 ok/missed，
+  但**绝不抢活跃租约**）；报告补推前先发一条「本报告为补发」说明。窗口 21:30–23:00
+  （`JOB_COMPENSATION_WINDOWS`），外网仍不通时返回 `skipped`（**非终态**）→ 分钟级扫描继续重试，
+  网络一恢复自动补上。OS 任务 `TraderSystem_late_catchup`（21:30，LeastPrivilege，**免管理员可注册**）。
+  **顺序坑**：补采时 `snapshot_close` 必须排在 akshare 类任务之前，否则快照行会在权威日线之后
+  重新写入 → (symbol,date) 的 snapshot/akshare 双行（与 2026-08-25 calc_rs 故障同款）。
+  ⑤ `tests/conftest.py` 新增 autouse 夹具：把 `nethealth.internet_ok` 打桩为 True + 每个用例
+  重置退避与探测缓存（否则无网 CI 会把任务全判成"外网不通"而 deferred）。
+- **仪表盘数据健康判定（2026-09-17 修）**：`dashboard/queries.load_data_health` 原先拿 today 比较、
+  「滞后≤1 天」即判「正常」——交易日内缺当日数据（15:00 后仍只有昨日）也显示正常，误导排查；
+  现在以**最近已收盘交易日**为参照（交易日 15:30 后=当天，否则回退上一交易日，周末继续回退），
+  新增 `ref_date` 列（胶囊条显示「参照 YYYY-MM-DD（最近已收盘交易日）」）；`dragon_tiger` 容 1 天
+  （只在有上榜日才有数据），其余容 0 天，1–2 天=偏旧、≥3 天=过期；**macro_series 按月解析**
+  （`2026年08月份`/`2026-08`/`202608` → 该月月末）按 45 天容忍度判定——原先 `MAX(date)` 解析不出
+  中文月份，恒为 NaT/过期。
 - Python 语法：关键字参数位置不能裸 walrus（`user=(x := ...)` 需括号）；try/with/finally 配对别写错
 - 涨停判断：主板 ≥9.8%、20cm 板 ≥19.8%；两市成交额=上证+深成指，别加创业板/科创50（子集重复）
 

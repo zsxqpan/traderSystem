@@ -437,6 +437,14 @@ def health_pills(df) -> None:
     if df is None or getattr(df, "empty", True):
         return
     pills = []
+    # 参照日 = 最近已收盘交易日（2026-09-15：原先拿 today 比较，"滞后≤1 天"被误判为正常）
+    ref = None
+    if "ref_date" in getattr(df, "columns", []):
+        raw_ref = df["ref_date"].iloc[0]
+        if str(raw_ref) not in ("NaT", "NaN", "None", ""):
+            ref = str(raw_ref)[:10]
+    if ref:
+        pills.append(f'<span class="ts-pill">参照 {_esc(ref)}（最近已收盘交易日）</span>')
     for r in df.itertuples():
         status = str(getattr(r, "status", "") or "")
         raw_d = getattr(r, "max_date", None)
