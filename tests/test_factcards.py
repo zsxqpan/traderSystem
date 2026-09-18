@@ -539,8 +539,14 @@ def test_dashboard_mid_compare_page_is_wired():
     assert "save_comparison" in queries
 
 
-def test_important_change_push_includes_evidence_ids(db_path: str):
+def test_important_change_push_top_n_without_evidence_ids(db_path: str):
+    """2026-09-18：飞书只推最明显的 N 个板块变化，且**不列证据编号**（避免刷屏）。
+
+    `format_change_digest` 默认仍带证据（供留痕/调试），推送路径传 with_evidence=False。
+    """
     from invest.evidence.factcards import (
+        PUSH_TOP_N,
+        build_industry_card,
         detect_important_changes,
         format_change_digest,
         persist_card,
@@ -551,26 +557,27 @@ def test_important_change_push_includes_evidence_ids(db_path: str):
     conn = connect(db_path)
     try:
         _seed_macro(conn, AS_OF_OLD)
-        _seed_industry(
-            conn, "有色", as_of=AS_OF_OLD, rs=0.04, rotation_rank=9,
-            pe_pct=0.7, crowding=0.2, crowding_state="正常",
-            style="主力", cycle_phase="筑底", main_net=-5e7,
-        )
+        for i, obj in enumerate(["有色", "银行", "煤炭", "钢铁", "化工", "白酒", "医药"]):
+            _seed_industry(
+                conn, obj, as_of=AS_OF_OLD, rs=0.04, rotation_rank=9 + i,
+                pe_pct=0.7, crowding=0.2, crowding_state="正常",
+                style="主力", cycle_phase="筑底", main_net=-5e7,
+            )
         _seed_macro(conn, AS_OF_NEW, env="收紧")
-        _seed_industry(
-            conn, "有色", as_of=AS_OF_NEW, rs=0.16, rotation_rank=1,
-            pe_pct=0.35, crowding=0.88, crowding_state="拥挤",
-            style="游资", cycle_phase="过热", main_net=4e8,
-        )
-        from invest.evidence.factcards import build_industry_card
-
-        persist_card(conn, build_industry_card(conn, "有色", as_of=AS_OF_OLD, news_fn=_news_fn))
-        persist_card(conn, build_industry_card(conn, "有色", as_of=AS_OF_NEW, news_fn=_news_fn))
+        for i, obj in enumerate(["有色", "银行", "煤炭", "钢铁", "化工", "白酒", "医药"]):
+            # 幅度递减：有色最大（周期+拥挤+RS+排名+PE 全变），医药最小
+            _seed_industry(
+                conn, obj, as_of=AS_OF_NEW, rs=0.16 - i * 0.01, rotation_rank=1 + i,
+                pe_pct=0.35, crowding=0.88, crowding_state="拥挤",
+                style="游资", cycle_phase="过热", main_net=4e8,
+            )
+            persist_card(conn, build_industry_card(conn, obj, as_of=AS_OF_OLD, news_fn=_news_fn))
+            persist_card(conn, build_industry_card(conn, obj, as_of=AS_OF_NEW, news_fn=_news_fn))
         changes = detect_important_changes(conn, as_of=AS_OF_NEW)
-        assert changes
-        digest = format_change_digest(changes)
-        assert "有色" in digest
-        assert "EVID-" in digest
+        assert len(changes) > PUSH_TOP_N, "构造出多于推送上限的变化才算有效用例"
+        assert all("score" in c for c in changes)
+        full = format_change_digest(changes)
+        assert "EVID-" in full                      # 留痕版仍带证据
         sent: list[str] = []
 
         class _FakeNotifier:
@@ -585,8 +592,13 @@ def test_important_change_push_includes_evidence_ids(db_path: str):
         )
         assert isinstance(result, JobResult)
         assert result.success
-        assert sent and "EVID-" in sent[0]
-        assert "综合买卖" not in sent[0] and "全市场排名" not in sent[0]
+        assert sent
+        pushed = sent[0]
+        assert "EVID-" not in pushed, "推送不应再列证据编号"
+        assert f"最明显的 {PUSH_TOP_N} 个" in pushed
+        # 只推最明显的：得分最高的"有色"必须在，数量受上限约束
+        assert "有色" in pushed
+        assert pushed.count("\n") <= PUSH_TOP_N + 1
     finally:
         conn.close()
 
@@ -961,9 +973,13 @@ def test_pushed_evidence_ids_are_queryable(db_path: str):
         )
         assert result.success
         assert sent
-        import re
-        ids = re.findall(r"EVID-\d{8}-\d{4}", sent[0])
-        assert ids
+        # 2026-09-18：推送不再列证据编号 → 编号从卡片（留痕）里取，并断言推送里没有 EVID-
+        assert "EVID-" not in sent[0]
+        from invest.evidence.factcards import detect_important_changes
+
+        changes = detect_important_changes(conn, as_of=AS_OF_NEW)
+        ids = [eid for c in changes for eid in (c.get("evidence_ids") or [])]
+        assert ids, changes
         looked = query_evidence(conn, evidence_id=ids[0])
         assert looked["evidence_id"] == ids[0]
         assert looked["summary"]

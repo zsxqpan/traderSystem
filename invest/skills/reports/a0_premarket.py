@@ -193,11 +193,14 @@ def render(db_path: str) -> dict:
         pass
 
     # 8) 涨停异动监控（表格：停牌 + 风险提示/异动监控/暴雷）
+    #    2026-09-18：风险条目只留**个股**（债券/汇率/商品/宏观等不进这张表）
+    from invest.skills.sections.d26_market_watch import stock_risk_items
+
     d = digest(db_path)
     watch_rows: list[list[str]] = []
     for h in fetch_halt_list():
         watch_rows.append(["停牌", f"{h['name']}({h['symbol']})", h.get("reason", "")[:30], "-"])
-    for it in (d.get("risk_items") or []):
+    for it in stock_risk_items(d):
         watch_rows.append([
             it.get("kind", "风险"),
             f"{it.get('name', '')}({it.get('symbol', '')})",

@@ -74,7 +74,13 @@ def _p0_universe(conn) -> tuple[list[dict], list[dict]]:
 
 
 def check_position_falsify(db_path: str, price_map: dict[str, float]) -> list[dict]:
-    """持仓证伪：active 计划 + locked/review 卡片止损。同标的两源都有止损时 plan 优先。"""
+    """持仓证伪：active 计划 + locked/review 卡片止损。同标的两源都有止损时 plan 优先。
+
+    静音名单（`data/alert_mute.json`）里的标的不产生告警——移出核心关注后历史计划/卡片
+    仍在库里，但不再刷盘中提示（2026-09-18）。
+    """
+    from invest.mute import is_muted
+
     conn = connect(db_path)
     try:
         plans, cards = _p0_universe(conn)
@@ -84,6 +90,8 @@ def check_position_falsify(db_path: str, price_map: dict[str, float]) -> list[di
     plan_with_stop: set[str] = set()
     for p in plans:
         sym = p["symbol"]
+        if is_muted(sym):
+            continue
         price = price_map.get(sym)
         if price is None:
             continue  # 无新鲜报价：由 data_guard 处理，不误报
@@ -107,7 +115,7 @@ def check_position_falsify(db_path: str, price_map: dict[str, float]) -> list[di
             })
     for c in cards:
         sym = c["symbol"]
-        if sym in plan_with_stop:
+        if sym in plan_with_stop or is_muted(sym):
             continue
         price = price_map.get(sym)
         if price is None:
@@ -180,6 +188,8 @@ def run_p0_monitor(db_path: str) -> int:
             _save_state({"realtime_invalid": False})
 
         # 持仓证伪（仅交易时段，需要新鲜价格）
+        from invest.mute import is_muted
+
         conn = connect(db_path)
         try:
             plans, cards = _p0_universe(conn)
@@ -188,10 +198,12 @@ def run_p0_monitor(db_path: str) -> int:
             ))
         finally:
             conn.close()
+        symbols = [s for s in symbols if not is_muted(s)]
         if symbols:
             prices = fetch_batch_prices(symbols, db_path=db_path)
             for a in check_position_falsify(db_path, prices):
-                ok = notifier.send_text(a["msg"], key=f"p0_{a['kind']}_{a['symbol']}", min_interval=1800)
+                # 2026-09-18：止损/证伪告警限频 1 小时（原 30 分钟），同标的 key 去重
+                ok = notifier.send_text(a["msg"], key=f"p0_{a['kind']}_{a['symbol']}", min_interval=3600)
                 sent += int(ok)
     return sent
 

@@ -39,6 +39,7 @@ FORBIDDEN_RANK_KEYS = {
 RS_CHANGE = 0.05
 PE_CHANGE = 0.10
 RANK_CHANGE = 3
+PUSH_TOP_N = 5  # 飞书推送只保留最明显的 N 个板块变化（2026-09-18）
 NewsFn = Callable[[str, str, str], list[dict]]
 
 
@@ -1186,21 +1187,61 @@ def detect_important_changes(
             "as_of": as_of,
             "prev_as_of": previous.as_of,
             "notes": notes,
+            "score": _change_score(notes),
             "evidence_ids": [e.evidence_id for e in current.evidence],
         })
     return changes
 
 
-def format_change_digest(changes: list[dict[str, Any]]) -> str:
+# 显著度权重：拥挤度状态跳变 > 周期相位 > 轮动排名 > 中线 RS > PE 分位（2026-09-18）
+_SCORE_ORDER = (("拥挤度", 100.0), ("周期", 60.0), ("轮动排名", 40.0), ("中线RS", 25.0), ("PE分位", 15.0))
+
+
+def _change_score(notes: list[str]) -> float:
+    """变化显著度（越大越明显）：按维度权重 × 变化幅度估算，供"只推最明显的几个"排序。"""
+    score = 0.0
+    for note in notes:
+        for key, weight in _SCORE_ORDER:
+            if not note.startswith(key):
+                continue
+            nums = [float(m) for m in re.findall(r"-?\d+(?:\.\d+)?", note)]
+            # 拥挤度/周期是状态跳变（无数值）→ 按权重本身；数值型按 幅度/量级 加权
+            if key in ("拥挤度", "周期"):
+                score += weight
+            elif len(nums) >= 2:
+                delta = abs(nums[-1] - nums[0])
+                score += weight * min(1.0, delta / 100.0 if key == "PE分位" else delta / 20.0)
+            break
+    return score
+
+
+def format_change_digest(
+    changes: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+    with_evidence: bool = True,
+) -> str:
+    """变化摘要。`limit` 只保留最明显的 N 个（按 score 降序）；`with_evidence=False` 不列证据编号。
+
+    2026-09-18：飞书推送改用「只推最明显的变化 + 不列证据」——原来每天把 100+ 个板块的
+    变化连证据编号一起推，刷屏且没人看。
+    """
     if not changes:
         return ""
-    as_of = changes[0]["as_of"]
-    lines = [f"【事实卡重要变化】as_of={as_of}"]
-    for item in changes:
+    picked = list(changes)
+    if limit is not None and limit > 0:
+        picked = sorted(picked, key=lambda c: float(c.get("score") or 0.0), reverse=True)[:limit]
+    as_of = picked[0]["as_of"]
+    header = f"【事实卡重要变化】as_of={as_of}"
+    if limit is not None and len(changes) > len(picked):
+        header += f"（共 {len(changes)} 个板块变化，列出最明显的 {len(picked)} 个）"
+    lines = [header]
+    for item in picked:
         lines.append(f"{item['obj']}：" + "；".join(item["notes"]))
-        eids = " ".join(item.get("evidence_ids") or [])
-        if eids:
-            lines.append(f"  证据: {eids}")
+        if with_evidence:
+            eids = " ".join(item.get("evidence_ids") or [])
+            if eids:
+                lines.append(f"  证据: {eids}")
     return "\n".join(lines)
 
 
@@ -1229,9 +1270,10 @@ def run_factcard_refresh(
         changes = detect_important_changes(conn, as_of=as_of)
         if not changes:
             return JobResult.ok("无重要变化", artifact="factcard_refresh")
-        digest = format_change_digest(changes)
         if not push:
-            return JobResult.ok(digest, artifact="factcard_refresh")
+            return JobResult.ok(format_change_digest(changes), artifact="factcard_refresh")
+        # 2026-09-18：推送只保留最明显的 PUSH_TOP_N 个板块，且不列证据编号（避免刷屏）
+        digest = format_change_digest(changes, limit=PUSH_TOP_N, with_evidence=False)
         if notifier is None:
             from invest.notifier import Notifier
             notifier = Notifier()

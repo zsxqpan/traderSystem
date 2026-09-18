@@ -796,6 +796,55 @@ def test_d32_render_and_pick_limit():
         conn3.close()
 
 
+def test_format_signals_appends_stock_name(tmp_path, monkeypatch):
+    """2026-09-18：股票类信号在代码后带名称（300438 鹏辉能源）；非股票类不变、查不到只留代码。
+
+    名称来源：① 本地缓存 data/symbol_names.json；② 库内带 name 列的表（此处用 auction_snapshots）。
+    """
+    import json
+
+    from invest.data import names as names_mod
+    from invest.signals.format import format_signals
+    from invest.signals.types import Signal
+
+    cache = tmp_path / "symbol_names.json"
+    cache.write_text(json.dumps({"names": {"300438": "鹏辉能源"}}), encoding="utf-8")
+    monkeypatch.setattr(names_mod, "CACHE_FILE", cache)
+    monkeypatch.setattr(names_mod, "_file_cache", None)
+    monkeypatch.setattr(names_mod, "_file_mtime", None)
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        conn.execute(
+            "INSERT INTO auction_snapshots(date, symbol, name, price, pct) VALUES(?,?,?,?,?)",
+            (ASOF.strftime("%Y-%m-%d"), "002083", "孚日股份", 10.0, 0.5),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    sigs = [
+        Signal(id="auction_keep_vol", name="竞价保量", session="auction", severity="watch",
+               subject_type="stock", subject="300438", hint="量比 3.2", evidence={}),
+        Signal(id="auction_keep_vol_yoy", name="竞价同比保量", session="auction", severity="watch",
+               subject_type="stock", subject="002083", hint="量比 2.1", evidence={}),
+        Signal(id="auction_keep_vol", name="竞价保量", session="auction", severity="watch",
+               subject_type="stock", subject="601091", hint="量比 1.9", evidence={}),
+        Signal(id="sector_flow_spike", name="板块资金放大", session="daily", severity="watch",
+               subject_type="sector", subject="半导体", hint="净流入放大", evidence={}),
+    ]
+    text = format_signals(sigs, limit=10, db_path=p)
+    assert "300438 鹏辉能源" in text                      # 命中本地缓存
+    assert "002083 孚日股份" in text                      # 命中库内名称
+    assert "601091 · 竞价保量" in text                    # 查不到名称 → 只留代码，不编造
+    assert "半导体 · 板块资金放大" in text                # 非股票类不加名称
+
+    # 不传 db_path → 纯函数行为不变（不带名称）
+    plain = format_signals(sigs, limit=10)
+    assert "300438" in plain and "鹏辉能源" not in plain
+
+
 def test_auto_overlays_background_zero_weight():
     """比价 overlay：短线信号 role=背景，不改变总分。"""
     from invest.discipline.auto import auto_factor_score

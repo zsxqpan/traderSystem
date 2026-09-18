@@ -341,6 +341,26 @@ def test_a6_yearly_render():
     assert out == "年度复盘已生成: 3 组回测结论待检视"
 
 
+def test_d26_risk_items_keep_only_stocks():
+    """2026-09-18：盘前「涨停异动监控」表只放个股风险条目，债券/汇率/商品/宏观一律不进表。"""
+    from invest.skills.sections.d26_market_watch import is_stock_risk, stock_risk_items
+
+    stock = {"kind": "业绩雷", "symbol": "600519", "name": "贵州茅台", "event": "预亏"}
+    stock_no_code = {"kind": "风险提示", "symbol": "", "name": "某科技", "event": "问询"}
+    bond = {"kind": "风险提示", "symbol": "", "name": "国债收益率上行", "event": "利率抬升"}
+    fx = {"kind": "风险提示", "symbol": "", "name": "人民币汇率波动", "event": "贬值"}
+    index_item = {"kind": "异动监控", "symbol": "", "name": "上证指数", "event": "放量"}
+    empty = {"kind": "风险提示", "symbol": "", "name": "", "event": "无标的"}
+
+    assert is_stock_risk(stock) and is_stock_risk(stock_no_code)
+    for bad in (bond, fx, index_item, empty):
+        assert not is_stock_risk(bad), bad
+
+    items = stock_risk_items({"risk_items": [stock, bond, stock_no_code, fx, empty]})
+    assert [i["name"] for i in items] == ["贵州茅台", "某科技"]
+    assert stock_risk_items(None) == []
+
+
 def test_a7_auction_structured(monkeypatch):
     """a7 竞价报告：指数竞价/高开放量榜/连板竞价/关键股票竞价+解析/核心竞价/情绪预判（全 mock）。"""
     import invest.skills.sections._intraday_llm as _il
@@ -418,7 +438,9 @@ def test_a7_auction_structured(monkeypatch):
     assert any("昨日连板" in t["title"] for t in tables)
     assert any("市场关键股票竞价" in t["title"] for t in tables)
     assert any("核心关注" in t["title"] for t in tables)
-    assert charts and charts[0]["chart"] == "index_bars"
+    # 2026-09-18：指数涨跌幅只在「指数竞价」表里出现一次 —— 原先还有同数据的条形图，
+    # 企微/微信会把图表渲染成数据行、飞书图片上传失败也降级成文本 → 开头重复两次。
+    assert not [c for c in charts if "指数竞价" in (c.get("title") or "")], "指数涨跌幅不应重复展示"
     assert "竞价情绪预判" in texts and "小盘占优" in texts
     assert "板块竞价解析" in texts and "受消息影响高开" in texts
     assert "浦发银行" in texts  # 低开榜文本

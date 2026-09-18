@@ -343,8 +343,8 @@ def render(db_path: str, agent_text: str = "") -> dict:
         from invest.signals.thresholds import DISPLAY_A3
 
         sigs = scan_db(db_path, "close", persist=True, limit=DISPLAY_A3)
-        short_text = format_signals(sigs, limit=DISPLAY_A3)
-        blk = signal_section(sigs, limit=DISPLAY_A3)
+        short_text = format_signals(sigs, limit=DISPLAY_A3, db_path=db_path)
+        blk = signal_section(sigs, limit=DISPLAY_A3, db_path=db_path)
         if blk:
             sections.append(blk)
         conn_m = connect(db_path)

@@ -57,6 +57,40 @@ def test_check_position_falsify():
     print("test_check_position_falsify OK")
 
 
+def test_muted_symbol_does_not_alert_stop_loss(tmp_path, monkeypatch):
+    """静音名单（已移出核心关注）的标的不再产生盘中止损/证伪告警（2026-09-18）。"""
+    from invest import mute
+
+    mute_file = tmp_path / "alert_mute.json"
+    mute_file.write_text('{"symbols": ["000001"]}', encoding="utf-8")
+    monkeypatch.setattr(mute, "MUTE_FILE", mute_file)
+    mute.reset_cache()
+
+    p = _tmp_db()
+    conn = connect(p)
+    conn.execute(
+        """INSERT INTO trade_plans(symbol, stop_loss, invalid_condition, status, created_at)
+           VALUES('000001', 10.0, '', 'active', datetime('now','localtime'))"""
+    )
+    conn.execute(
+        """INSERT INTO trade_plans(symbol, stop_loss, invalid_condition, status, created_at)
+           VALUES('600000', 20.0, '', 'active', datetime('now','localtime'))"""
+    )
+    conn.commit()
+    conn.close()
+
+    # 两只都跌破止损，但 000001 静音 → 只应报 600000
+    alerts = check_position_falsify(p, {"000001": 9.5, "600000": 19.0})
+    syms = {a["symbol"] for a in alerts}
+    assert syms == {"600000"}, alerts
+
+    # 名单清空后恢复告警
+    mute_file.write_text('{"symbols": []}', encoding="utf-8")
+    mute.reset_cache()
+    alerts2 = check_position_falsify(p, {"000001": 9.5, "600000": 19.0})
+    assert {a["symbol"] for a in alerts2} == {"000001", "600000"}
+
+
 def test_check_data_conflict():
     p = _tmp_db()
     # 无 realtime 留痕 -> 数据失效告警

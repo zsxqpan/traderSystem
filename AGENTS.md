@@ -112,6 +112,34 @@
   （只在有上榜日才有数据），其余容 0 天，1–2 天=偏旧、≥3 天=过期；**macro_series 按月解析**
   （`2026年08月份`/`2026-08`/`202608` → 该月月末）按 45 天容忍度判定——原先 `MAX(date)` 解析不出
   中文月份，恒为 NaT/过期。
+- **盘中提示静音名单（2026-09-18）**：`invest/mute.py` + `data/alert_mute.json`
+  （`{"symbols": [...], "reason": ...}`，mtime 缓存、改文件即时生效）。标的移出核心关注后
+  历史 `cards`/`trade_plans` 仍在库里 → 止损伤口仍会推；写进名单即静音**盘中提示**
+  （不改历史留痕，可随时撤销）。生效点：`monitor.check_position_falsify`（含跳过其价格抓取）/
+  `report._card_alerts`。**同日**：P0 止损/证伪告警限频 `min_interval` 1800s → **3600s**
+  （一小时最多一次）。当前名单：`002083 孚日股份`、`300438 鹏辉能源`（同期已从 `candidate_pool`
+  移除：`out_date='2026-09-18'`，d18 异常波动随之不再覆盖它们）。
+- **代码→名称（2026-09-18）**：`invest/data/names.py`。缓存 `data/symbol_names.json`
+  （akshare `stock_info_a_code_name`，**盘前任务按周刷新**，TTL 7 天，失败沿用旧缓存）；
+  `names.lookup(symbols, db_path)` **只读缓存 + 库内含 name 列的表**（auction_snapshots/
+  limit_up_pool/dragon_tiger/daily_actions），不发网络。`signals.format.format_signals/signal_section`
+  新增 `db_path=` → 股票类标的显示成 `300438 鹏辉能源`（a0/a3/a7/b1/d32 已传；dashboard「交易信号」页
+  同源补名称）。查不到只留代码，不编造。
+- **晚发布源 → 21:30 兜底补采（2026-09-18）**：龙虎榜 / 巨潮行业估值 / 同花顺行业指数
+  **当天 16:0x–16:5x 还没有当日数据**（16:00 采集到的是前一交易日 —— 这是仪表盘"某些表还是昨天"
+  的根因，不是显示 bug；`macro_series` 是月度口径，靠按月中解析 + 45 天容忍度判定）。
+  实测 21:30 后三者都有当日数据 → `late_catchup` 内新增 `_late_data_refresh`：
+  采集 `dragon_tiger`/`industry_valuation`/`margin` + 重跑 `industry_refresh`；
+  **20:00 后已跑过则跳过**（按 `job_runs` 判断，幂等），并把一行 `late_data_refresh` 留痕。
+- **事实卡推送减负（2026-09-18）**：只推最明显的 `PUSH_TOP_N=5` 个板块变化，且**不列证据编号**
+  （`format_change_digest(changes, limit=..., with_evidence=False)`；默认仍全量带证据，供留痕/调试）。
+  显著度 `score` 权重：拥挤度状态跳变(100) > 周期相位(60) > 轮动排名(40) > 中线RS(25) > PE分位(15)。
+- **盘前「涨停异动监控」表只放个股（2026-09-18）**：`d26_market_watch.is_stock_risk/stock_risk_items`
+  —— 有 6 位代码，或名称不含 债/汇率/商品/宏观/指数/ETF 等关键词；a0 表格与 d26 文本视图共用它。
+  原先 LLM 汇总里的债券/汇率/商品条目会混进这张表。
+- **竞价报告去掉重复的指数图（2026-09-18）**：a7 删除「指数竞价涨跌幅（%）」条形图——
+  表格已含同样数值，而企微/微信通道会把图表渲染成数据行、飞书图片上传失败也降级成文本，
+  导致报告开头把指数涨跌幅展示两次。
 - Python 语法：关键字参数位置不能裸 walrus（`user=(x := ...)` 需括号）；try/with/finally 配对别写错
 - 涨停判断：主板 ≥9.8%、20cm 板 ≥19.8%；两市成交额=上证+深成指，别加创业板/科创50（子集重复）
 

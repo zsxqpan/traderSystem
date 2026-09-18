@@ -61,10 +61,11 @@ def render(db_path: str, session: str = "intraday", horizon: str = "", layer: st
             rows = list_signals(
                 conn, horizon=horizon_f, session="daily", layer=layer_f,
             )
-            return format_signals(_rows_to_signals(rows))
+            return format_signals(_rows_to_signals(rows), db_path=db_path)
         layers = [layer_f] if layer_f else None
         return format_signals(
-            scan(conn, session, persist=False, horizon=horizon_f, layers=layers)
+            scan(conn, session, persist=False, horizon=horizon_f, layers=layers),
+            db_path=db_path,
         )
     except Exception:
         return ""

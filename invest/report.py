@@ -142,7 +142,10 @@ def _card_alerts(conn, live_prices: dict | None = None) -> list[str]:
     """持仓卡片警戒：优先用实时价（盘中），无则用最新收盘价。
 
     返回格式 ["600519 破止损(现价1710<止损1720)", ...]。
+    静音名单（data/alert_mute.json）内的标的跳过（2026-09-18：移出核心关注后不再刷盘中提示）。
     """
+    from invest.mute import is_muted
+
     rows = conn.execute(
         """SELECT symbol, level, cycle, status, stop_loss, target FROM cards
            WHERE status IN ('locked','review') ORDER BY level"""
@@ -150,6 +153,8 @@ def _card_alerts(conn, live_prices: dict | None = None) -> list[str]:
     out: list[str] = []
     for r in rows:
         sym = r["symbol"]
+        if is_muted(sym):
+            continue
         price = (live_prices or {}).get(sym)
         if price is None:
             row = conn.execute(

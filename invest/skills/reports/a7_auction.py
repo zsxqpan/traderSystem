@@ -130,7 +130,8 @@ def render(db_path: str, snapshot=None) -> dict:
     # ========== 第一段：消费冻结快照（不再各自重拉） ==========
     idx_block = snap.blocks.get("index_quotes")
     idx_results = list(getattr(idx_block, "quotes", None) or [])
-    idx_rows, chart, idx_results = _index_table(idx_results)
+    # 图表数据不再使用（2026-09-18 去掉重复的指数条形图，只留表格）
+    idx_rows, _chart, idx_results = _index_table(idx_results)
 
     boards = getattr(snap.blocks.get("auction_boards"), "payload", None) or {}
     gainers = list(boards.get("gainers") or [])
@@ -189,7 +190,7 @@ def render(db_path: str, snapshot=None) -> dict:
             db_path, "auction", boards=boards,
             limit=DISPLAY_A7, persist=True,
         )
-        sig_text = format_signals(sigs)
+        sig_text = format_signals(sigs, db_path=db_path)
     except Exception:
         pass
 
@@ -227,11 +228,8 @@ def render(db_path: str, snapshot=None) -> dict:
             "type": "table", "title": "指数竞价",
             "columns": ["指数", "竞价点位", "竞价涨跌幅", "状态"], "rows": idx_rows,
         })
-        if chart:
-            sections.append({
-                "type": "chart", "chart": "index_bars",
-                "title": "指数竞价涨跌幅（%）", "data": chart,
-            })
+        # 2026-09-18：去掉「指数竞价涨跌幅（%）」条形图——表格已含同样数值，
+        # 企微/微信通道会把图表渲染成数据行、飞书图片上传失败也会降级成文本 → 开头重复两次。
         if analysis:
             sections.append({"type": "text", "text": f"**指数竞价解析**: {_an('index')}"})
 

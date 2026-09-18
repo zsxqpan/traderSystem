@@ -703,6 +703,15 @@ def _premarket(db: str, conn) -> JobResult:
         (ROOT / "data" / "premarket_agent.txt").write_text(text or "", encoding="utf-8")
     except Exception as exc:
         logger.warning("盘前 Agent 关注方向落盘失败: %s", exc)
+    # 2026-09-18：全市场代码→名称缓存按周刷新（给交易信号/表格补名称；失败沿用旧缓存）
+    try:
+        from invest.data.names import refresh_cache
+
+        n_named = refresh_cache()
+        if n_named:
+            _log_run(conn, "symbol_names", "ok", f"名称缓存 {n_named} 个")
+    except Exception as exc:
+        logger.warning("名称缓存刷新失败: %s", exc)
     return collected
 
 
@@ -1258,6 +1267,65 @@ def _notify_late_report() -> None:
         logger.warning("补发说明推送异常", exc_info=True)
 
 
+# 当天"晚发布"的数据源（2026-09-18）：16:0x–16:5x 采集时这些源还只有前一交易日的数据，
+# 21:30 后才有当日数据 → 兜底任务里补采一次，让仪表盘/次日报告用上当日值。
+LATE_DATA_TASKS: tuple[str, ...] = ("dragon_tiger", "industry_valuation", "margin")
+LATE_REFRESH_AFTER = dt.time(20, 0)
+
+
+def _refreshed_after(db: str, job: str, since: dt.datetime) -> bool:
+    """该 job 今天在 since 之后是否已成功跑过。"""
+    conn = connect(db)
+    try:
+        row = conn.execute(
+            """SELECT MAX(started_at) AS t FROM job_runs
+               WHERE job=? AND status='ok' AND started_at>=?""",
+            (job, since.strftime("%Y-%m-%d %H:%M:%S")),
+        ).fetchone()
+    finally:
+        conn.close()
+    return bool(row and row["t"])
+
+
+def _late_data_refresh(db: str, *, run_now: dt.datetime) -> str:
+    """补采晚发布源：龙虎榜/行业估值/融资融券（采集任务）+ 行业指数（industry_refresh 正文）。
+
+    实测（2026-09-18）：16:0x 龙虎榜/行业指数/行业估值都只有前一交易日数据，21:30 后才有当日值。
+    已在 20:00 后成功跑过的任务不重复（幂等），失败只记日志不影响兜底任务结论。
+    """
+    from invest.data.collector import TASKS, run_collection
+
+    done: list[str] = []
+    since = dt.datetime.combine(run_now.date(), LATE_REFRESH_AFTER)
+    if not _refreshed_after(db, "late_data_refresh", since):
+        tasks = [t for t in TASKS if t["name"] in set(LATE_DATA_TASKS)]
+        try:
+            summary = run_collection(db, tasks=tasks)
+            ok_n = sum(1 for s in summary if s.get("status") == "ok")
+            done.append(f"晚发布采集 {ok_n}/{len(summary)}")
+        except Exception:
+            logger.warning("晚发布源补采异常", exc_info=True)
+            done.append("晚发布采集异常")
+        try:
+            conn = connect(db)
+            try:
+                _log_run(conn, "late_data_refresh", "ok", "；".join(done))
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("晚发布补采留痕失败", exc_info=True)
+
+    # 行业指数（同花顺）同样晚发布 → 重跑 industry_refresh 正文（槽位强制接管，attempt+1）
+    if not _refreshed_after(db, "industry_refresh", since):
+        try:
+            result = run_job_once("industry_refresh", db_path=db, now=run_now, force=True)
+            done.append(f"industry_refresh={result.status}")
+        except Exception as exc:
+            logger.warning("行业指数补采异常: %s", exc)
+            done.append("industry_refresh=error")
+    return "；".join(done) if done else "晚发布源已是最新"
+
+
 def _late_catchup(db: str, conn, *, today: dt.date | None = None) -> JobResult:
     """当日关键槽位若仍漏跑、且外网已恢复 → 逐个强制补采；报告补推前先发「补发」说明。
 
@@ -1289,7 +1357,8 @@ def _late_catchup(db: str, conn, *, today: dt.date | None = None) -> JobResult:
             logger.warning("兜底补采 %s（当日槽位状态=%s）", job, status)
             pending.append(job)
     if not pending:
-        return JobResult.ok("当日关键任务均已成功，无需补采")
+        late = _late_data_refresh(db, run_now=run_now)
+        return JobResult.ok(f"当日关键任务均已成功，无需补采；{late}")
     if "snapshot_close" in pending and "daily_refresh" not in pending:
         # 快照补完后必须让权威日线再写一次，清掉同 (symbol,date) 的 snapshot 行
         pending.append("daily_refresh")
@@ -1320,6 +1389,8 @@ def _late_catchup(db: str, conn, *, today: dt.date | None = None) -> JobResult:
         f"需补 {len(pending)} 项 | 成功: {','.join(done) or '-'} | "
         f"未成功: {','.join(failed) or '-'}"
     )
+    late = _late_data_refresh(db, run_now=run_now)
+    detail = f"{detail}；{late}"
     if failed:
         return JobResult.failed(detail)
     return JobResult.ok(detail)

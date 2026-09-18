@@ -351,15 +351,15 @@ def render(db_path: str, public: bool = False, brief: bool = False, snapshot=Non
         main, disc = split_b1(sigs)
         sig_text = "\n".join(
             x for x in (
-                format_signals(main, limit=DISPLAY_B1_WATCH),
+                format_signals(main, limit=DISPLAY_B1_WATCH, db_path=db_path),
                 format_discovery_action(sigs),
             ) if x
         )
-        blk = signal_section(main, limit=DISPLAY_B1_WATCH)
+        blk = signal_section(main, limit=DISPLAY_B1_WATCH, db_path=db_path)
         if blk:
             sections.append(blk)
         if disc:
-            dblk = signal_section(disc, title="【明确发现】")
+            dblk = signal_section(disc, title="【明确发现】", db_path=db_path)
             if dblk:
                 sections.append(dblk)
     except Exception:

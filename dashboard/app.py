@@ -401,6 +401,21 @@ def page_signals():
     if df.empty:
         empty("暂无交易信号")
         return
+    # 2026-09-18：股票类信号在代码后带名称（300438 乾照光电），查不到就只留代码
+    try:
+        from invest.data.names import lookup
+
+        if "subject" in df.columns and "subject_type" in df.columns:
+            types = list(df["subject_type"])
+            syms = sorted({str(s) for s, t in zip(df["subject"], types) if t == "stock"})
+            names = lookup(syms, DB) if syms else {}
+            df = df.copy()
+            df["subject"] = [
+                f"{s} {names.get(str(s), '')}".strip() if t == "stock" else s
+                for s, t in zip(df["subject"], types)
+            ]
+    except Exception:
+        pass
     n_act = int((df["severity"] == "action").sum()) if "severity" in df.columns else 0
     n_watch = int((df["severity"] == "watch").sum()) if "severity" in df.columns else 0
     k1, k2, k3 = st.columns(3)

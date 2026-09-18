@@ -1291,6 +1291,31 @@ def _mark_slot(db_path: str, job: str, run_slot: str, status: str) -> None:
         conn.close()
 
 
+def test_late_data_refresh_collects_late_sources_once(db_path: str):
+    """21:30 兜底里的"晚发布源补采"：龙虎榜/行业估值/融资融券 + 行业指数，且当天只补一次。"""
+    from invest import scheduler
+
+    calls: list[str] = []
+
+    def fake_collect(_db, tasks=None):
+        calls.append("collect:" + ",".join(sorted(t["name"] for t in (tasks or []))))
+        return [{"name": t["name"], "status": "ok"} for t in (tasks or [])]
+
+    body = mock.Mock(return_value=JobResult.ok("行业指数已补"))
+    run_now = dt.datetime(2026, 9, 15, 21, 35)
+    with mock.patch("invest.data.collector.run_collection", side_effect=fake_collect), \
+         mock.patch.dict(scheduler.JOB_FUNCS, {"industry_refresh": body}, clear=True):
+        first = scheduler._late_data_refresh(db_path, run_now=run_now)
+        second = scheduler._late_data_refresh(db_path, run_now=dt.datetime(2026, 9, 15, 22, 30))
+
+    assert "晚发布采集" in first
+    assert calls and calls[0] == "collect:dragon_tiger,industry_valuation,margin"
+    body.assert_called_once()                     # 行业指数补一次
+    assert len(calls) == 1, "同一天不得重复采集"
+    assert "已是最新" in second
+    body.assert_called_once()
+
+
 def test_late_catchup_backfills_missed_slots(db_path: str):
     """21:30 兜底：当日漏跑的槽位在网络恢复后被强制补采，报告补推前先发「补发」说明。"""
     from invest import scheduler
@@ -1313,6 +1338,7 @@ def test_late_catchup_backfills_missed_slots(db_path: str):
     jobs = {name: _body(name) for name in scheduler.LATE_CATCHUP_TARGETS}
     notifier = mock.Mock()
     with mock.patch.dict(scheduler.JOB_FUNCS, jobs, clear=True), \
+         mock.patch.object(scheduler, "_late_data_refresh", return_value="晚发布源已是最新"), \
          mock.patch.object(scheduler, "Notifier", notifier):
         conn = connect(db_path)
         try:
@@ -1367,6 +1393,7 @@ def test_late_catchup_noop_when_everything_ok(db_path: str):
     body = mock.Mock(return_value=JobResult.ok("不该跑"))
     notifier = mock.Mock()
     with mock.patch.dict(scheduler.JOB_FUNCS, {"industry_refresh": body}, clear=True), \
+         mock.patch.object(scheduler, "_late_data_refresh", return_value="晚发布源已是最新"), \
          mock.patch.object(scheduler, "Notifier", notifier):
         conn = connect(db_path)
         try:

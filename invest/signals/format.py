@@ -64,17 +64,45 @@ def format_signals(
     signals: list[Signal],
     limit: int = DISPLAY_LIMIT,
     title: str = "【交易信号】",
+    *,
+    db_path: str | None = None,
 ) -> str:
+    """信号文本。传 db_path 时给股票类标的补上名称（`300438 乾照光电`，2026-09-18）。"""
     picked = pick_signals(signals, limit)
     if not picked:
         return ""
+    names = _names_for(picked, db_path)
     lines = [title]
     for s in picked:
         sev = _SEV_CN.get(s.severity, s.severity)
-        name = (s.name or "").strip()
-        head = f"{s.subject} · {name}" if name else s.subject
+        signal_name = (s.name or "").strip()
+        subject = _with_stock_name(s, names)
+        head = f"{subject} · {signal_name}" if signal_name else subject
         lines.append(f"  [{sev}] {head}：{s.hint}")
     return "\n".join(lines)
+
+
+def _names_for(signals: list[Signal], db_path: str | None) -> dict[str, str]:
+    """给 stock 类 subject 查名称（无 db_path → 空表，纯函数行为不变）。"""
+    if not db_path:
+        return {}
+    syms = [s.subject for s in signals if s.subject_type == "stock" and s.subject]
+    if not syms:
+        return {}
+    try:
+        from invest.data.names import lookup
+
+        return lookup(syms, db_path)
+    except Exception:
+        return {}
+
+
+def _with_stock_name(s: Signal, names: dict[str, str]) -> str:
+    """股票类：`300438 乾照光电`；其余（板块/ETF/市场）原样。"""
+    if s.subject_type != "stock":
+        return s.subject
+    nm = (names or {}).get(s.subject, "")
+    return f"{s.subject} {nm}" if nm else s.subject
 
 
 def format_discovery_action(signals: list[Signal]) -> str:
@@ -89,9 +117,11 @@ def signal_section(
     signals: list[Signal],
     limit: int = DISPLAY_LIMIT,
     title: str = "【交易信号】",
+    *,
+    db_path: str | None = None,
 ) -> dict | None:
     """报告用结构化文本节；无命中返回 None。"""
-    text = format_signals(signals, limit, title=title)
+    text = format_signals(signals, limit, title=title, db_path=db_path)
     if not text:
         return None
     body = text.split("\n", 1)[-1] if "\n" in text else ""
