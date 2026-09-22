@@ -611,13 +611,7 @@ CREATE TABLE IF NOT EXISTS daily_actions (
 );
 CREATE INDEX IF NOT EXISTS idx_daily_actions_date ON daily_actions(date, priority);
 
-CREATE TABLE IF NOT EXISTS review_lessons (
-    date TEXT NOT NULL,
-    kind TEXT NOT NULL,            -- intraday / plan
-    body TEXT NOT NULL,
-    src  TEXT NOT NULL DEFAULT 'llm',
-    PRIMARY KEY (date, kind, body)
-);
+-- 2026-09-18：删除 review_lessons（复盘错误原因/经验校验库）——盘后日报不再产出，链路已删
 
 CREATE TABLE IF NOT EXISTS watch_items (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

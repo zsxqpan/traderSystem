@@ -19,8 +19,6 @@
         TraderSystem_weekend            周日   20:00
         TraderSystem_monthly            每月1日 09:30
         TraderSystem_yearly             每年1/1 09:30
-        TraderSystem_action_digest_am   交易日 10:00
-        TraderSystem_action_digest_pm   交易日 13:30
         TraderSystem_big_v_harvest      每天   17:10
         TraderSystem_late_catchup       交易日 21:30（当日漏跑兜底补采；窗口至 23:00，需机器清醒）
     电源策略任务（2026-09-07：机器仅 08:30-17:30 唤醒，其余时间允许休眠省电）：
@@ -56,8 +54,6 @@ $jobs = @(
     @{ Name = "TraderSystem_daily_refresh";    Desc = "16:40 日线/指数补采+quant";         Trigger = 'weekday'; Time = "16:40"; Job = "daily_refresh" },
     @{ Name = "TraderSystem_factcard_refresh"; Desc = "16:50 行业事实卡/重要变化推送";       Trigger = 'weekday'; Time = "16:50"; Job = "factcard_refresh" },
     @{ Name = "TraderSystem_evening_report";   Desc = "17:00 晚间盘后报告(含数据滞后门禁)"; Trigger = 'weekday'; Time = "17:00"; Job = "evening_report" },
-    @{ Name = "TraderSystem_action_digest_am"; Desc = "10:00 动作 digest";                 Trigger = 'weekday'; Time = "10:00"; Job = "action_digest" },
-    @{ Name = "TraderSystem_action_digest_pm"; Desc = "13:30 动作 digest";                 Trigger = 'weekday'; Time = "13:30"; Job = "action_digest_pm" },
     @{ Name = "TraderSystem_big_v_harvest";    Desc = "17:10 大V画像库雪球慢速回灌";         Trigger = 'daily'; Time = "17:10"; Job = "big_v_harvest" },
     @{ Name = "TraderSystem_late_catchup";     Desc = "21:30 当日漏跑兜底补采（外网恢复后）"; Trigger = 'weekday'; Time = "21:30"; Job = "late_catchup" }
 )

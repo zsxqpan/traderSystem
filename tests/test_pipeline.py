@@ -50,7 +50,7 @@ def test_scheduler_jobs():
     assert {"premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend",
             "intraday_tick", "monthly", "yearly", "industry_refresh", "daily_refresh",
             "factcard_refresh", "evening_report", "pool_trap_scan", "compensation_scan",
-            "action_digest_am", "action_digest_pm", "big_v_harvest"} <= ids
+            "big_v_harvest"} <= ids
     assert "p2_brief" not in ids and "nightly" not in ids
     print("test_scheduler_jobs OK")
 
@@ -83,7 +83,7 @@ def test_ticker_only_and_job_funcs():
     assert set(JOB_FUNCS) == {
         "premarket", "morning_brief", "auction", "after_close", "snapshot_close", "weekend", "monthly",
         "yearly", "industry_refresh", "daily_refresh", "factcard_refresh", "evening_report", "pool_trap_scan",
-        "action_digest", "action_digest_pm", "big_v_harvest", "late_catchup",
+        "big_v_harvest", "late_catchup",
     }
     assert set(JOB_COMPENSATION_WINDOWS) == set(JOB_SLOTS) == set(JOB_FUNCS)
     print("test_ticker_only_and_job_funcs OK")

@@ -53,12 +53,10 @@ def test_viewpoints_status_parameterized():
 
 
 def test_overview_queries():
-    """总览页查询：温度历史/涨跌榜/拥挤度×强度/数据健康。"""
+    """总览页查询：温度历史/拥挤度×强度/数据健康（2026-09-18 删板块涨跌热力图）。"""
     th = q.load_temperature_history(DB)
     assert not th.empty and {"run_date", "score"} <= set(th.columns)
-    mv = q.load_latest_movers(DB)
-    assert not mv.empty and {"industry", "pct", "amount"} <= set(mv.columns)
-    assert mv["pct"].max() > 0
+    assert not hasattr(q, "load_latest_movers"), "当日板块涨跌热力图已删，查询函数不应保留"
     cs = q.load_crowding_vs_strength(DB)
     assert not cs.empty and {"obj", "rs", "crowding", "trend_stage"} <= set(cs.columns)
     h = q.load_data_health(DB)
@@ -101,13 +99,12 @@ def test_data_health_reference_and_macro_month_parse():
 
 
 def test_rotation_linkage_style_queries():
-    """轮动轨迹/联动网络/风格时间线查询。"""
+    """轮动轨迹/风格时间线查询（2026-09-18 删行业联动网络图；短线轨「高相关行业对」表保留）。"""
     rh = q.load_rotation_history(DB)
     assert not rh.empty and {"run_date", "industry", "rank"} <= set(rh.columns)
-    edges = q.load_linkage_edges(DB, threshold=0.85, max_edges=150)
-    assert not edges.empty and {"a", "b", "corr", "lead"} <= set(edges.columns)
-    assert len(edges) <= 150
-    assert (edges["corr"] >= 0.85).all()
+    assert not hasattr(q, "load_linkage_edges"), "联动网络图已删，查询函数不应保留"
+    lk = q.load_linkage(DB)
+    assert not lk.empty
     sh = q.load_style_history(DB)
     assert not sh.empty and {"run_date", "style", "n"} <= set(sh.columns)
     print("test_rotation_linkage_style_queries OK")

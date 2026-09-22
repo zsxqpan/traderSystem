@@ -17,7 +17,6 @@ from dashboard.charts import (
 )
 from dashboard.nav import NAV_GROUPS, PAGES_ORDER
 from dashboard.theme import (
-    A_SHARE_SCALE,
     COLORWAY,
     MUTED,
     TEMP_BANDS,
@@ -125,23 +124,7 @@ def page_overview():
     else:
         empty("温度历史数据不足（每日运行后自动积累）")
 
-    section("当日板块涨跌热力图", "面积=成交额，颜色=涨跌幅（红涨绿跌）")
-    mv = q.load_latest_movers(DB)
-    if not mv.empty:
-        m2 = mv.dropna(subset=["pct"]).copy()
-        fig = px.treemap(
-            m2, path=[px.Constant("板块"), "industry"], values="amount", color="pct",
-            color_continuous_scale=list(A_SHARE_SCALE), color_continuous_midpoint=0,
-        )
-        fig.update_traces(
-            texttemplate="%{label}",
-            hovertemplate="%{label}<br>涨跌幅 %{color:.2%}<br>成交额 %{value:,.0f}",
-        )
-        apply_fig(fig, height=520)
-        fig.update_layout(coloraxis_colorbar_title="涨跌幅")
-        st.plotly_chart(fig, width="stretch")
-    else:
-        empty("暂无板块行情数据")
+    # 2026-09-18 删除「当日板块涨跌热力图」（按需求精简；queries.load_latest_movers 一并移除）
 
     section("拥挤度 × 相对强度", "右上=又强又拥挤，追高风险区")
     cs = _safe_df(q.load_crowding_vs_strength, DB)
@@ -185,51 +168,8 @@ def page_rotation():
     else:
         empty("暂无轮动历史（每日运行后自动积累）")
 
-    section("行业联动网络", "高相关板块，阈值可调")
-    threshold = st.slider("相关性阈值", 0.6, 0.95, 0.85, 0.05)
-    edges = q.load_linkage_edges(DB, threshold=threshold, max_edges=150)
-    if not edges.empty:
-        import math
-        from collections import Counter
-
-        import plotly.graph_objects as go
-        nodes = sorted(set(edges["a"]) | set(edges["b"]))
-        deg = Counter(list(edges["a"]) + list(edges["b"]))
-        pos = {name: (math.cos(2 * math.pi * i / len(nodes)), math.sin(2 * math.pi * i / len(nodes)))
-               for i, name in enumerate(nodes)}
-        ex, ey = [], []
-        for r in edges.itertuples():
-            x0, y0 = pos[r.a]
-            x1, y1 = pos[r.b]
-            ex += [x0, x1, None]
-            ey += [y0, y1, None]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=ex, y=ey, mode="lines",
-            line={"color": "rgba(139,151,173,0.35)", "width": 1},
-            hoverinfo="none",
-        ))
-        fig.add_trace(go.Scatter(
-            x=[pos[n][0] for n in nodes], y=[pos[n][1] for n in nodes],
-            mode="markers+text", text=nodes, textposition="middle center",
-            textfont={"size": 11, "color": "#E8EEF7"},
-            marker={
-                "size": [10 + 5 * deg[n] for n in nodes],
-                "color": "#4C8DFF",
-                "line": {"color": "#0B1220", "width": 1},
-            },
-            hovertext=[f"{n}<br>连接 {deg[n]} 个板块" for n in nodes], hoverinfo="text",
-        ))
-        apply_fig(fig, height=560)
-        fig.update_layout(
-            showlegend=False, xaxis={"visible": False}, yaxis={"visible": False},
-            margin={"l": 10, "r": 10, "t": 10, "b": 10},
-        )
-        fig.update_yaxes(scaleanchor="x", scaleratio=1)
-        st.plotly_chart(fig, width="stretch")
-        st.caption(f"显示 {len(nodes)} 个板块 / {len(edges)} 条高相关边（按相关性取前150条）")
-    else:
-        empty(f"相关性 ≥ {threshold:.0%} 的板块对暂无")
+    # 2026-09-18 删除「行业联动网络」图（按需求精简；queries.load_linkage_edges 一并移除）
+    #   注：短线轨页的「高相关行业对」表格（load_linkage）保留。
 
     section("行业风格轮动时间线", "各类风格占比")
     sh = q.load_style_history(DB)

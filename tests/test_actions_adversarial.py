@@ -217,49 +217,6 @@ def test_close_session_signals_win_the_cap_over_auction():
         conn.close()
 
 
-def test_format_digest_multiline_hint_stays_within_15_lines():
-    from invest.actions.digest import format_digest
-    from invest.actions.types import Action
-
-    rows = [
-        Action(
-            date="d", symbol=f"{i:06d}", verb="sell", priority=1,
-            source="card", status="pending",
-            hint="第一行\n建议买入\n第三行还很长",
-        )
-        for i in range(1, 10)
-    ]
-    text = format_digest(rows)
-    assert text
-    assert len(text.splitlines()) <= 15
-    assert "建议买入" not in text
-    assert "\n建议" not in text
-
-
-def test_format_digest_empty_and_no_stale_unbroken_stop():
-    from invest.actions.digest import format_digest
-    from invest.actions.types import Action
-
-    assert format_digest([]) == ""
-    assert format_digest([
-        Action(date="d", symbol="600519", verb="watch", priority=4,
-               source="llm", status="pending", hint="探索"),
-    ]) == ""
-
-    text = format_digest([
-        Action(
-            date="d", symbol="600519", verb="hold", priority=2,
-            source="card", status="triggered", stop_loss=9.5,
-            hint="600519 止损 9.5，收盘 10.8 未破",
-            evidence={"last": 9.4},
-        ),
-    ])
-    assert "600519" in text
-    assert "未破" not in text
-    assert "建议买入" not in text
-    assert len(text.splitlines()) <= 15
-
-
 def test_maybe_open_one_day_does_not_enter_watch_or_pool():
     from invest.actions.persist import persist_actions
     from invest.actions.types import Action

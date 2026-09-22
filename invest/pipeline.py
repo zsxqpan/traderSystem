@@ -690,34 +690,8 @@ def _persist_plan(plan_data: dict) -> None:
         logging.getLogger(__name__).warning("明日预案落库失败", exc_info=True)
 
 
-def notify_action_digest(db_path: str, asof=None) -> bool:
-    """盘中动作 digest（阶段 C）：priority=1 或已 triggered，无 LLM。"""
-    import datetime as _dt
-
-    from invest.actions.digest import format_digest
-    from invest.actions.persist import update_statuses
-    from invest.actions.query import list_actions
-    from invest.notifier import Notifier
-
-    day = asof or _dt.date.today()
-    conn = connect(db_path)
-    try:
-        try:
-            from invest.intraday import fetch_batch_prices
-
-            rows = list_actions(conn, day)
-            symbols = [r["symbol"] for r in rows]
-            if symbols:
-                prices = fetch_batch_prices(symbols, db_path=db_path)
-                update_statuses(conn, day, prices)
-        except Exception:
-            logger.warning("digest 刷新现价失败", exc_info=True)
-        text = format_digest(list_actions(conn, day))
-    finally:
-        conn.close()
-    if not text:
-        return False
-    return Notifier().send_text(text, key="action_digest", min_interval=5400)
+# notify_action_digest（10:00/13:30 盘中动作 digest）2026-09-18 按需求删除：
+# 内容属"今日操作"，非报告链路；invest/actions/digest.py 与两个 OS 任务一并移除。
 
 
 def notify_weekend(

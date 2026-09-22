@@ -1,19 +1,22 @@
 """A3 盘后日报 skill（2026-08-22 重构：盘中报告 PLUS 版，4 点结构化 + 预案闭环）。
 
-结构（用户指定）：
-1. 盘面总览（收盘角度）：指数表格 + **指数 ETF 分析**（量能/资金流入流出/大资金进出≈国家队）；
-2. **盘中观点复盘**：今日盘中报告给过的预测/操作建议/短线判断 vs 当日实际 → 对错总结 +
-   错误原因（沉淀经验，可固化 skill）；
-3. **重要板块总分析**：AI硬件/AI软件/机器人/金融/金属/新旧能源/内需 固定方向 + 各方向 ETF
-   （纯度高于板块指数）——活跃方向详细分析；不活跃一句话中线状态；方向内个股异动一句话归因；
-4. **明日预案**：推荐介入股票（系统探索迭代）+ 关注/持仓股操作预案 + 最近 N 日预案质量复盘
-   （优化预案推演方式，可沉淀为 skill）。
+2026-09-18 精简（省 token）：
+- 删除「点1 盘面总览·指数」涨跌幅表格（ETF 段保留）；
+- 「点2 盘中观点复盘」只留对错总结，**不再输出错误原因/经验，也不再沉淀校验库**
+  （review_lessons 表与 persist_lessons/list_lessons 已删）；
+- 报告不再输出「今日操作」与「明日动作」表格（动作清单仍在后台合成落库，
+  供仪表盘/对话 d33/盘中报告消费）；
+- 「点4 明日预案」**只给方向**（direction/focus/risk），不提及个股；
+- 删除预案质量复盘模块（含 `_daily_llm.plan_review_llm` 与 `_plan_history`）。
+
+结构：1. 盘面总览（指数 ETF 量能/资金/大资金进出）2. 盘中观点复盘（对错总结）
+3. 重要板块总分析 4. 明日预案（仅方向）。
 
 尾部保留（Q1-A）：持仓警戒 / 消息面(LLM) / 候选池变化。
-struct 附 "plan_data"（明日预案 JSON），由调度器写 viewpoints source='plan'（B1 预案对照
-与次日复盘读取；skill render 保持纯函数）。
+struct 附 "plan_data"（明日方向 JSON），由调度器写 viewpoints source='plan'
+（B1 预案对照读取；skill render 保持纯函数）。
 
-LLM：job='daily_report'，4 次调用（intraday_review / board_analysis / plan_gen / plan_review），
+LLM：job='daily_report'，3 次调用（intraday_review / board_analysis / plan_gen），
 失败回退（省略该节/直列数据），不阻断报告。
 """
 from __future__ import annotations
@@ -27,9 +30,9 @@ SKILL = {
     "id": "a3_daily",
     "name": "盘后日报",
     "kind": "report",
-    "description": "盘后日报（盘中PLUS）：盘面总览(含ETF)/盘中观点复盘/重要板块总分析/明日预案+质量复盘",
-    "uses": ["d1_news_block", "d10_action_guide", "d16_card_alerts", "d17_pool_delta",
-             "d21_freshness", "d12_limit_up_ladder", "d13_fund_line", "d28_community_hot",
+    "description": "盘后日报（盘中PLUS）：盘面总览(ETF)/盘中观点复盘(对错)/重要板块总分析/明日预案(方向)",
+    "uses": ["d1_news_block", "d16_card_alerts", "d17_pool_delta",
+             "d21_freshness", "d13_fund_line", "d28_community_hot",
              "d29_sector_resonance", "d32_trade_signals", "d33_daily_actions"],
     "params": {
         "db_path": "str, required",
@@ -220,55 +223,6 @@ def _next_trading_day(d: dt.date) -> dt.date | None:
     return None
 
 
-def _plan_history(conn) -> list[dict]:
-    """最近 5 天预案 vs 次日实际（预案质量复盘输入）。"""
-    try:
-        rows = conn.execute(
-            """SELECT created_at, conclusion FROM viewpoints
-               WHERE source='plan' ORDER BY created_at DESC LIMIT 5"""
-        ).fetchall()
-    except Exception:
-        return []
-    history = []
-    for r in reversed(rows):
-        try:
-            plan = json.loads(r["conclusion"])
-        except (ValueError, TypeError):
-            continue
-        date_str = (r["created_at"] or "")[:10]
-        try:
-            d = dt.date.fromisoformat(date_str)
-        except ValueError:
-            continue
-        nxt = _next_trading_day(d)
-        picks = plan.get("picks") or []
-        picks_txt = "、".join(
-            f"{p.get('name', '')}" + (f"({p.get('symbol', '')})" if p.get("symbol") else "")
-            for p in picks
-        ) or "无推荐"
-        # 次日实际：picks + plans 标的涨跌
-        actual = []
-        seen_sym: set[str] = set()
-        for p in list(picks) + list(plan.get("plans") or []):
-            sym = (p.get("symbol") or "").strip()
-            if not sym or nxt is None or sym in seen_sym:
-                continue
-            seen_sym.add(sym)
-            row = conn.execute(
-                "SELECT close FROM daily_bars WHERE symbol=? AND date=?", (sym, nxt.isoformat()),
-            ).fetchone()
-            prev = conn.execute(
-                "SELECT close FROM daily_bars WHERE symbol=? AND date=?", (sym, d.isoformat()),
-            ).fetchone()
-            if row and prev and prev["close"]:
-                actual.append(f"{sym} {(row['close']/prev['close']-1):+.2%}")
-        plan_summary = f"方向:{plan.get('direction', '')} 推荐:{picks_txt}"
-        actual_summary = (" 实际:" + " ".join(actual)) if actual else " 实际:（数据不足）"
-        history.append({"date": date_str, "plan_summary": plan_summary,
-                        "actual_summary": actual_summary})
-    return history
-
-
 # ---------- 组装 ----------
 
 def render(db_path: str, agent_text: str = "") -> dict:
@@ -290,13 +244,7 @@ def render(db_path: str, agent_text: str = "") -> dict:
         "text": f"**【A股投资系统 · 盘后日报】**\n\n数据截至: {freshness}",
     })
 
-    # ---- 点1 盘面总览（指数 + ETF 分析） ----
-    idx_rows = _index_table()
-    if idx_rows:
-        sections.append({
-            "type": "table", "title": "点1 盘面总览·指数",
-            "columns": ["指数", "点位", "涨跌幅"], "rows": idx_rows,
-        })
+    # ---- 点1 盘面总览（2026-09-18 删除「指数涨跌幅」表格，盘面总览指数点数不再重复列出） ----
     etf_rows = _index_etf_rows()
     if etf_rows:
         sections.append({
@@ -374,24 +322,13 @@ def render(db_path: str, agent_text: str = "") -> dict:
     review = _daily_llm.intraday_review_llm(db_path, {
         "views_text": views_text, "actual_text": actual_text, "signals_text": sig_text,
     })
+    # 2026-09-18 精简：复盘只留「对错总结」，不再输出错误原因/经验，也不再沉淀校验库
+    # （review_lessons 表与 persist_lessons/list_lessons 一并删除）
     if review.get("verdict"):
-        lines = [f"**对错总结**: {review['verdict']}"]
-        for r in (review.get("wrong_reasons") or []):
-            lines.append(f"  · 错误原因: {r}")
-        for l in (review.get("lessons") or []):
-            lines.append(f"  · 经验: {l}")
-        sections.append({"type": "text", "text": "**【点2 盘中观点复盘】**\n" + "\n".join(lines)})
-        try:
-            from invest.actions.persist import persist_lessons
-
-            conn_r = connect(db_path)
-            try:
-                persist_lessons(conn_r, dt.date.today(), "intraday",
-                                list(review.get("lessons") or []))
-            finally:
-                conn_r.close()
-        except Exception:
-            pass
+        sections.append({
+            "type": "text",
+            "text": "**【点2 盘中观点复盘】**\n" + f"**对错总结**: {review['verdict']}",
+        })
     elif views_text:
         sections.append({
             "type": "text",
@@ -403,7 +340,7 @@ def render(db_path: str, agent_text: str = "") -> dict:
     try:
         from invest.report import _abnormal_moves
 
-        sector_top = _index_table() and _today_actual_text(conn).split("板块涨幅TOP:")[-1].strip()
+        sector_top = _today_actual_text(conn).split("板块涨幅TOP:")[-1].strip()
         ladder = "\n".join(
             f"  {r['symbol']} {r['name'] or ''} {int(r['lianban'] or 0)}板"
             for r in conn.execute(
@@ -439,7 +376,10 @@ def render(db_path: str, agent_text: str = "") -> dict:
     elif etf_sector:
         sections.append({"type": "text", "text": "**【点3 板块ETF数据】**\n" + etf_sector})
 
-    # ---- 点4 明日动作表 + 预案专栏 + 质量复盘 ----
+    # ---- 点4 明日预案（仅方向）+ 动作落库 ----
+    #  2026-09-18 精简：① 报告不再输出「今日操作」提示与「明日动作」表格（动作清单仍在后台
+    #  合成落库，供仪表盘/对话 d33/盘中报告消费）；② 明日预案**只给方向**，不提及个股；
+    #  ③ 删除预案质量复盘（含 plan_review_llm 与 _plan_history）。
     summary = "\n".join(
         s.get("text", "") for s in sections if s.get("type") == "text"
     )[:1500]
@@ -448,13 +388,9 @@ def render(db_path: str, agent_text: str = "") -> dict:
     for_date = _next_trading_day(asof) or (asof + dt.timedelta(days=1))
     conn = connect(db_path)
     try:
-        history = _plan_history(conn)
         from invest.actions.format import format_actions
-        from invest.actions.persist import list_lessons
-        from invest.report import _action_guide
 
         draft_text = ""
-        lessons_txt = ""
         try:
             from invest.actions.compose import compose
 
@@ -462,27 +398,15 @@ def render(db_path: str, agent_text: str = "") -> dict:
             draft_text = format_actions(draft)
         except Exception:
             draft = []
-        lessons_txt = "；".join(x["body"] for x in list_lessons(conn, asof=asof))
-        score_row = conn.execute(
-            "SELECT score FROM quant_temperature ORDER BY run_date DESC LIMIT 1"
-        ).fetchone()
-        score = float(score_row["score"]) if score_row and score_row["score"] is not None else None
-        guide = _action_guide(conn, score)
-        if guide:
-            sections.append({"type": "text", "text": f"📌 今日操作: {guide}"})
     finally:
         conn.close()
     plan = _daily_llm.plan_gen_llm(db_path, {
         "summary": summary, "holdings": holdings,
-        "plan_history": json.dumps(history, ensure_ascii=False)[:800],
         "signals_text": sig_text,
         "actions_text": draft_text,
-        "lessons_text": lessons_txt,
     })
-    merged = []
     try:
         from invest.actions.compose import compose
-        from invest.actions.format import action_table
         from invest.actions.persist import persist_actions
 
         conn_a = connect(db_path)
@@ -498,50 +422,16 @@ def render(db_path: str, agent_text: str = "") -> dict:
                 pass
         finally:
             conn_a.close()
-        tbl = action_table(merged, title="明日动作（规则）")
-        if tbl:
-            sections.append(tbl)
-            sections.append({
-                "type": "text",
-                "text": "警戒=价位触达告警；动作表=明日清单",
-            })
     except Exception:
         merged = []
-    if plan.get("direction") or plan.get("picks") or plan.get("plans"):
+    if plan.get("direction"):
         plines = [f"**明日主线**: {plan.get('direction', '')}"]
-        for p in (plan.get("picks") or []):
-            plines.append(f"  · 介入 {p.get('name', '')}：{p.get('reason', '')}｜{p.get('plan', '')}")
-        for p in (plan.get("plans") or []):
-            plines.append(f"  · {p.get('symbol', '')}：{p.get('action', '')}")
+        if plan.get("focus"):
+            plines.append(f"  · 关注方向: {plan['focus']}")
+        if plan.get("risk"):
+            plines.append(f"  · 风险提示: {plan['risk']}")
         sections.append({"type": "text", "text": "**【点4 明日预案】**\n" + "\n".join(plines)})
         plan_data = plan
-    # 预案质量复盘
-    if history:
-        pv = _daily_llm.plan_review_llm(db_path, {"history": history})
-        if pv.get("quality"):
-            qlines = [f"**预案质量**: {pv['quality']}"]
-            for f in (pv.get("fixes") or []):
-                qlines.append(f"  · 改进: {f}")
-            sections.append({
-                "type": "text",
-                "text": "**【预案质量复盘（近 N 日）】**\n" + "\n".join(qlines),
-            })
-        else:
-            hlines = [f"[{h['date']}] {h['plan_summary']} {h['actual_summary']}" for h in history[-3:]]
-            sections.append({
-                "type": "text",
-                "text": "**【预案质量复盘（近 N 日）】**（LLM 失败，直列）\n" + "\n".join(hlines),
-            })
-        try:
-            from invest.actions.persist import persist_lessons
-
-            conn_l = connect(db_path)
-            try:
-                persist_lessons(conn_l, asof, "plan", list(pv.get("fixes") or []))
-            finally:
-                conn_l.close()
-        except Exception:
-            pass
 
     # ---- 尾部保留：持仓警戒 / 消息面 / 候选池变化 ----
     conn = connect(db_path)

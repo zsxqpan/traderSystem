@@ -81,8 +81,6 @@ JOB_SLOTS = {
     "daily_refresh": "16:40",
     "factcard_refresh": "16:50",
     "evening_report": "17:00",
-    "action_digest": "10:00",
-    "action_digest_pm": "13:30",
     "big_v_harvest": "17:10",
     "late_catchup": "21:30",
 }
@@ -103,8 +101,6 @@ JOB_COMPENSATION_WINDOWS = {
     "daily_refresh": (dt.time(16, 40), dt.time(17, 29, 59)),
     "factcard_refresh": (dt.time(16, 50), dt.time(17, 29, 59)),
     "evening_report": (dt.time(17, 0), dt.time(17, 29, 59)),
-    "action_digest": (dt.time(10, 0), dt.time(13, 29, 59)),
-    "action_digest_pm": (dt.time(13, 30), dt.time(17, 29, 59)),
     "big_v_harvest": (dt.time(17, 10), dt.time(17, 29, 59)),
     # 21:30 兜底补采（2026-09-15 事故后新增）：当日关键任务仍漏跑且外网已恢复时补采/补推。
     # 窗口留到 23:00 —— 网络恢复后每分钟补偿扫描会自动重试（任务返回 skipped/deferred 时可重试），
@@ -121,8 +117,6 @@ TRADING_DAY_JOBS = {
     "industry_refresh",
     "daily_refresh",
     "factcard_refresh",
-    "action_digest",
-    "action_digest_pm",
     "late_catchup",
 }
 JOB_LEASE_SECONDS = {"auction": 180}
@@ -424,7 +418,7 @@ _BACKOFF_CAP_SECONDS = 900.0
 _BACKOFF_NET_DOWN_SECONDS = 60.0
 _JOB_BACKOFF: dict[str, tuple[int, float]] = {}
 # 这些任务只读本地库/发本地通知，不依赖外网，网络不通时不必拦
-_LOCAL_ONLY_JOBS = frozenset({"action_digest", "action_digest_pm"})
+_LOCAL_ONLY_JOBS: frozenset[str] = frozenset()  # action_digest 任务已删，保留空集供扩展
 
 
 def _backoff_remaining(job_name: str) -> float:
@@ -785,16 +779,6 @@ def _weekend(db: str, conn) -> JobResult:
         failure_detail="周报投递失败",
         artifact="a4_weekly",
     )
-
-
-def _action_digest(db: str, conn) -> JobResult:
-    """交易日 10:00 / 13:30 动作 digest，无 LLM。"""
-    import invest.pipeline as pl
-
-    ok = pl.notify_action_digest(db)
-    if ok:
-        return JobResult.ok("动作 digest 已推送", artifact="action_digest")
-    return JobResult.ok("动作 digest 无内容", artifact="action_digest")
 
 
 def _big_v_harvest(db: str, conn) -> JobResult:
@@ -1411,8 +1395,6 @@ JOB_FUNCS: dict[str, Callable] = {
     "factcard_refresh": _factcard_refresh,
     "evening_report": _evening_report,
     "pool_trap_scan": _pool_trap_scan,  # 2026-08-23：候选池杀猪盘扫描
-    "action_digest": _action_digest,    # 2026-09-09：10:00 动作 digest
-    "action_digest_pm": _action_digest,  # 2026-09-09：13:30 动作 digest（独立槽，避免 already_ok）
     "big_v_harvest": _big_v_harvest,    # 2026-09-10：每天 17:10 慢速回灌
     "late_catchup": _late_catchup,      # 2026-09-15：21:30 兜底补采（外网中断事故后）
 }
@@ -1667,9 +1649,7 @@ def build_scheduler(ticker_only: bool = False) -> BackgroundScheduler:
     sched.add_job(_wrap("morning_brief", _morning_brief), CronTrigger(day_of_week="mon-fri", hour=8, minute=40), id="morning_brief", misfire_grace_time=21600)
     # 竞价报告（2026-08-22）：9:26（ticker-only 部署由 _intraday_tick_job 竞价窗口触发，这里为 full 模式备选）
     sched.add_job(_wrap("auction", _auction_report), CronTrigger(day_of_week="mon-fri", hour=9, minute=26), id="auction", misfire_grace_time=300)
-    # 动作 digest（2026-09-09 阶段 C）：10:00 / 13:30，无 LLM；限频 90 分钟
-    sched.add_job(_wrap("action_digest", _action_digest), CronTrigger(day_of_week="mon-fri", hour=10, minute=0), id="action_digest_am", misfire_grace_time=1800)
-    sched.add_job(_wrap("action_digest_pm", _action_digest), CronTrigger(day_of_week="mon-fri", hour=13, minute=30), id="action_digest_pm", misfire_grace_time=1800)
+    # 动作 digest（10:00/13:30）已按需求删除：内容属今日操作，非报告链路（2026-09-18）
     sched.add_job(_wrap("after_close", _after_close), CronTrigger(day_of_week="mon-fri", hour=16, minute=0), id="after_close", misfire_grace_time=21600)
     # 收盘即日线（2026-08-20 初版 16:10；2026-08-24 提前到 15:01 并升级全市场 OHLCV）：
     # 东财 clist 批量接口 15:00 收盘后立即返回全市场当日 OHLCV，15:01 落库 src='snapshot'，

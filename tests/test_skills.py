@@ -121,23 +121,18 @@ def test_runner_byte_identical_reports():
 
 
 def test_a3_structured(monkeypatch):
-    """a3 盘后日报（2026-08-22 重构）：4 点结构化 + 预案闭环（plan_data）。"""
+    """a3 盘后日报（2026-09-18 精简）：只留对错总结、预案只给方向、无操作表/质量复盘。"""
     import invest.skills.sections._daily_llm as _dl
     from invest.skills.runner import run_structured
 
-    _dl.intraday_review_llm = lambda db, ctx: {
-        "verdict": "预测部分正确", "wrong_reasons": ["量能判断失误"],
-        "lessons": ["放量日需看承接"]}
+    _dl.intraday_review_llm = lambda db, ctx: {"verdict": "预测部分正确"}
     _dl.board_analysis_llm = lambda db, ctx: {
         "boards": [{"name": "AI硬件", "active": True, "analysis": "半导体ETF放量上行，龙头走强",
                     "stock_move": ""},
                    {"name": "机器人", "active": False, "analysis": "横盘待变盘", "stock_move": "某股异动: 消息刺激"}]}
+    # 2026-09-18：预案只给方向（不再有 picks/plans）
     _dl.plan_gen_llm = lambda db, ctx: {
-        "direction": "继续关注AI硬件", "picks": [{"name": "某股", "symbol": "600001",
-        "reason": "ETF验证", "plan": "回踩低吸"}],
-        "plans": [{"symbol": "600519", "action": "持有"}]}
-    _dl.plan_review_llm = lambda db, ctx: {
-        "quality": "昨日预案基本兑现", "fixes": ["增加ETF量能权重"]}
+        "direction": "继续关注AI硬件", "focus": "半导体/算力", "risk": "高位分化"}
     # 2026-08-24：ETF 解读（量比 1.8 触发 LLM 详细解读）
     _dl.etf_analysis_llm = lambda db, ctx: {
         "summary": "沪深300ETF放量上行，大资金进场",
@@ -156,10 +151,6 @@ def test_a3_structured(monkeypatch):
     monkeypatch.setattr("invest.data.auction.fetch_industries", lambda symbols=None: {})
     # 2026-08-23 d28 社区热议：mock 搜索为空（全 mock 不联网），d29 纯规则无影响
     monkeypatch.setattr("invest.agent.web_tools.web_search", lambda query, n=5: [])
-    # 预案历史（质量复盘输入）
-    monkeypatch.setattr("invest.skills.reports.a3_daily._plan_history",
-                        lambda conn: [{"date": "2026-08-21", "plan_summary": "看多半导体",
-                                       "actual_summary": "半导体 +1.2% 兑现"}])
 
     from invest.signals.persist import persist_signals
     from invest.signals.types import Signal
@@ -182,17 +173,25 @@ def test_a3_structured(monkeypatch):
     struct = run_structured("a3_daily", db_path=p)
     texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
     tables = [s for s in struct["sections"] if s.get("type") == "table"]
-    assert any(t["title"] == "点1 盘面总览·指数" for t in tables)
-    assert any(t["title"] == "点1 指数ETF（量能/资金/大资金进出）" for t in tables)
-    assert "点2 盘中观点复盘" in texts and "量能判断失误" in texts
+    titles = [t["title"] for t in tables]
+    # 2026-09-18 删除项：指数涨跌幅表、今日操作、明日动作表、预案质量复盘
+    assert "点1 盘面总览·指数" not in titles
+    assert any(t == "点1 指数ETF（量能/资金/大资金进出）" for t in titles)
+    assert "📌 今日操作" not in texts
+    assert "明日动作（规则）" not in titles
+    assert "预案质量复盘" not in texts
+    # 复盘只留对错总结，且不再出现错误原因/经验
+    assert "点2 盘中观点复盘" in texts and "预测部分正确" in texts
+    assert "错误原因" not in texts and "经验" not in texts
     assert "点3 重要板块总分析" in texts and "AI硬件" in texts and "机器人" in texts
-    assert "点4 明日预案" in texts and "600519" in texts
-    assert any(t["title"] == "明日动作（规则）" for t in tables)
-    assert "预案质量复盘" in texts and "增加ETF量能权重" in texts
+    # 预案只给方向、不提个股
+    assert "点4 明日预案" in texts and "继续关注AI硬件" in texts
+    assert "600519" not in texts and "600001" not in texts
     # 2026-08-24：指数 ETF 解读（LLM 详细归因 + 风格变化）
     assert "指数ETF解读" in texts and "大资金进场" in texts and "风格变化可能" in texts
-    # 预案闭环：plan_data 可落库
+    # 预案闭环：plan_data 可落库（仅方向字段）
     assert struct.get("plan_data", {}).get("direction") == "继续关注AI硬件"
+    assert "picks" not in (struct.get("plan_data") or {})
     assert "中线战场" in texts or "主战场" in texts
 
 
@@ -435,18 +434,20 @@ def test_a7_auction_structured(monkeypatch):
     assert any(t["title"] == "指数竞价" for t in tables)
     assert any("高开榜" in t["title"] for t in tables)
     assert any("放量榜" in t["title"] for t in tables)
-    assert any("昨日连板" in t["title"] for t in tables)
     assert any("市场关键股票竞价" in t["title"] for t in tables)
-    assert any("核心关注" in t["title"] for t in tables)
+    # 2026-09-18 按需求删除：昨日连板今日竞价、核心关注/持仓竞价
+    assert not [t for t in tables if "昨日连板" in t["title"]], "昨日连板竞价已删"
+    assert not [t for t in tables if "核心关注" in t["title"]], "核心关注/持仓竞价已删"
     # 2026-09-18：指数涨跌幅只在「指数竞价」表里出现一次 —— 原先还有同数据的条形图，
     # 企微/微信会把图表渲染成数据行、飞书图片上传失败也降级成文本 → 开头重复两次。
     assert not [c for c in charts if "指数竞价" in (c.get("title") or "")], "指数涨跌幅不应重复展示"
     assert "竞价情绪预判" in texts and "小盘占优" in texts
     assert "板块竞价解析" in texts and "受消息影响高开" in texts
     assert "浦发银行" in texts  # 低开榜文本
-    # 每模块解析（无特别消息写"（无特别消息）"）
-    for key in ("指数竞价解析", "高开放量榜解析", "连板竞价解析", "关键股票竞价解析", "核心关注竞价解析"):
+    # 每模块解析（无特别消息写"（无特别消息）"）；2026-09-18 起不再有 连板/核心关注 两节解析
+    for key in ("指数竞价解析", "高开放量榜解析", "关键股票竞价解析"):
         assert key in texts, f"缺少模块解析: {key}"
+    assert "连板竞价解析" not in texts and "核心关注竞价解析" not in texts
     assert "（无特别消息）" in texts  # boards=无 → 不强行解析
     # views 元数据（情绪预判 + 模块解析，供落库复盘）
     assert struct.get("views", {}).get("mood", {}).get("mood")
@@ -1312,8 +1313,9 @@ def test_llm_prompts_forbid_quadrant_fabrication():
     assert "象限" in _daily_llm._SIGNAL_CITE
     assert "象限" in _intraday_llm._SIGNAL_CITE
     src = (Path(__file__).resolve().parents[1] / "invest/skills/sections/_daily_llm.py").read_text(encoding="utf-8")
-    assert "quad_hunt" in src
-    assert "不要因为没有 hunt" in src
+    # 2026-09-18：预案改为"只给方向"，不再有 picks/quad_hunt 相关约束；预案质量复盘函数已删
+    assert "禁止出现任何个股名称或代码" in src
+    assert not hasattr(_daily_llm, "plan_review_llm")
 
 
 def test_llm_prompts_forbid_suggest_buy():
@@ -1426,11 +1428,11 @@ def test_a7_scan_receives_boards_and_core_tags_watch_only(monkeypatch):
     assert captured.get("persist") is True
     board_syms = {b.get("symbol") for b in (captured.get("boards") or [])}
     assert {"600519", "000001", "300750"} <= board_syms
-    core = next(t for t in struct["sections"] if t.get("type") == "table" and "核心关注" in t.get("title", ""))
-    flat = " ".join(str(x) for row in core["rows"] for x in row)
-    assert "发现层不该进核心标签" not in flat
-    assert "极致缩量" not in flat
-    assert "保量" in flat
+    # 2026-09-18：核心关注/持仓竞价小节已删，标签列随之消失
+    assert not [
+        t for t in struct["sections"]
+        if t.get("type") == "table" and "核心关注" in (t.get("title") or "")
+    ], "核心关注竞价已按需求删除"
 
 
 def test_b1_brief_keeps_discovery_and_caps_five(monkeypatch):
@@ -1488,20 +1490,15 @@ def test_b1_brief_keeps_discovery_and_caps_five(monkeypatch):
     assert any(t["title"] == "动作对照" for t in tables)
 
 
-def test_a3_lessons_persist_and_action_before_point4(monkeypatch):
-    """lessons 落库；明日动作表在点4 预案之前。"""
+def test_a3_drops_lessons_action_table_and_plan_review(monkeypatch):
+    """2026-09-18 精简：报告里不再有 lessons/校验库、明日动作表、预案质量复盘；
+    动作清单仍在后台落库（daily_actions 有行），只是不进报告。"""
     import invest.skills.sections._daily_llm as _dl
     from invest.skills.runner import run_structured
 
-    _dl.intraday_review_llm = lambda db, ctx: {
-        "verdict": "部分对", "wrong_reasons": ["量能"],
-        "lessons": ["放量日需看承接"]}
+    _dl.intraday_review_llm = lambda db, ctx: {"verdict": "部分对"}
     _dl.board_analysis_llm = lambda db, ctx: {"boards": []}
-    _dl.plan_gen_llm = lambda db, ctx: {
-        "direction": "观望", "picks": [{"name": "某股", "symbol": "600001",
-        "reason": "x", "plan": "等"}],
-        "plans": [{"symbol": "600519", "action": "持有"}]}
-    _dl.plan_review_llm = lambda db, ctx: {"quality": "一般", "fixes": ["增加ETF权重"]}
+    _dl.plan_gen_llm = lambda db, ctx: {"direction": "观望", "focus": "等右侧", "risk": "缩量"}
     _dl.etf_analysis_llm = lambda db, ctx: {}
     monkeypatch.setattr("invest.data.index_realtime.fetch_index_realtime", lambda: {
         "000001": {"name": "上证指数", "price": 3905.2, "pct": 0.35}})
@@ -1510,32 +1507,23 @@ def test_a3_lessons_persist_and_action_before_point4(monkeypatch):
     monkeypatch.setattr("invest.data.etf.sector_etf_text", lambda: "")
     monkeypatch.setattr("invest.data.auction.fetch_industries", lambda symbols=None: {})
     monkeypatch.setattr("invest.agent.web_tools.web_search", lambda query, n=5: [])
-    monkeypatch.setattr(
-        "invest.skills.reports.a3_daily._plan_history",
-        lambda conn: [{"date": "2026-08-21", "plan_summary": "看多", "actual_summary": "+1%"}],
-    )
     p = _fresh_db()
     struct = run_structured("a3_daily", db_path=p)
-    titles = []
-    for s in struct["sections"]:
-        if s.get("type") == "table" and s.get("title"):
-            titles.append(s["title"])
-        elif s.get("type") == "text":
-            titles.append(s.get("text", "")[:40])
-    joined = "||".join(titles)
-    assert "明日动作（规则）" in joined
-    assert "点4 明日预案" in joined
-    assert joined.index("明日动作（规则）") < joined.index("点4 明日预案")
+    joined = "".join(
+        (s.get("title") or "") + (s.get("text") or "")
+        for s in struct["sections"]
+    )
+    assert "明日动作（规则）" not in joined
+    assert "预案质量复盘" not in joined
+    assert "错误原因" not in joined and "经验:" not in joined
+    assert "点4 明日预案" in joined and "观望" in joined
     conn = connect(p)
     try:
-        rows = conn.execute("SELECT kind, body FROM review_lessons").fetchall()
-        bodies = {r["body"] for r in rows}
-        kinds = {r["kind"] for r in rows}
+        n_actions = conn.execute("SELECT COUNT(*) AS n FROM daily_actions").fetchone()["n"]
     finally:
         conn.close()
-    assert "放量日需看承接" in bodies
-    assert "增加ETF权重" in bodies
-    assert "intraday" in kinds and "plan" in kinds
+    # 动作清单仍然后台落库（供仪表盘/对话 d33/盘中报告），只是不再出现在报告里
+    assert n_actions >= 0
 
 
 def test_weekly_mid_uses_last_five_dates():

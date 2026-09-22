@@ -1,11 +1,10 @@
 """盘后日报 LLM 环节（2026-08-22，a3_daily 用，job='daily_report'）。
 
-4 次调用：
-1. intraday_review_llm：盘中观点复盘（点2）——当日 source='intraday_report' 观点 vs 当日实际；
+3 次调用（2026-09-18 精简：删 plan_review_llm、复盘不再要错误原因/经验）：
+1. intraday_review_llm：盘中观点复盘（点2）——当日 source='intraday_report' 观点 vs 当日实际，**只出对错总结**；
 2. board_analysis_llm：重要板块总分析（点3）——固定方向清单（AI硬件/AI软件/机器人/金融/
    金属/新旧能源/内需）+ 各方向 ETF（纯度高于板块指数）+ 异动个股；
-3. plan_gen_llm：明日预案（点4）——推荐介入股票 + 关注/持仓股操作预案；
-4. plan_review_llm：预案质量复盘（点4）——最近 N 日 source='plan' 预案 vs 实际。
+3. plan_gen_llm：明日预案（点4）——**只给方向**（direction/focus/risk），不推荐个股。
 
 失败/解析失败返回 {}，调用方回退（省略该节或直列数据），不阻断报告。
 """
@@ -50,7 +49,10 @@ def _parse_json(text: str | None) -> dict | None:
 
 
 def intraday_review_llm(db_path: str, ctx: dict) -> dict:
-    """点2：盘中观点复盘。ctx: {views_text, actual_text}。失败返回 {}。"""
+    """点2：盘中观点复盘。ctx: {views_text, actual_text, signals_text}。失败返回 {}。
+
+    2026-09-18 精简：只输出对错总结，不再要错误原因/经验（也不落校验库）。
+    """
     try:
         from invest.db import connect
 
@@ -60,12 +62,11 @@ def intraday_review_llm(db_path: str, ctx: dict) -> dict:
                        f"以下是今日竞价报告与盘中报告给出的观点（预测/操作建议/短线判断，来源已标注）：\n{ctx.get('views_text') or '（今日无观点）'}\n\n"
                        f"以下是当日实际表现：\n{ctx.get('actual_text') or '暂无'}\n"
                        f"规则算出的当日信号（{_SIGNAL_CITE}）：\n{ctx.get('signals_text') or '无'}\n\n"
-                       "请输出 JSON：\n"
-                       '{"verdict": "逐条判断观点对错（对/错/部分对；竞价预判与盘中判断分别点评，50字内）",\n'
-                       '"wrong_reasons": ["错误原因（数据/逻辑/突发，每条20字内）"],\n'
-                       '"lessons": ["沉淀成经验的一句话（供固化为复盘 skill，每条20字内）"]}\n'
-                       "没有观点则 verdict 写'今日无观点可复盘'，数组为空。",
-                       max_tokens=600)
+                       "请输出 JSON（verdict：逐条判断观点对错，对/错/部分对；竞价预判与盘中判断"
+                       "分别点评，不要展开成因与经验总结，60字内）：\n"
+                       '{"verdict": "..."}\n'
+                       "没有观点则 verdict 写'今日无观点可复盘'。",
+                       max_tokens=300)
             return _parse_json(out) or {}
         finally:
             conn.close()
@@ -105,7 +106,11 @@ def board_analysis_llm(db_path: str, ctx: dict) -> dict:
 
 
 def plan_gen_llm(db_path: str, ctx: dict) -> dict:
-    """点4：明日预案。ctx: {summary, holdings, plan_history}。失败返回 {}。"""
+    """点4：明日预案（**只给方向**）。ctx: {summary, holdings, signals_text, actions_text}。
+
+    2026-09-18：按需求改为仅指示方向，不再推荐个股、不给个股操作预案
+    （原 picks/plans 字段与"必须带 6 位代码"等约束一并删除）。
+    """
     try:
         from invest.db import connect
 
@@ -113,55 +118,21 @@ def plan_gen_llm(db_path: str, ctx: dict) -> dict:
         try:
             out = _llm(conn, _SYSTEM,
                        "以下是今日盘面总结：\n" + (ctx.get("summary") or "暂无") + "\n\n"
-                       "以下是关注/持仓股（用户指定，多为持仓；系统推荐仅为迭代验证）：\n"
+                       "以下是关注/持仓股（用户指定，多为持仓）：\n"
                        + (ctx.get("holdings") or "暂无") + "\n\n"
-                       "以下是最近几天预案质量复盘（若有）：\n" + (ctx.get("plan_history") or "暂无") + "\n\n"
                        "规则算出的当日信号（" + _SIGNAL_CITE + "）：\n" + (ctx.get("signals_text") or "无") + "\n\n"
                        "规则合成的动作草稿（" + _ACTION_CITE + "）：\n" + (ctx.get("actions_text") or "无") + "\n\n"
-                       "近期复盘教训（避免重复同一类错误）：\n" + (ctx.get("lessons_text") or "无") + "\n\n"
-                       "picks 若推荐个股，优先落在给定 quad_hunt 行业或 discovery 短线命中行业；"
-                       "无信号时仍可探索，不要因为没有 hunt 就输出空 picks。"
-                       "每条 pick 必须带 6 位 symbol，没有代码的不要输出。\n\n"
-                       "请输出明日预案 JSON：\n"
-                       '{"direction": "明日主线方向判断（25字内）",\n'
-                       '"picks": [{"name": "明日可介入股票名", "symbol": "6位代码",'
-                       ' "reason": "介入理由（结合今日主线/ETF，20字内）",'
-                       '"plan": "介入预案（如回踩X均线低吸/打板/半路，20字内）"}],  # 最多3只，仅系统探索推荐\n'
-                       '"plans": [{"symbol": "关注/持仓股代码", "action": "明日操作预案（持有/减/加/止盈止损位，20字内）"}]}\n'
-                       "plans 必须覆盖动作草稿里 priority 1-2 的全部 symbol。",
-                       max_tokens=1200)
+                       "请输出明日预案 JSON（**只给方向层面判断，禁止出现任何个股名称或代码**）：\n"
+                       '{"direction": "明日主线方向判断（25字内，如：AI硬件分化、资金转向有色金属）",\n'
+                       '"focus": "明日关注方向（板块/风格层面，20字内）",\n'
+                       '"risk": "明日风险提示（一句话，20字内）"}\n'
+                       "不要输出 picks / plans / 个股代码；方向要能被次日盘面检验。",
+                       max_tokens=400)
             return _parse_json(out) or {}
         finally:
             conn.close()
     except Exception as exc:
         logger.warning("明日预案 LLM 失败: %s", exc)
-        return {}
-
-
-def plan_review_llm(db_path: str, ctx: dict) -> dict:
-    """点4：预案质量复盘。ctx: {history: [{date, plan_summary, actual_summary}]}。失败返回 {}。"""
-    if not ctx.get("history"):
-        return {}
-    try:
-        from invest.db import connect
-
-        conn = connect(db_path)
-        try:
-            lines = []
-            for h in ctx["history"][-5:]:
-                lines.append(f"[{h['date']}] 预案: {h['plan_summary']}\n    实际: {h['actual_summary']}")
-            out = _llm(conn, _SYSTEM,
-                       "以下是最近几天的盘后预案与其后实际表现的对照：\n" + "\n".join(lines) + "\n\n"
-                       "请输出 JSON：\n"
-                       '{"quality": "预案质量总评（预测与盘面结果的契合度，40字内）",\n'
-                       '"fixes": ["优化预案推演方式的具体建议（每条25字内，可沉淀为预案推演 skill 的迭代方向）"]}\n'
-                       "若只有一天数据，quality 简短即可，fixes 给 1-2 条。",
-                       max_tokens=600)
-            return _parse_json(out) or {}
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning("预案质量复盘 LLM 失败: %s", exc)
         return {}
 
 

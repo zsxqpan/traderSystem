@@ -59,7 +59,8 @@ def test_schema_has_action_tables():
     p = _tmp_db()
     names = table_names(p)
     assert "daily_actions" in names
-    assert "review_lessons" in names
+    # 2026-09-18：review_lessons（复盘校验库）已随盘后复盘精简删除
+    assert "review_lessons" not in names
     conn = connect(p)
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_actions)")}
@@ -256,23 +257,6 @@ def test_format_sorted_by_priority_no_buy_slogan():
     pos3 = text.index("300001")
     assert pos1 < pos2 < pos3
     assert "建议买入" not in text
-
-
-def test_review_lessons_roundtrip():
-    from invest.actions.persist import list_lessons, persist_lessons
-
-    p = _tmp_db()
-    conn = connect(p)
-    try:
-        persist_lessons(conn, ASOF, "intraday", ["放量看承接", "放量看承接", "   "])
-        persist_lessons(conn, ASOF, "plan", ["增加ETF权重"])
-        rows = list_lessons(conn, asof=ASOF)
-        bodies = [r["body"] for r in rows]
-        assert bodies.count("放量看承接") == 1
-        assert "增加ETF权重" in bodies
-        assert all(len(b) <= 80 for b in bodies)
-    finally:
-        conn.close()
 
 
 def test_b1_pick_keeps_triggered_watch():

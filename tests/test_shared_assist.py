@@ -4,20 +4,18 @@
 """
 from __future__ import annotations
 
-import datetime as dt
 import os
 import re
 import sys
 import tempfile
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from invest.db import SCHEMA_VERSION, connect, init_db
-from invest.scheduler import JOB_FUNCS, JOB_SLOTS, JobResult, _execute_job
+from invest.scheduler import JOB_FUNCS
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -42,7 +40,9 @@ def test_schema_version_is_21_with_horizon_actions_and_fts():
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        assert {"daily_actions", "review_lessons", "watch_items", "trade_signals"} <= tables
+        # 2026-09-18：review_lessons（复盘校验库）已删
+        assert {"daily_actions", "watch_items", "trade_signals"} <= tables
+        assert "review_lessons" not in tables
         cols = {r[1] for r in conn.execute("PRAGMA table_info(trade_signals)")}
         assert {"horizon", "layer"} <= cols
         fts = conn.execute(
@@ -59,69 +59,19 @@ def test_schema_version_is_21_with_horizon_actions_and_fts():
         os.remove(p)
 
 
-def test_action_digest_am_and_pm_are_separate_slots():
-    """13:30 不得与 10:00 共用 job_executions 槽，否则下午 digest 永远 already_ok。"""
-    assert "action_digest_pm" in JOB_FUNCS
-    assert JOB_SLOTS["action_digest"] == "10:00"
-    assert JOB_SLOTS["action_digest_pm"] == "13:30"
-    assert JOB_SLOTS["action_digest"] != JOB_SLOTS["action_digest_pm"]
-
-    p = _tmp_db()
-    calls: list[str] = []
-
-    def _fn(db, conn):
-        calls.append(db)
-        return JobResult.ok("digest", artifact="action_digest")
-
-    monday = dt.datetime(2026, 9, 7, 10, 0, 0)
-    try:
-        with mock.patch("invest.data.calendar.is_trading_day", return_value=True):
-            r1 = _execute_job("action_digest", _fn, p, now=monday)
-            r2 = _execute_job(
-                "action_digest_pm",
-                _fn,
-                p,
-                now=monday.replace(hour=13, minute=30),
-            )
-            r3 = _execute_job(
-                "action_digest",
-                _fn,
-                p,
-                now=monday.replace(hour=15),
-            )
-        assert r1.status == "ok"
-        assert r2.status == "ok"
-        assert r3.status == "already_ok"
-        assert len(calls) == 2
-        conn = connect(p)
-        try:
-            slots = {
-                r["run_slot"]
-                for r in conn.execute(
-                    "SELECT run_slot FROM job_executions WHERE job LIKE 'action_digest%'"
-                )
-            }
-            assert slots == {"10:00", "13:30"}
-        finally:
-            conn.close()
-    finally:
-        os.remove(p)
+# 2026-09-18：action_digest / action_digest_pm（10:00 / 13:30 动作 digest）已按需求删除，
+# 原 test_action_digest_am_and_pm_are_separate_slots 一并移除。
 
 
 def test_os_manifest_digest_jobs_not_collapsed():
-    """PS1 里两个 digest 若同名 Job，findall 字典会把 10:00 覆盖成 13:30。"""
+    """PS1 里同一 job 不得映射到两个时刻（findall 字典会把后一个覆盖前一个）。"""
     raw = (ROOT / "scripts" / "install_os_tasks.ps1").read_text(encoding="utf-8-sig")
     entries = re.findall(r'Time = "(\d\d:\d\d)"; Job = "([^"]+)"', raw)
     times_by_job: dict[str, str] = {}
     for time, job in entries:
         if job in times_by_job and times_by_job[job] != time:
-            pytest.fail(
-                f"Job={job} 同时映射 {times_by_job[job]} 与 {time}；"
-                "13:30 必须用独立 job 名 action_digest_pm"
-            )
+            pytest.fail(f"Job={job} 同时映射 {times_by_job[job]} 与 {time}；一天跑两次必须拆两个 job 名")
         times_by_job[job] = time
-    assert times_by_job["action_digest"] == "10:00"
-    assert times_by_job["action_digest_pm"] == "13:30"
     assert set(times_by_job) == set(JOB_FUNCS)
 
 

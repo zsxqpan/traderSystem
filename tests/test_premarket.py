@@ -314,56 +314,15 @@ def test_a0_market_opportunity_from_quad(monkeypatch):
     assert "半导体" in texts
 
 
-def test_a0_yesterday_action_marks_pool_inout(monkeypatch):
-    """昨日 action 全列，池内/池外标注。"""
-    import datetime as dt
-
-    from invest.signals.persist import persist_signals
-    from invest.signals.types import Signal
-
-    p = _tmp_db()
-    conn = connect(p)
-    _seed(conn)
-    conn.execute(
-        "INSERT INTO candidate_pool(symbol, level, industry, in_date) "
-        "VALUES('600519','core','白酒','2026-08-20')"
-    )
-    persist_signals(
-        conn,
-        [
-            Signal(
-                id="shrink_extreme", name="极致缩量", session="close",
-                severity="action", subject_type="stock", subject="600519",
-                hint="缩量跌破昨收", horizon="short", layer="watch",
-            ),
-            Signal(
-                id="high_vol", name="高位放量", session="close",
-                severity="action", subject_type="stock", subject="000002",
-                hint="量比滞涨", horizon="short", layer="discovery",
-            ),
-        ],
-        dt.date(2026, 8, 21),
-        "close",
-    )
-    conn.close()
-    monkeypatch.setattr("invest.skills.sections._digest.overnight_analysis", lambda db: "x")
-    monkeypatch.setattr("invest.skills.sections._digest.digest", lambda db: dict(_DIGEST_OK))
-    monkeypatch.setattr("invest.data.global_snapshot.global_snapshot_rows", lambda: list(_SNAP_ROWS))
-    monkeypatch.setattr("invest.data.halt.fetch_halt_list", list)
-    monkeypatch.setattr("invest.skills.reports.a0_premarket._read_agent_focus", lambda: "")
-    struct = run_structured("a0_premarket", db_path=p)
-    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
-    assert "昨日未消化" in texts or "昨日信号" in texts
-    assert "池内" in texts and "池外" in texts
-    assert "600519" in texts and "000002" in texts
-
-
-def test_a0_today_actions_mark_pool_inout(monkeypatch):
-    """今日动作表标池内/池外。"""
+def test_a0_drops_actions_table_and_yesterday_signals(monkeypatch):
+    """2026-09-18 精简：盘前报告不再输出「今日动作」表格、「📌 今日操作」、「昨日信号」模块，
+    但盘前其余节（外围/温度/风格/今日关注/涨停异动监控/消息汇总）保持可用。"""
     import datetime as dt
 
     from invest.actions.persist import persist_actions
     from invest.actions.types import Action
+    from invest.signals.persist import persist_signals
+    from invest.signals.types import Signal
 
     p = _tmp_db()
     conn = connect(p)
@@ -382,17 +341,35 @@ def test_a0_today_actions_mark_pool_inout(monkeypatch):
         ],
         dt.date(2026, 8, 24),
     )
-    conn.commit()
+    persist_signals(
+        conn,
+        [
+            Signal(
+                id="shrink_extreme", name="极致缩量", session="close",
+                severity="action", subject_type="stock", subject="600519",
+                hint="缩量跌破昨收", horizon="short", layer="watch",
+            ),
+        ],
+        dt.date(2026, 8, 21),
+        "close",
+    )
     conn.close()
     monkeypatch.setattr("invest.skills.sections._digest.overnight_analysis", lambda db: "x")
     monkeypatch.setattr("invest.skills.sections._digest.digest", lambda db: dict(_DIGEST_OK))
     monkeypatch.setattr("invest.data.global_snapshot.global_snapshot_rows", lambda: list(_SNAP_ROWS))
     monkeypatch.setattr("invest.data.halt.fetch_halt_list", list)
     monkeypatch.setattr("invest.skills.reports.a0_premarket._read_agent_focus", lambda: "")
+
     struct = run_structured("a0_premarket", db_path=p)
     tables = [s for s in struct["sections"] if s.get("type") == "table"]
-    act = next(t for t in tables if t.get("title") == "今日动作")
-    assert "池" in "".join(act["columns"])
-    cells = [c for row in act["rows"] for c in row]
-    assert "池内" in cells and "池外" in cells
-    assert "600519" in cells and "000002" in cells
+    titles = [t.get("title") for t in tables]
+    texts = "".join(s.get("text", "") for s in struct["sections"] if s.get("type") == "text")
+
+    assert "今日动作" not in titles, "今日动作表已按需求删除"
+    assert "昨日信号" not in texts and "昨日未消化" not in texts
+    assert "📌 今日操作" not in texts
+    assert "池内" not in texts and "池外" not in texts
+    # 其余节仍在（说明只删了动作/昨日信号，没伤到盘前报告本体）
+    assert "隔夜外围" in titles
+    assert "**【市场温度】**" in texts or "**【市场风格】**" in texts
+    assert "涨停异动监控" in titles

@@ -133,54 +133,6 @@ def expire_active_plans(conn: sqlite3.Connection) -> None:
         logger.warning("expire_active_plans 失败: %s", exc)
 
 
-def persist_lessons(
-    conn: sqlite3.Connection,
-    asof: date | str,
-    kind: str,
-    bodies: list[str],
-) -> None:
-    day = _iso_day(asof)
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(review_lessons)")}
-    if not cols:
-        logger.warning("review_lessons 不存在，跳过 persist")
-        return
-    for raw in bodies or []:
-        body = str(raw or "").strip()[:80]
-        if not body:
-            continue
-        conn.execute(
-            """INSERT OR IGNORE INTO review_lessons(date, kind, body, src)
-               VALUES (?,?,?, 'llm')""",
-            (day, kind, body),
-        )
-    conn.commit()
+# 2026-09-18：删除 review_lessons「校验库」（persist_lessons / list_lessons）——
+# 盘后复盘不再产出错误原因/经验，相关沉淀链路与建表一并移除。
 
-
-def list_lessons(
-    conn: sqlite3.Connection,
-    *,
-    asof: date | str | None = None,
-    n_days: int = 5,
-    limit: int = 8,
-) -> list[dict]:
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(review_lessons)")}
-    if not cols:
-        return []
-    sql = "SELECT date, kind, body FROM review_lessons"
-    params: list = []
-    if asof is not None:
-        sql += " WHERE date<=?"
-        params.append(_iso_day(asof))
-    sql += " ORDER BY date DESC, kind LIMIT ?"
-    params.append(int(n_days) * 8)
-    seen: set[str] = set()
-    out: list[dict] = []
-    for r in conn.execute(sql, params):
-        body = r["body"]
-        if body in seen:
-            continue
-        seen.add(body)
-        out.append(dict(r))
-        if len(out) >= limit:
-            break
-    return out

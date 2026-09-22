@@ -23,7 +23,7 @@ SKILL = {
     "name": "竞价报告",
     "kind": "report",
     "description": "9:25 竞价报告：指数竞价/高开量比榜/连板竞价/核心关注竞价/情绪预判(LLM)",
-    "uses": ["d12_limit_up_ladder", "d21_freshness", "d32_trade_signals", "d33_daily_actions"],
+    "uses": ["d21_freshness", "d32_trade_signals"],
     "params": {
         "db_path": "str, required",
         "snapshot": "optional, 冻结快照；缺省则 render 内 freeze",
@@ -160,13 +160,7 @@ def render(db_path: str, snapshot=None) -> dict:
             block_texts.append(f"[{b['block']}] {s['name']} {pct_txt} {label}")
 
     core_results = list(getattr(snap.blocks.get("core_quotes"), "quotes", None) or [])
-    core_rows: list[list[str]] = []
-    for r in core_results:
-        core_rows.append([
-            r.ref.symbol, r.ref.name,
-            f"{r.price:.2f}" if r.price is not None else "—",
-            _pct_txt(r.pct), status_label(r),
-        ])
+    # 2026-09-18：核心关注/持仓竞价小节已删，core_results 仅用于覆盖率/降级判定
 
     from invest.data.quotes import coverage_text, degrade_alert_text, report_should_degrade
 
@@ -176,16 +170,13 @@ def render(db_path: str, snapshot=None) -> dict:
         sections.append({"type": "text", "text": degrade_alert_text(cov_info)})
 
     sigs: list = []
-    tags_for = None
     sig_text = ""
     boards = list(gainers or []) + list(losers or []) + list(vol_top or [])
     try:
         from invest.signals.format import format_signals
-        from invest.signals.format import tags_for as _tags_for
         from invest.signals.scan import scan_db
         from invest.signals.thresholds import DISPLAY_A7
 
-        tags_for = _tags_for
         sigs = scan_db(
             db_path, "auction", boards=boards,
             limit=DISPLAY_A7, persist=True,
@@ -202,13 +193,13 @@ def render(db_path: str, snapshot=None) -> dict:
         + [f"  低开 {it['name']} {it['pct']:+.2f}%" for it in losers])
     ladder_text = "\n".join(f"  {r[0]} {r[2]}" for r in ladder_rows)
     key_text = "\n".join(block_texts)
-    core_text = "\n".join(f"  {r[0]} {r[3]}" for r in core_rows)
     if degrade:
         analysis, pred = {}, {}
     else:
+        # 2026-09-18：模块解析不再要 ladder/core（对应小节已删），只留指数/榜单/关键股
         analysis = _intraday_llm.section_analysis_llm(db_path, {
-            "index_text": index_text, "boards_text": boards_text, "ladder_text": ladder_text,
-            "key_text": key_text, "core_text": core_text, "signals_text": sig_text,
+            "index_text": index_text, "boards_text": boards_text,
+            "key_text": key_text, "signals_text": sig_text,
         })
         pred = _intraday_llm.auction_llm(db_path, {
             "index_text": index_text, "gainers": boards_text,
@@ -268,15 +259,8 @@ def render(db_path: str, snapshot=None) -> dict:
     if (gainers or vol_top or losers) and analysis:
         sections.append({"type": "text", "text": f"**高开放量榜解析**: {_an('boards')}"})
 
-    # 3) 昨日连板竞价 + 解析
-    if ladder_rows:
-        up = sum(1 for r in ladder_rows if r[2] not in ("-",) and r[2].startswith("+"))
-        sections.append({
-            "type": "table", "title": f"昨日连板今日竞价（高开{up}/{len(ladder_rows)}=承接）",
-            "columns": ["代码", "名称", "竞价涨幅", "状态"], "rows": ladder_rows,
-        })
-        if analysis:
-            sections.append({"type": "text", "text": f"**连板竞价解析**: {_an('ladder')}"})
+    # 3) 昨日连板竞价、5) 核心关注/持仓竞价 —— 2026-09-18 按需求删除（精简 + 省 token）。
+    #    连板信息仍作为【竞价情绪预判】的输入（ladder_text），只是不再单独成节。
 
     # 4) 市场关键股票竞价 + 板块解析 + 模块解析
     if block_rows:
@@ -298,51 +282,7 @@ def render(db_path: str, snapshot=None) -> dict:
         if analysis:
             sections.append({"type": "text", "text": f"**关键股票竞价解析**: {_an('key_stocks')}"})
 
-    # 5) 核心关注竞价 + 解析
-    if core_rows:
-        core_cols = ["代码", "名称", "竞价价", "竞价涨幅", "状态"]
-        if tags_for:
-            tags = [tags_for(sigs, row[0], layers=["watch"]) or "-" for row in core_rows]
-            if any(t != "-" for t in tags):
-                core_cols.append("信号")
-                for row, tag in zip(core_rows, tags):
-                    row.append(tag)
-        extra_cols: list[str] = []
-        watch_n = 0
-        try:
-            from invest.actions.format import VERB_CN, range_gap
-            from invest.actions.query import list_actions
-
-            conn_a = connect(db_path)
-            try:
-                amap = {r["symbol"]: r for r in list_actions(conn_a)}
-            finally:
-                conn_a.close()
-            extra_cols = ["动作", "距区间"]
-            for row in core_rows:
-                act = amap.get(row[0]) or {}
-                row.append(VERB_CN.get(act.get("verb") or "", act.get("verb") or "-") or "-")
-                try:
-                    price = float(str(row[2]).replace(",", ""))
-                except (TypeError, ValueError):
-                    price = None
-                row.append(range_gap(price, act.get("entry_lo"), act.get("entry_hi"),
-                                     act.get("stop_loss")))
-            watch_n = sum(1 for r in amap.values() if r.get("verb") == "watch")
-        except Exception:
-            extra_cols = []
-            watch_n = 0
-        sections.append({
-            "type": "table", "title": "核心关注/持仓竞价",
-            "columns": core_cols + extra_cols, "rows": core_rows,
-        })
-        if watch_n:
-            sections.append({
-                "type": "text",
-                "text": "池外观察动作已列入动作清单，不进核心表",
-            })
-        if analysis:
-            sections.append({"type": "text", "text": f"**核心关注竞价解析**: {_an('core')}"})
+    # 5) 核心关注/持仓竞价：2026-09-18 删除（含"动作/距区间"子列与池外观察提示）
 
     # 6) 竞价情绪预判（独立模块）
     if pred.get("mood"):

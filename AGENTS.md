@@ -119,6 +119,23 @@
   `report._card_alerts`。**同日**：P0 止损/证伪告警限频 `min_interval` 1800s → **3600s**
   （一小时最多一次）。当前名单：`002083 孚日股份`、`300438 鹏辉能源`（同期已从 `candidate_pool`
   移除：`out_date='2026-09-18'`，d18 异常波动随之不再覆盖它们）。
+- **报告/仪表盘精简（2026-09-18，省 token）**：
+  - **盘前 a0**：删「今日动作」表格 +「📌 今日操作」+「昨日信号」模块（`undigested_actions`）；
+  - **竞价 a7**：删「昨日连板今日竞价」+「核心关注/持仓竞价」两节（含其 LLM 解析键
+    ladder/core；连板仍作为情绪预判输入），并删掉重复的「指数竞价涨跌幅（%）」条形图；
+  - **盘后 a3**：删「点1 盘面总览·指数」表；点2 复盘**只留对错总结**（不再输出错误原因/经验）；
+    报告不再输出今日操作与「明日动作（规则）」表；点4 明日预案**只给方向**
+    （direction/focus/risk，禁止个股名称与代码）；删「预案质量复盘（近 N 日）」；
+  - **校验库删除**：`review_lessons` 表 + `persist_lessons/list_lessons` + `db.py` 建表 +
+    `actions/__init__` 导出 + 相关测试断言全部移除；`_daily_llm.plan_review_llm` 与
+    a3 的 `_plan_history` 一并删除（LLM 由 4 次降到 3 次）；
+  - **仪表盘**：删「当日板块涨跌热力图」（`queries.load_latest_movers`）与「行业联动网络」图
+    （`queries.load_linkage_edges`）；短线轨页「高相关行业对」表（`load_linkage`）保留；
+  - **定时任务删除**：`action_digest` / `action_digest_pm`（10:00 / 13:30 动作 digest，
+    内容属"今日操作"）+ `invest/actions/digest.py` + `pipeline.notify_action_digest` +
+    OS 任务 `TraderSystem_action_digest_am/pm`（已用 `schtasks /Delete` 删除）。
+    **保留**：`invest/actions`（compose/persist/watch/query）——a3 仍在后台合成并落库
+    `daily_actions`，供仪表盘/对话 d33/盘中报告 b1 消费；删报告小节不影响这些功能。
 - **代码→名称（2026-09-18）**：`invest/data/names.py`。缓存 `data/symbol_names.json`
   （akshare `stock_info_a_code_name`，**盘前任务按周刷新**，TTL 7 天，失败沿用旧缓存）；
   `names.lookup(symbols, db_path)` **只读缓存 + 库内含 name 列的表**（auction_snapshots/

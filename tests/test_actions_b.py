@@ -201,51 +201,5 @@ def test_load_watch_query():
     assert not df.empty and "000001" in set(df["symbol"])
 
 
-def test_notify_digest_sends_priority_one(monkeypatch):
-    from invest.actions.persist import persist_actions
-    from invest.actions.types import Action
-    from invest.pipeline import notify_action_digest
-
-    p = _tmp_db()
-    today = dt.date.today()
-    conn = connect(p)
-    try:
-        persist_actions(conn, [Action(
-            date=today.isoformat(), symbol="600519", verb="sell",
-            priority=1, source="card", hint="破止损",
-        )], today)
-    finally:
-        conn.close()
-
-    sent = {}
-
-    class _N:
-        def send_text(self, content, key="", min_interval=0.0, feishu=True):
-            sent["text"] = content
-            sent["key"] = key
-            sent["min_interval"] = min_interval
-            return True
-
-    monkeypatch.setattr("invest.notifier.Notifier", _N)
-    monkeypatch.setattr("invest.intraday.fetch_batch_prices", lambda *a, **k: {})
-    assert notify_action_digest(p, asof=today) is True
-    assert sent["key"] == "action_digest" and sent["min_interval"] == 5400
-    assert "600519" in sent["text"] and "建议买入" not in sent["text"]
-    assert notify_action_digest(_tmp_db(), asof=today) is False
-
-
-def test_digest_priority_and_limit():
-    from invest.actions.digest import format_digest
-    from invest.actions.types import Action
-
-    rows = [
-        Action(date="d", symbol="A", verb="sell", priority=1, source="card", status="pending", hint="破止损"),
-        Action(date="d", symbol="B", verb="watch", priority=4, source="llm", status="triggered", hint="到价"),
-        Action(date="d", symbol="C", verb="watch", priority=4, source="llm", status="pending", hint="探索"),
-        Action(date="d", symbol="D", verb="hold", priority=2, source="pool", status="pending", hint="持有"),
-    ]
-    text = format_digest(rows)
-    assert "A" in text and "B" in text
-    assert "C" not in text and "D" not in text
-    assert "建议买入" not in text
-    assert len(text.splitlines()) <= 15
+# 2026-09-18：动作 digest（10:00/13:30 推送）与 invest/actions/digest.py 已按需求删除，
+# 原 test_notify_digest_sends_priority_one / test_digest_priority_and_limit 一并移除。

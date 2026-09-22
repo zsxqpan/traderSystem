@@ -4,9 +4,12 @@ render 返回 {"title": ..., "sections": [...]}，由发送层按通道渲染：
 - 飞书：invest.push.render.render_feishu → interactive 卡片（表格/加粗）；
 - 企微/微信：render.render_plain → 纯文本（表格转紧凑行）。
 
-结构（10 节）：标题+数据截至 / 隔夜外围(表格,含日韩) / 外围影响(LLM) / 市场温度 /
+结构（8 节）：标题+数据截至 / 隔夜外围(表格,含日韩) / 外围影响(LLM) / 市场温度 /
 仓位评级 / 市场风格 / 今日关注(Agent 8:30 落盘,仅结论) / 涨停异动监控(表格:停牌+风险提示+暴雷)
 / 风险提示(LLM) / 消息汇总(宏观仅变化时+个股+市场外,LLM)。
+
+2026-09-18 精简：删除「今日动作」表格、「📌 今日操作」一行、「昨日信号」模块
+（动作清单仍由盘后 a3 合成落库，仪表盘与对话 d33 不受影响）。
 
 依赖：d24-d27 小节 skill 的底层逻辑（_digest / global_snapshot / halt），
 本 skill 组装表格结构时直接使用底层函数（薄包装原则）。
@@ -25,7 +28,7 @@ SKILL = {
     "uses": ["d3_style", "d8_temp_guide", "d9_rating_guide", "d10_action_guide",
              "d21_freshness", "d22_ratings",
              "d24_global_snapshot", "d25_overnight_analysis", "d26_market_watch",
-             "d27_news_digest", "d32_trade_signals", "d33_daily_actions"],
+             "d27_news_digest", "d32_trade_signals"],
     "params": {
         "db_path": "str, required",
     },
@@ -106,73 +109,11 @@ def render(db_path: str) -> dict:
         conn.close()
 
     # 7) 今日关注（Agent 8:30 落盘，仅结论）
+    #    2026-09-18 精简：删除「今日动作」表格 + 「📌 今日操作」+「昨日信号」模块（减少 token；
+    #    动作清单仍由盘后 a3 合成落库，仪表盘/对话 d33 照常可用）
     focus = _read_agent_focus()
     if focus:
         sections.append({"type": "text", "text": "**【今日关注】**\n" + focus})
-    try:
-        from invest.actions.format import action_table, pick_b1
-        from invest.actions.query import list_actions
-        from invest.actions.types import Action
-        from invest.report import _action_guide
-
-        conn_a = connect(db_path)
-        try:
-            raw = list_actions(conn_a)
-            if score is not None:
-                guide = _action_guide(conn_a, score)
-                if guide:
-                    sections.append({"type": "text", "text": f"📌 今日操作: {guide}"})
-        finally:
-            conn_a.close()
-        acts = [Action(
-            date=r.get("date") or "", symbol=r.get("symbol") or "",
-            verb=r.get("verb") or "hold", priority=int(r.get("priority") or 2),
-            source=r.get("source") or "", hint=r.get("hint") or "",
-            entry_lo=r.get("entry_lo"), entry_hi=r.get("entry_hi"),
-            stop_loss=r.get("stop_loss"), target=r.get("target"),
-            status=r.get("status") or "pending",
-        ) for r in raw]
-        show = pick_b1(acts) if len(acts) > 12 else acts
-        tbl = action_table(show, title="今日动作")
-        if tbl:
-            pool = set()
-            try:
-                conn_p = connect(db_path)
-                try:
-                    pool = {r["symbol"] for r in conn_p.execute(
-                        "SELECT symbol FROM candidate_pool "
-                        "WHERE level IN ('core','track') AND out_date IS NULL"
-                    )}
-                    pool |= {r["symbol"] for r in conn_p.execute(
-                        "SELECT symbol FROM cards WHERE status IN ('locked','review')"
-                    )}
-                finally:
-                    conn_p.close()
-            except Exception:
-                pool = set()
-            tbl = {
-                **tbl,
-                "columns": list(tbl["columns"]) + ["池"],
-                "rows": [
-                    list(row) + (["池内"] if row[1] in pool else ["池外"])
-                    for row in tbl["rows"]
-                ],
-            }
-            sections.append(tbl)
-    except Exception:
-        pass
-    try:
-        from invest.signals.format import undigested_actions
-
-        conn_u = connect(db_path)
-        try:
-            undig = undigested_actions(conn_u)
-        finally:
-            conn_u.close()
-        if undig:
-            sections.append({"type": "text", "text": "**【昨日信号】** " + undig})
-    except Exception:
-        pass
     try:
         from invest.signals.format import format_market_opportunity, rows_to_signals
         from invest.signals.query import list_signals

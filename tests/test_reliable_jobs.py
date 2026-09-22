@@ -401,15 +401,15 @@ def test_os_task_manifest_matches_job_funcs_and_required_times():
     for slot_time, job in entries:
         if job in jobs_to_times and jobs_to_times[job] != slot_time:
             raise AssertionError(
-                f"Job={job} 映射了 {jobs_to_times[job]} 与 {slot_time}，下午 digest 必须用 action_digest_pm"
+                f"Job={job} 映射了 {jobs_to_times[job]} 与 {slot_time}，一天跑两次必须拆两个 job 名"
             )
         jobs_to_times[job] = slot_time
     assert set(jobs_to_times) == set(JOB_FUNCS)
     assert jobs_to_times["auction"] == "09:26"
     assert jobs_to_times["snapshot_close"] == "15:01"
     assert jobs_to_times["pool_trap_scan"] == "16:20"
-    assert jobs_to_times["action_digest"] == "10:00"
-    assert jobs_to_times["action_digest_pm"] == "13:30"
+    assert jobs_to_times["late_catchup"] == "21:30"
+    assert "action_digest" not in jobs_to_times, "动作 digest 任务已按需求删除（2026-09-18）"
     assert (ROOT / "scripts" / "install_os_tasks.ps1").read_bytes().startswith(b"\xef\xbb\xbf")
 
 

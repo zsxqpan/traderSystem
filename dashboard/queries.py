@@ -38,22 +38,7 @@ def load_temperature_history(db: str, limit: int = 60) -> pd.DataFrame:
     ).iloc[::-1].reset_index(drop=True)
 
 
-def load_latest_movers(db: str) -> pd.DataFrame:
-    """最新行业交易日板块涨跌幅与成交额（用于热力图/树图）。"""
-    return _read(
-        db,
-        """WITH ranked AS (
-             SELECT industry, close, amount,
-                    ROW_NUMBER() OVER (PARTITION BY industry ORDER BY REPLACE(date,'-','') DESC) rn
-             FROM industry_bars
-           )
-           SELECT a.industry,
-                  (a.close/b.close - 1) AS pct,
-                  a.amount
-           FROM ranked a JOIN ranked b ON a.industry=b.industry AND b.rn=2
-           WHERE a.rn=1
-           ORDER BY pct DESC"""
-    )
+# 2026-09-18：load_latest_movers（当日板块涨跌热力图）已按需求删除
 
 
 _SCATTER_SQL = """SELECT s.obj, s.rs, s.trend_stage, v.crowding, v.crowding_state,
@@ -163,15 +148,8 @@ def load_rotation_history(db: str) -> pd.DataFrame:
     )
 
 
-def load_linkage_edges(db: str, threshold: float = 0.8, max_edges: int = 150) -> pd.DataFrame:
-    """最新联动网络高相关边（按 corr 降序截断，避免图太密）。"""
-    return _read(
-        db,
-        """SELECT a, b, corr, lead FROM quant_linkage
-           WHERE run_date = (SELECT MAX(run_date) FROM quant_linkage) AND corr >= ?
-           ORDER BY corr DESC LIMIT ?""",
-        (threshold, max_edges),
-    )
+# 2026-09-18：load_linkage_edges（行业联动网络图）已按需求删除；
+# load_linkage（短线轨页「高相关行业对」表格）保留。
 
 
 def load_style_history(db: str) -> pd.DataFrame:
