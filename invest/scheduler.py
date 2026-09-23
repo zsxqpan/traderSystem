@@ -1255,6 +1255,9 @@ def _notify_late_report() -> None:
 # 21:30 后才有当日数据 → 兜底任务里补采一次，让仪表盘/次日报告用上当日值。
 LATE_DATA_TASKS: tuple[str, ...] = ("dragon_tiger", "industry_valuation", "margin")
 LATE_REFRESH_AFTER = dt.time(20, 0)
+# 当日日线/指数补采的最小重试间隔（2026-09-23）：兜底扫描每分钟一轮，
+# 指数日线晚发布时不必每分钟都去拉一遍。
+LATE_BARS_RETRY_INTERVAL = dt.timedelta(minutes=20)
 
 
 def _refreshed_after(db: str, job: str, since: dt.datetime) -> bool:
@@ -1310,6 +1313,50 @@ def _late_data_refresh(db: str, *, run_now: dt.datetime) -> str:
     return "；".join(done) if done else "晚发布源已是最新"
 
 
+def _late_bars_refresh(db: str, *, run_now: dt.datetime) -> str:
+    """当日日线/指数仍缺当日数据时补采一次（2026-09-23 事故）。
+
+    情形：指数日线（akshare）当天 21 点后才发布 —— 17:00 的 `_data_lag_reason` 门禁会拦下
+    盘后报告；若 15:01 收盘快照也失败/被清，当日 bar 就彻底没有 → 报告整晚发不出去。
+    兜底窗口（21:30–23:00）里先把当日 bar 补齐，报告才有可能生成；20 分钟限频
+    （`late_bars_refresh` 留痕判重），失败可在下一轮重试。
+    """
+    conn = connect(db)
+    try:
+        lag = _data_lag_reason(conn)
+    finally:
+        conn.close()
+    if not lag:
+        return "当日日线/指数已最新"
+    if _refreshed_after(db, "late_bars_refresh", run_now - LATE_BARS_RETRY_INTERVAL):
+        return "当日 bar 补采 20 分钟内已试过"
+
+    status = "failed"
+    detail = f"原滞后：{lag}"
+    try:
+        result = run_job_once(
+            "daily_refresh",
+            db_path=db,
+            now=run_now,
+            force=True,
+            wait_for_running=120.0,
+        )
+        status = "ok" if result.status in {"ok", "already_ok"} else "failed"
+        detail = f"daily_refresh={result.status}；原滞后：{lag}"
+    except Exception as exc:
+        logger.warning("当日 bar 补采异常: %s", exc)
+        detail = f"daily_refresh=error({type(exc).__name__})；原滞后：{lag}"
+    try:
+        conn = connect(db)
+        try:
+            _log_run(conn, "late_bars_refresh", status, detail)
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("当日 bar 补采留痕失败", exc_info=True)
+    return f"当日 bar 补采={status}"
+
+
 def _late_catchup(db: str, conn, *, today: dt.date | None = None) -> JobResult:
     """当日关键槽位若仍漏跑、且外网已恢复 → 逐个强制补采；报告补推前先发「补发」说明。
 
@@ -1317,6 +1364,10 @@ def _late_catchup(db: str, conn, *, today: dt.date | None = None) -> JobResult:
     17:29:59 内全部失败；外网 20:10 恢复时已过窗，补偿扫描只记 missed，
     当天数据与报告整份丢掉。现在 21:30 兜底：窗口内（至 23:00）每分钟扫描会重试本任务，
     网络一恢复就自动补上。
+
+    2026-09-23 事故：17:00 报告被"当日 bar 缺当日数据"门禁拦下（指数日线当天 21 点后
+    才发布 + 15:01 快照的当日行被 collector 按日期误清）。发报告前先跑 `_late_bars_refresh`
+    补当日日线/指数，否则兜底窗口里报告永远过不了门禁。
 
     `today` 仅测试用（钉住日期，避免跨零点导致用例不稳定）。
     """
@@ -1347,6 +1398,13 @@ def _late_catchup(db: str, conn, *, today: dt.date | None = None) -> JobResult:
         # 快照补完后必须让权威日线再写一次，清掉同 (symbol,date) 的 snapshot 行
         pending.append("daily_refresh")
 
+    bars = ""
+    if "evening_report" in pending:
+        # 2026-09-23：报告可能正是被"当日 bar 缺当日数据"的门禁拦下的（指数日线晚发布 /
+        # 快照失败），发之前先补齐，否则兜底窗口里报告一直发不出去。
+        bars = _late_bars_refresh(db, run_now=run_now)
+        logger.info("兜底补采前当日 bar 检查：%s", bars)
+
     done: list[str] = []
     failed: list[str] = []
     for job in pending:
@@ -1373,6 +1431,8 @@ def _late_catchup(db: str, conn, *, today: dt.date | None = None) -> JobResult:
         f"需补 {len(pending)} 项 | 成功: {','.join(done) or '-'} | "
         f"未成功: {','.join(failed) or '-'}"
     )
+    if bars:
+        detail = f"{detail}；{bars}"
     late = _late_data_refresh(db, run_now=run_now)
     detail = f"{detail}；{late}"
     if failed:

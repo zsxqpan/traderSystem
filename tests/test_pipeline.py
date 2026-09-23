@@ -225,7 +225,13 @@ def test_close_daily_fetch():
 
 
 def test_drop_snapshot_dups():
-    """2026-08-24/25：晚间权威日线写入后删除当日收盘快照行（daily_bars + index_bars，避免双行）。"""
+    """2026-08-24/25 初版；2026-09-23 收窄为「本表 + df 里出现过的 (键,日期)」。
+
+    收窄原因：akshare 的 daily_bars 任务只采 000001(+核心池)，其 df 覆盖 2024 至今每个
+    交易日，按日期全删会把**当日全市场 5200 行快照 + 9 行指数快照**一起删掉 →
+    当天 index_bars 一行不剩（akshare 指数日线当天还没发布）→ 17:00 盘后报告被
+    `_data_lag_reason` 门禁拦下（当天报告没发到飞书）。
+    """
     from invest.data.collector import _drop_snapshot_dups
     from invest.data.storage import upsert_df
 
@@ -233,28 +239,106 @@ def test_drop_snapshot_dups():
     conn = connect(p)
     try:
         upsert_df(conn, "daily_bars", pd.DataFrame([
-            {"date": "2026-08-24", "symbol": "600519", "close": 1304.66, "src": "snapshot"},
-            {"date": "2026-08-24", "symbol": "600519", "close": 1304.66, "src": "akshare"},
-            {"date": "2026-08-21", "symbol": "600519", "close": 1272.83, "src": "snapshot"},
+            {"date": "2026-09-23", "symbol": "000001", "close": 10.0, "src": "snapshot"},
+            {"date": "2026-09-23", "symbol": "000001", "close": 10.1, "src": "akshare"},
+            {"date": "2026-09-23", "symbol": "600519", "close": 1304.66, "src": "snapshot"},
+            {"date": "2026-09-22", "symbol": "600519", "close": 1272.83, "src": "snapshot"},
         ]))
-        # 2026-08-25：index_bars 也需清理（snapshot/akshare 双行导致 quant strength concat 崩溃）
         upsert_df(conn, "index_bars", pd.DataFrame([
-            {"index_code": "000300", "date": "2026-08-24", "close": 4000.0, "src": "snapshot"},
-            {"index_code": "000300", "date": "2026-08-24", "close": 4001.0, "src": "akshare"},
+            {"index_code": "000001", "date": "2026-09-23", "close": 3400.0, "src": "snapshot"},
         ]))
-        _drop_snapshot_dups(conn, pd.DataFrame([{"date": "2026-08-24"}]))
-        rows = conn.execute("SELECT date, src, index_code FROM index_bars ORDER BY date").fetchall()
-        idx_got = {(r["index_code"], r["date"], r["src"]) for r in rows}
-        assert ("000300", "2026-08-24", "snapshot") not in idx_got  # 指数快照行被清
-        assert ("000300", "2026-08-24", "akshare") in idx_got       # 权威行保留
-        drows = conn.execute("SELECT date, src FROM daily_bars ORDER BY date").fetchall()
-        got = {(r["date"], r["src"]) for r in drows}
-        assert ("2026-08-24", "snapshot") not in got
-        assert ("2026-08-24", "akshare") in got
-        assert ("2026-08-21", "snapshot") in got  # 历史快照行保留
+        # akshare daily_bars 任务：df 只含 000001，日期覆盖到今天
+        _drop_snapshot_dups(conn, "daily_bars", pd.DataFrame([
+            {"date": "2026-09-23", "symbol": "000001"},
+            {"date": "2026-09-22", "symbol": "000001"},
+        ]))
+        got = {(r["symbol"], r["date"], r["src"])
+               for r in conn.execute("SELECT symbol, date, src FROM daily_bars")}
+        assert ("000001", "2026-09-23", "snapshot") not in got   # 同 (symbol,date) 快照行被清
+        assert ("000001", "2026-09-23", "akshare") in got        # 权威行保留
+        assert ("600519", "2026-09-23", "snapshot") in got       # 全市场快照行保留（不再被误删）
+        assert ("600519", "2026-09-22", "snapshot") in got       # 其他日期快照行保留
+        idx = {(r["index_code"], r["date"], r["src"])
+               for r in conn.execute("SELECT index_code, date, src FROM index_bars")}
+        assert ("000001", "2026-09-23", "snapshot") in idx       # 不再被 daily_bars 任务跨表删除
+
+        # index_bars 任务自己清理同 (index_code,date) 的指数快照行（08-25 calc_rs 双行坑仍防住）
+        upsert_df(conn, "index_bars", pd.DataFrame([
+            {"index_code": "000001", "date": "2026-09-23", "close": 3401.0, "src": "akshare"},
+        ]))
+        _drop_snapshot_dups(conn, "index_bars", pd.DataFrame([
+            {"date": "2026-09-23", "index_code": "000001"},
+        ]))
+        idx2 = {(r["index_code"], r["date"], r["src"])
+                for r in conn.execute("SELECT index_code, date, src FROM index_bars")}
+        assert ("000001", "2026-09-23", "snapshot") not in idx2
+        assert ("000001", "2026-09-23", "akshare") in idx2
     finally:
         conn.close()
     print("test_drop_snapshot_dups OK")
+
+
+def test_collection_keeps_index_snapshot_when_index_source_lags():
+    """2026-09-23 事故回归：daily_bars 任务落库时不得删掉当日指数快照行（跨表删除已取消）。
+
+    当天真实链条：15:01 快照写 market=700/index=9 → 16:00/16:40 akshare daily_bars 任务
+    （只含 000001）落库时按日期把 index_bars 当日行全清 → 17:00 门禁判"指数最新=上一交易日"
+    → 盘后报告 skipped → 17:30 missed，报告没发到飞书。
+    """
+    from invest.data.collector import _run_one
+    from invest.data.storage import upsert_df
+
+    class _FakeSource:
+        def fetch(self, params):
+            return pd.DataFrame([{
+                "date": "2026-09-23", "symbol": "000001", "open": 10.0,
+                "high": 10.2, "low": 9.9, "close": 10.1, "volume": 1, "amount": 1.0,
+            }])
+
+        def normalize(self, df, params):
+            return df
+
+    p = _tmp_db()
+    conn = connect(p)
+    try:
+        upsert_df(conn, "index_bars", pd.DataFrame([
+            {"index_code": "000001", "date": "2026-09-23", "close": 3400.0, "src": "snapshot"},
+            {"index_code": "000300", "date": "2026-09-23", "close": 4500.0, "src": "snapshot"},
+        ]))
+        task = {"name": "daily_bars", "kind": "daily_bars", "table": "daily_bars",
+                "sources": ["akshare"], "params": {}}
+        summary = _run_one(conn, task, {"akshare": _FakeSource()}, retries=1, delay=0.0)
+        assert summary["status"] == "ok", summary
+        n_idx = conn.execute(
+            "SELECT COUNT(*) FROM index_bars WHERE date='2026-09-23' AND src='snapshot'"
+        ).fetchone()[0]
+        assert n_idx == 2, f"当日指数快照行被误删（剩 {n_idx} 行）"
+    finally:
+        conn.close()
+    print("test_collection_keeps_index_snapshot_when_index_source_lags OK")
+
+
+def test_close_daily_continues_after_failed_page():
+    """2026-09-23：单页失败不再直接放弃分页（当天第 8 页 RemoteDisconnected 只拿到 700/5200）。"""
+    from invest.data import close_daily as cd
+
+    def _page(n):
+        return {"data": {"total": 300, "diff": [
+            {"f12": f"600{n:03d}", "f2": 10.0, "f3": 0.0, "f5": 100, "f6": 1e6,
+             "f15": 10.5, "f16": 9.5, "f17": 9.8, "f18": 10.0}] * 100}}
+
+    def _fake_page(host, pn):
+        if pn == 2:
+            raise RuntimeError("RemoteDisconnected")
+        return _page(pn)
+
+    with mock.patch.object(cd, "_fetch_page", side_effect=_fake_page), \
+         mock.patch.object(cd.time, "sleep", return_value=None):
+        df = cd.fetch_all_close_daily("2026-09-23")
+    # 第 2 页两轮重试都失败 → 跳过继续，第 3 页数据仍入库
+    assert len(df) == 200, len(df)
+    assert set(df["symbol"]) == {"600001", "600003"}
+    print("test_close_daily_continues_after_failed_page OK")
 
 
 def test_evening_report_freshness_gate():
@@ -506,7 +590,9 @@ if __name__ == "__main__":
     test_ticker_only_and_job_funcs()
     test_data_freshness_and_snapshot_close()
     test_close_daily_fetch()
+    test_close_daily_continues_after_failed_page()
     test_drop_snapshot_dups()
+    test_collection_keeps_index_snapshot_when_index_source_lags()
     test_data_lag_reason()
     test_evening_report_freshness_gate()
     test_pipeline_quant()

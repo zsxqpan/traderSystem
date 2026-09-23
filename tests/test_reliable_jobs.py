@@ -1277,15 +1277,16 @@ def test_force_claim_refuses_active_lease(db_path: str):
     body.assert_not_called()
 
 
-def _mark_slot(db_path: str, job: str, run_slot: str, status: str) -> None:
+def _mark_slot(db_path: str, job: str, run_slot: str, status: str,
+               day: str = "2026-09-15") -> None:
     conn = connect(db_path)
     try:
         with conn:
             conn.execute(
                 """INSERT OR REPLACE INTO job_executions(
                        job, scheduled_date, run_slot, status, attempt, detail, updated_at)
-                   VALUES(?, '2026-09-15', ?, ?, 1, '事故漏跑', datetime('now','localtime'))""",
-                (job, run_slot, status),
+                   VALUES(?, ?, ?, ?, 1, '事故漏跑', datetime('now','localtime'))""",
+                (job, day, run_slot, status),
             )
     finally:
         conn.close()
@@ -1338,6 +1339,7 @@ def test_late_catchup_backfills_missed_slots(db_path: str):
     jobs = {name: _body(name) for name in scheduler.LATE_CATCHUP_TARGETS}
     notifier = mock.Mock()
     with mock.patch.dict(scheduler.JOB_FUNCS, jobs, clear=True), \
+         mock.patch.object(scheduler, "_late_bars_refresh", return_value="当日日线/指数已最新"), \
          mock.patch.object(scheduler, "_late_data_refresh", return_value="晚发布源已是最新"), \
          mock.patch.object(scheduler, "Notifier", notifier):
         conn = connect(db_path)
@@ -1364,6 +1366,119 @@ def test_late_catchup_backfills_missed_slots(db_path: str):
         conn.close()
     assert statuses["industry_refresh"] == "ok"
     assert statuses["evening_report"] == "ok"
+
+
+def test_late_catchup_backfills_stale_bars_before_evening_report(db_path: str):
+    """2026-09-23 事故：报告被"当日 bar 缺当日数据"门禁拦下时，兜底先补当日日线/指数再发报告。
+
+    当天：指数日线 21 点后才发布 + 15:01 快照的当日行被 collector 误清 → 17:00 门禁拦下
+    盘后报告；兜底窗口里若不补 bar，报告整晚都发不出去。
+    """
+    import pandas as pd
+
+    from invest import scheduler
+    from invest.data.calendar import latest_trading_day
+    from invest.data.storage import upsert_df
+
+    for job in scheduler.LATE_CATCHUP_TARGETS:
+        _mark_slot(db_path, job, scheduler.JOB_SLOTS[job], "ok", day=dt.date.today().isoformat())
+    _mark_slot(db_path, "evening_report", "17:00", "missed", day=dt.date.today().isoformat())
+
+    day = latest_trading_day(dt.date.today()).isoformat()
+    calls: list[str] = []
+    gate_when_report: list[str] = []
+
+    def _daily_refresh(_db, _conn):
+        calls.append("daily_refresh")
+        conn = connect(_db)
+        try:
+            upsert_df(conn, "daily_bars", pd.DataFrame([
+                {"date": day, "symbol": "000001", "close": 10.0, "src": "akshare"}]))
+            upsert_df(conn, "index_bars", pd.DataFrame([
+                {"index_code": "000300", "date": day, "close": 4000.0, "src": "akshare"}]))
+        finally:
+            conn.close()
+        return JobResult.ok("当日 bar 已补")
+
+    def _evening(_db, _conn):
+        calls.append("evening_report")
+        conn = connect(_db)
+        try:
+            gate_when_report.append(scheduler._data_lag_reason(conn))
+        finally:
+            conn.close()
+        return JobResult.ok("报告已补发")
+
+    jobs = {"daily_refresh": _daily_refresh, "evening_report": _evening}
+    with mock.patch.dict(scheduler.JOB_FUNCS, jobs, clear=True), \
+         mock.patch.object(scheduler, "_late_data_refresh", return_value="晚发布源已是最新"), \
+         mock.patch.object(scheduler, "Notifier", mock.Mock()):
+        conn = connect(db_path)
+        try:
+            result = scheduler._late_catchup(db_path, conn, today=dt.date.today())
+        finally:
+            conn.close()
+
+    assert result.status == "ok", result.detail
+    assert calls == ["daily_refresh", "evening_report"], calls
+    assert gate_when_report == [""], "发报告时门禁应已放行（当日 bar 先补齐）"
+    assert "当日 bar 补采=ok" in result.detail
+    # 20 分钟限频留痕（避免兜底扫描每分钟都去拉一次）
+    conn = connect(db_path)
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM job_runs WHERE job='late_bars_refresh' AND status='ok'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert n == 1
+
+
+def test_late_bars_refresh_rate_limited(db_path: str):
+    """20 分钟内已试过 → 不再重复补采当日 bar（指数晚发布时兜底扫描每分钟一轮）。"""
+    import pandas as pd
+
+    from invest import scheduler
+    from invest.data.storage import upsert_df
+
+    conn = connect(db_path)
+    try:
+        upsert_df(conn, "daily_bars", pd.DataFrame([
+            {"date": "2026-09-22", "symbol": "000001", "close": 10.0, "src": "akshare"}]))
+        upsert_df(conn, "index_bars", pd.DataFrame([
+            {"index_code": "000300", "date": "2026-09-22", "close": 4000.0, "src": "akshare"}]))
+        scheduler._log_run(conn, "late_bars_refresh", "ok", "刚试过")
+    finally:
+        conn.close()
+    body = mock.Mock(return_value=JobResult.ok("不该跑"))
+    with mock.patch.dict(scheduler.JOB_FUNCS, {"daily_refresh": body}, clear=True):
+        out = scheduler._late_bars_refresh(db_path, run_now=dt.datetime.now())
+    assert "已试过" in out, out
+    body.assert_not_called()
+
+
+def test_late_bars_refresh_noop_when_fresh(db_path: str):
+    """当日日线/指数已最新 → 不触发补采（正常日子兜底窗口不做多余采集）。"""
+    import pandas as pd
+
+    from invest import scheduler
+    from invest.data.calendar import latest_trading_day
+    from invest.data.storage import upsert_df
+
+    day = latest_trading_day(dt.date.today()).isoformat()
+    conn = connect(db_path)
+    try:
+        upsert_df(conn, "daily_bars", pd.DataFrame([
+            {"date": day, "symbol": "000001", "close": 10.0, "src": "akshare"}]))
+        upsert_df(conn, "index_bars", pd.DataFrame([
+            {"index_code": "000300", "date": day, "close": 4000.0, "src": "akshare"}]))
+    finally:
+        conn.close()
+    body = mock.Mock(return_value=JobResult.ok("不该跑"))
+    with mock.patch.dict(scheduler.JOB_FUNCS, {"daily_refresh": body}, clear=True):
+        out = scheduler._late_bars_refresh(db_path, run_now=dt.datetime.now())
+    assert "已最新" in out, out
+    body.assert_not_called()
 
 
 def test_late_catchup_skips_when_network_still_down(db_path: str):

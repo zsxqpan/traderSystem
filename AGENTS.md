@@ -29,7 +29,9 @@
   （`invest/data/close_daily.py::fetch_all_close_daily`）——收盘后立即返回全市场当日 OHLCV
   （f2收盘/f17今开/f15最高/f16最低/f5成交量手/f6成交额，pz=100 分页约 56 页，实测 5207 只 12.7s），
   `snapshot_close` 任务 15:01 写 daily_bars + index_bars(src='snapshot')；晚间 akshare 权威数据写入时
-  `collector._drop_snapshot_dups` 删当日 snapshot 行（**daily_bars 和 index_bars 都要清**——
+  `collector._drop_snapshot_dups` 删同 (键,日期) 的 snapshot 行（**2026-09-23 起收窄为
+  「本表 + df 里出现过的 (symbol,date)/(index_code,date)」，不再按日期跨表全删**——见下文
+  2026-09-23 事故；
   2026-08-25 曾漏清 index_bars 导致同 (index_code,date) snapshot/akshare 双行，
   quant.strength.calc_rs 的 pd.concat 报 "cannot reindex on an axis with duplicate labels"
   使 after_close/industry_refresh 失败；已加 calc_rs index 去重防御 + 清理历史重复）
@@ -148,6 +150,27 @@
   实测 21:30 后三者都有当日数据 → `late_catchup` 内新增 `_late_data_refresh`：
   采集 `dragon_tiger`/`industry_valuation`/`margin` + 重跑 `industry_refresh`；
   **20:00 后已跑过则跳过**（按 `job_runs` 判断，幂等），并把一行 `late_data_refresh` 留痕。
+- **盘后报告没发到飞书 = 快照行被跨表按日期误删（2026-09-23 事故，报告 skipped→missed）**：
+  当天 15:01 `snapshot_close` 因东财 clist 第 8 页 RemoteDisconnected 只写 `market=700`（正常
+  5210），但 `index=9` 的当日指数快照写成功；16:00/16:40 akshare `daily_bars` 任务（**只采
+  000001+核心池**）落库后调用 `_drop_snapshot_dups` —— **旧实现按日期删除、且被 daily_bars
+  任务跨表连带清 index_bars**，而它的 df 覆盖 2024 至今每个交易日 → 一次写入就把**当日全市场
+  5200 行快照 + 9 行指数快照**删光；当天 akshare 指数日线还没发布（16:40 仍写 661 行 =
+  08:30 同值）→ **当日 `index_bars` 一行不剩** → 17:00 `_data_lag_reason` 判"指数最新=上一
+  交易日" → 报告 `skipped`（每分钟重试到 17:29:59）→ 17:30 记 `missed`，只有一条
+  「⚠️【盘后报告未发送】数据滞后」告警（`evening_stale`，12h 限频）。
+  **修法**：① `collector._drop_snapshot_dups` 收窄为**本表 + df 里出现过的 (symbol,date)/
+  (index_code,date)**，取消跨表删除——各表由自己的任务清理（08-25 calc_rs 双行坑仍防住），
+  权威源当天没发布时快照行必须保留；② `close_daily.fetch_all_close_daily` 单页失败
+  **重试 2 轮 + 跳过继续**（连续 5 页失败才收工），不再第 8 页 break 只拿 700/5200；
+  ③ `scheduler._late_bars_refresh`：兜底窗口里 `evening_report` 待补时先查
+  `_data_lag_reason`，滞后就 `run_job_once('daily_refresh', force=True)` 补当日日线/指数
+  （**20 分钟限频**，`late_bars_refresh` 留痕），然后再发报告——否则报告永远过不了门禁。
+  回归用例：`test_drop_snapshot_dups`（改写）、`test_collection_keeps_index_snapshot_when_index_source_lags`、
+  `test_close_daily_continues_after_failed_page`、`test_late_catchup_backfills_stale_bars_before_evening_report`、
+  `test_late_bars_refresh_rate_limited`、`test_late_bars_refresh_noop_when_fresh`。
+  **诊断口径**：`job_runs` 里 `daily_bars` 任务的行数（akshare=N 行）只有 000001+核心池，
+  **全市场当日日线只来自 15:01 快照**——查 `daily_bars` 的 `src` 分布即可确认快照行是否被清。
 - **事实卡推送减负（2026-09-18）**：只推最明显的 `PUSH_TOP_N=5` 个板块变化，且**不列证据编号**
   （`format_change_digest(changes, limit=..., with_evidence=False)`；默认仍全量带证据，供留痕/调试）。
   显著度 `score` 权重：拥挤度状态跳变(100) > 周期相位(60) > 轮动排名(40) > 中线RS(25) > PE分位(15)。

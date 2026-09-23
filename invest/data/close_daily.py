@@ -3,7 +3,7 @@
 背景：akshare 东财日线（push2his kline 接口）在本机存在 RemoteDisconnected 且当日数据
 更新偏晚（约晚间 21 点后）；而东财**行情列表接口**（clist，push2delay）收盘后立即返回
 全市场当日 OHLCV（f2 最新=f2 收盘价 / f17 今开 / f15 最高 / f16 最低 / f5 成交量手 / f6 成交额元）。
-- 分页拉取：clist pz 上限 100，全 A 约 5550+ 只 → ~56 页；
+- 分页拉取：clist pz 上限 100，全 A 约 5550+ 只 → ~56 页（单页失败重试+跳过，见 _PAGE_ATTEMPTS）；
 - 收盘后（16:10 snapshot_close 任务）调用，写入 daily_bars(src='snapshot')；
   晚间 akshare 权威数据写入后删除当日 snapshot 行（见 collector._run_one）。
 - 失败静默返回空 DataFrame（不阻断 snapshot_close 其他逻辑）。
@@ -22,6 +22,12 @@ _HOSTS = ["https://push2delay.eastmoney.com", "https://push2.eastmoney.com"]
 _UT = "bd1d9ddb04089700cf9c27f6f7426281"
 _TIMEOUT = 15
 _PAGE_SIZE = 100
+# 2026-09-23：单页失败不再直接放弃分页——当天第 8 页 RemoteDisconnected 就 break，
+# 全市场只拿到 700/5200 只（快照残缺）。现在单页重试 2 轮（两主机各一次），
+# 跳过后继续拉后续页；连续失败 5 页才收工。
+_PAGE_ATTEMPTS = 2
+_MAX_PAGE_FAILS = 5
+_MIN_COVERAGE = 0.95
 _FIELDS = "f2,f3,f5,f6,f12,f14,f15,f16,f17,f18"
 # 沪深京 A 股
 _FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
@@ -61,17 +67,29 @@ def fetch_all_close_daily(date: str | None = None) -> pd.DataFrame:
     last_err = ""
     total: int | None = None
     pn = 1
+    failed_pages = 0
     while True:
         page = None
-        for host in _HOSTS:
-            try:
-                page = _fetch_page(host, pn)
+        for attempt in range(1, _PAGE_ATTEMPTS + 1):
+            for host in _HOSTS:
+                try:
+                    page = _fetch_page(host, pn)
+                    break
+                except Exception as exc:
+                    last_err = f"{host}: {exc}"
+            if page is not None:
                 break
-            except Exception as exc:
-                last_err = f"{host}: {exc}"
+            if attempt < _PAGE_ATTEMPTS:
+                time.sleep(0.5 * attempt)
         if page is None:
-            logger.warning("收盘日线 clist 第 %d 页失败: %s", pn, last_err)
-            break
+            failed_pages += 1
+            logger.warning("收盘日线 clist 第 %d 页失败（连续 %d 页）: %s", pn, failed_pages, last_err)
+            if failed_pages >= _MAX_PAGE_FAILS:
+                break
+            pn += 1
+            time.sleep(0.2)
+            continue
+        failed_pages = 0
         data = page.get("data") or {}
         if total is None:
             total = int(data.get("total") or 0)
@@ -96,5 +114,7 @@ def fetch_all_close_daily(date: str | None = None) -> pd.DataFrame:
     if not rows:
         logger.warning("收盘日线无数据（total=%s, last_err=%s）", total, last_err)
         return pd.DataFrame()
+    if total and len(rows) < total * _MIN_COVERAGE:
+        logger.warning("收盘日线仅取到 %d/%s 行（分页部分失败，非全市场）", len(rows), total)
     logger.info("收盘日线全市场获取 %d 行（total=%s）", len(rows), total)
     return pd.DataFrame(rows)

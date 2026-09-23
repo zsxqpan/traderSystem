@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 import pandas as pd
@@ -250,10 +251,11 @@ def _run_one(
                     break
                 _check_df(df, task)
                 written = upsert_df(conn, table, df) if table else 0
-                if table == "daily_bars" and "date" in df.columns:
-                    # 2026-08-24：收盘快照（src='snapshot'，16:10 写入）为临时日线，
-                    # 权威日线（akshare）写入后删除当日 snapshot 行，避免同 (symbol,date) 双行
-                    _drop_snapshot_dups(conn, df)
+                if table in _SNAPSHOT_KEY_COL and "date" in df.columns:
+                    # 2026-08-24：收盘快照（src='snapshot'）是临时数据，权威数据写入后删除
+                    # **对应 (键, 日期)** 的 snapshot 行，避免同 (symbol,date)/
+                    # (index_code,date) 双行（2026-09-23 由"按日期全删"收窄，见该函数说明）
+                    _drop_snapshot_dups(conn, table, df)
                 update_credibility(conn, src_name, True)
                 source_results.append({
                     "source": src_name,
@@ -299,26 +301,59 @@ def _run_one(
     }
 
 
-def _drop_snapshot_dups(conn, df: pd.DataFrame) -> None:
-    """删除 df 涉及日期的 src='snapshot' 行（2026-08-24 初版；2026-08-25 修复 index_bars）。
+# 收盘快照（src='snapshot'）清理：**只删本表里 df 出现过的 (键, 日期)**。
+# 2026-09-23 事故：原实现是按日期删除、且被 daily_bars 任务跨表连带清 index_bars——
+# 而 akshare 的 daily_bars 任务只采 000001(+核心池)，它的 df 覆盖 2024 至今每个交易日，
+# 于是每天 16:00/16:40 一次写入就把**当日全市场 5200 行快照**和**当日 9 行指数快照**删光；
+# 当天 index_bars 因此一行不剩（akshare 指数日线当天还没发布）→ 17:00 盘后报告被
+# `_data_lag_reason` 门禁拦下 → 当天报告没发到飞书。
+_SNAPSHOT_KEY_COL = {"daily_bars": "symbol", "index_bars": "index_code"}
+_SNAPSHOT_DELETE_SQL = {
+    "daily_bars": (
+        "DELETE FROM daily_bars WHERE src='snapshot' AND symbol=?"
+        " AND (date=? OR REPLACE(date,'-','')=?)"
+    ),
+    "index_bars": (
+        "DELETE FROM index_bars WHERE src='snapshot' AND index_code=?"
+        " AND (date=? OR REPLACE(date,'-','')=?)"
+    ),
+}
 
-    收盘快照（15:01，东财 clist 拼的当日 OHLCV）是临时数据，晚间 akshare 日线/指数写入后
-    删除当日快照行，避免同 (symbol,date)/(index_code,date) 出现 snapshot/akshare 双行——
-    双行会导致 quant.strength.calc_rs 的 pd.concat 报 "cannot reindex on an axis with
+
+def _bare_code(value) -> str:
+    """归一化成裸 6 位代码（各源可能写成 sh600000 / 600000.SH / 600000）。"""
+    text = str(value).strip().upper()
+    m = re.search(r"\d{6}", text)
+    return m.group(0) if m else text
+
+
+def _drop_snapshot_dups(conn, table: str, df: pd.DataFrame) -> None:
+    """删除 df 里出现过的 (键, 日期) 对应的 src='snapshot' 行（仅限本表）。
+
+    收盘快照（15:01，东财 clist 拼的当日 OHLCV / 腾讯指数现价）是临时数据，权威源
+    （akshare）写入**同一个 (symbol,date)/(index_code,date)** 后删除该快照行，避免双行——
+    双行会让 quant.strength.calc_rs 的 pd.concat 报 "cannot reindex on an axis with
     duplicate labels"（2026-08-25 盘中 after_close/industry_refresh 故障）。
+
+    2026-09-23 收窄范围：权威源当天尚未发布该日期/该标的时，快照行**必须保留**——
+    否则当日指数/个股数据整体消失，盘后报告会被数据滞后门禁拦下（当天报告没发）。
+    跨表删除（daily_bars 任务顺手清 index_bars）同时取消：各表由自己的任务清理。
     """
+    sql = _SNAPSHOT_DELETE_SQL.get(table)
+    key_col = _SNAPSHOT_KEY_COL.get(table)
+    if not sql or not key_col or key_col not in df.columns or "date" not in df.columns:
+        return
     try:
-        dates = sorted({str(d)[:10] for d in pd.unique(df["date"]) if d is not None})
-        for d in dates:
-            conn.execute(
-                "DELETE FROM daily_bars WHERE src='snapshot' AND (date=? OR REPLACE(date,'-','')=?)",
-                (d, d.replace("-", "")),
-            )
-            conn.execute(
-                "DELETE FROM index_bars WHERE src='snapshot' AND (date=? OR REPLACE(date,'-','')=?)",
-                (d, d.replace("-", "")),
-            )
+        pairs = {
+            (_bare_code(k), str(d)[:10])
+            for k, d in zip(df[key_col].tolist(), df["date"].tolist())
+            if k is not None and d is not None and str(d).strip()
+        }
+        for code, day in sorted(pairs):
+            conn.execute(sql, (code, day, day.replace("-", "")))
         conn.commit()
+        if pairs:
+            logger.info("清理收盘快照行 %s：%d 组 (键,日期)", table, len(pairs))
     except Exception as exc:
         logger.warning("清理收盘快照行失败: %s", exc)
 
